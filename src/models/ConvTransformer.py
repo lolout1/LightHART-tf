@@ -3,7 +3,7 @@ from tensorflow.keras import layers
 from typing import Any, Dict
 from einops import rearrange
 import tensorflow as tf
-from models.modules import Block, MLP, Identity, DropPath
+from src.models.modules import Block, MLP, Identity, DropPath
 
 teacher = keras.Sequential(
     [
@@ -53,7 +53,7 @@ class ConvTransformer(tf.keras.Model):
 
         # postional embedding
         self.temporal_pos_embed = tf.Variable(
-            tf.zeros([1, num_patch + 1, embed_size]))
+            tf.zeros([1, num_patch, embed_size]))
         self.acc_pos_embed = tf.Variable(tf.zeros(1, 1, embed_size))
 
         # positional dropout
@@ -118,11 +118,16 @@ class ConvTransformer(tf.keras.Model):
             tf.keras.layers.Dense(num_classes)
         ])
 
+        #reshape layer 
+        self.reshape = tf.keras.layers.Reshape((num_patch, -1))
+        self.flatten = tf.keras.layers.Flatten()
+        self.pooling = tf.keras.layers.AveragePooling1D(pool_size = num_patch, strides = 1, padding = "valid")
+
     def acc_model(self, x):
 
         b, f, e = x.shape
-        class_token = tf.tile(self.acc_token, [b, 1, 1])
-        x = tf.concat([x, class_token], axis=1)
+        # class_token = tf.tile(self.acc_token, [b, 1, 1])
+        # x = tf.concat([x, class_token], axis=1)
 
         x += self.acc_pos_embed
         x = self.pos_drop(x)
@@ -136,10 +141,10 @@ class ConvTransformer(tf.keras.Model):
 
         x = self.acc_norm(x)
 
-        x = x[:, :f, :]
-        x = tf.nn.avg_pool1d(
-            x, x.shape[-2], strides=1, padding='VALID')
-        x = tf.reshape(x, [b, e])
+        # x = tf.nn.avg_pool1d(
+        #     x, x.shape[-2], strides=1, padding='VALID')
+        x = self.pooling(x)
+        x = self.flatten(x)
         return x, eb_signals
     
     def temporal_encoder(self, x, eb_signals):
@@ -148,8 +153,8 @@ class ConvTransformer(tf.keras.Model):
         '''
         b, f, St = x.shape
 
-        class_token = tf.tile(self.temp_token, [b, 1, 1])
-        x = tf.concat([x, class_token], axis = 1)
+        # class_token = tf.tile(self.temp_token, [b, 1, 1])
+        # x = tf.concat([x, class_token], axis = 1)
         x += self.temporal_pos_embed
         for idx, blk in enumerate(self.temporal_block):
             acc_feature = eb_signals[idx]
@@ -158,11 +163,11 @@ class ConvTransformer(tf.keras.Model):
             x = x + acc_feature
         
         x = self.temp_norm(x)
-
-        x = x[:, :f, :]
-        x = tf.nn.avg_pool1d(
-            x, x.shape[-2], strides=1, padding='VALID')
-        x = tf.reshape(x, [b, St])
+        
+        # x = tf.nn.avg_pool1d(
+        #     x, x.shape[-2], strides=1, padding='VALID')
+        x = self.pooling(x)
+        x = self.flatten(x)
         return x       
         
 
@@ -176,13 +181,13 @@ class ConvTransformer(tf.keras.Model):
         x = self.spatial_conv(skl_data)
 
         # dividing into patch
-        x = tf.reshape(x, [b, self.num_patch, -1])
+        x = self.reshape(x)
 
         # matching encoder dimensions
         x = self.spatial_encoder(x)
 
         ### processing acc signal ###
-        acc = tf.reshape(acc_data, [b, self.num_patch, -1])
+        acc = self.reshape(x)
         ax = self.acc_encoder(acc)
         ax, eb_signals = self.acc_model(ax)
 

@@ -18,6 +18,7 @@ class Distiller(tf.keras.Model):
         Sets values of key componets
         '''
         super().compile(optimizer=optimizer, metrics = metrics, loss = student_loss_fn)
+        self.student.compile(optimizer=optimizer, metrics = metrics, loss = student_loss_fn)
         self.student_loss_fn = student_loss_fn
         self.distillation_loss_fn = distillation_loss_fn
         self.alpha = alpha
