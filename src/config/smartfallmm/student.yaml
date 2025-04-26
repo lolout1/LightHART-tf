@@ -1,15 +1,13 @@
-# Student model configuration
 model: src.models.transformer_student_tf.StudentTransformerTF
 dataset: smartfallmm
 
-# For fall detection task with 2 classes (fall vs. non-fall)
 subjects: [32, 39, 30, 31, 33, 34, 35, 37, 43, 44, 45, 36, 29]
 
 model_args:
   acc_frames: 128
   num_classes: 1
   num_heads: 2
-  acc_coords: 4  # 3 accelerometer axes + 1 signal magnitude vector
+  acc_coords: 4
   num_layers: 2
   embed_dim: 32
   ff_dim: 64
@@ -18,7 +16,7 @@ model_args:
 dataset_args: 
   mode: 'sliding_window'
   max_length: 128
-  task: 'fd'  # fall detection
+  task: 'fd'
   modalities: ['accelerometer']
   age_group: ['young']
   sensors: ['watch']

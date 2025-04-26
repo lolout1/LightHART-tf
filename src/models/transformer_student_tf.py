@@ -1,14 +1,15 @@
-# src/models/transformer_student_tf.py
 import tensorflow as tf
 from tensorflow.keras import layers, Model
 import numpy as np
 
 class TransformerEncoderBlock(layers.Layer):
-    """Transformer encoder block with multi-head attention."""
-    
-    def __init__(self, embed_dim, num_heads, ff_dim, dropout=0.1, **kwargs):
-        super(TransformerEncoderBlock, self).__init__(**kwargs)
-        self.att = layers.MultiHeadAttention(num_heads=num_heads, key_dim=embed_dim//num_heads)
+    def __init__(self, embed_dim, num_heads, ff_dim, dropout=0.1):
+        super(TransformerEncoderBlock, self).__init__()
+        self.att = layers.MultiHeadAttention(
+            num_heads=num_heads, 
+            key_dim=embed_dim//num_heads,
+            value_dim=embed_dim//num_heads
+        )
         self.ffn = tf.keras.Sequential([
             layers.Dense(ff_dim, activation="relu"),
             layers.Dense(embed_dim),
@@ -19,36 +20,31 @@ class TransformerEncoderBlock(layers.Layer):
         self.dropout2 = layers.Dropout(dropout)
     
     def call(self, inputs, training=False):
-        # Normalization before attention (pre-norm transformer)
+        # Pre-norm transformer architecture
         x = self.layernorm1(inputs)
         
-        # Multi-head attention
-        attn_output, attn_weights = self.att(
-            query=x, key=x, value=x, 
-            return_attention_scores=True, 
-            training=training
-        )
+        # Multi-head attention with residual connection
+        attn_output = self.att(x, x, x, training=training)
         attn_output = self.dropout1(attn_output, training=training)
         out1 = inputs + attn_output
         
-        # Feed-forward network
+        # Feed-forward network with residual connection
         x = self.layernorm2(out1)
         ffn_output = self.ffn(x)
         ffn_output = self.dropout2(ffn_output, training=training)
-        return out1 + ffn_output, attn_weights
+        return out1 + ffn_output, None  # Return None for attention weights to save memory
 
 class StudentTransformerTF(Model):
     """
-    Student Transformer model for human activity recognition.
-    A lighter version designed to be trained with knowledge distillation.
+    Efficient Transformer model for accelerometer-based human activity recognition.
+    Optimized for compatibility with TensorFlow's GPU operations.
     """
-    
     def __init__(
             self,
             acc_frames=128,
-            num_classes=2,
+            num_classes=1,
             num_heads=2,
-            acc_coords=3,
+            acc_coords=4,
             num_layers=2,
             embed_dim=32,
             ff_dim=64,
@@ -57,86 +53,97 @@ class StudentTransformerTF(Model):
         ):
         super(StudentTransformerTF, self).__init__(**kwargs)
         
-        # Input shape definition
+        # Model parameters
         self.acc_frames = acc_frames
         self.acc_coords = acc_coords
         self.num_layers = num_layers
         self.embed_dim = embed_dim
         
-        # Input projection: Map the raw accelerometer data to embedding space
+        # Explicitly set data_format to channels_last for better compatibility
         self.input_projection = tf.keras.Sequential([
-            layers.Conv1D(embed_dim, kernel_size=7, strides=1, padding='same'),
+            layers.Conv1D(
+                embed_dim, 
+                kernel_size=7, 
+                strides=1, 
+                padding='same',
+                data_format='channels_last',
+                kernel_initializer='glorot_uniform'
+            ),
             layers.BatchNormalization(),
             layers.Activation('relu'),
         ])
         
-        # Positional encoding
-        self.pos_encoding = self.positional_encoding(acc_frames, embed_dim)
+        # Create positional encoding
+        self.pos_encoding = self._positional_encoding(acc_frames, embed_dim)
         
-        # Transformer encoder blocks
-        self.encoder_blocks = [
-            TransformerEncoderBlock(
-                embed_dim=embed_dim,
-                num_heads=num_heads,
-                ff_dim=ff_dim,
-                dropout=dropout
-            ) for _ in range(num_layers)
-        ]
+        # Create transformer encoder blocks
+        self.encoder_blocks = []
+        for _ in range(num_layers):
+            self.encoder_blocks.append(
+                TransformerEncoderBlock(
+                    embed_dim=embed_dim,
+                    num_heads=num_heads,
+                    ff_dim=ff_dim,
+                    dropout=dropout
+                )
+            )
         
         # Output layers
         self.layernorm = layers.LayerNormalization(epsilon=1e-6)
         self.pooling = layers.GlobalAveragePooling1D()
         self.final_dropout = layers.Dropout(dropout)
-        self.classifier = layers.Dense(num_classes)
-
-    def positional_encoding(self, max_len, d_model):
+        self.classifier = layers.Dense(
+            num_classes,
+            kernel_initializer=tf.keras.initializers.GlorotUniform()
+        )
+        
+        # Initialize with dummy input to build the model
+        self._build_model()
+    
+    def _positional_encoding(self, max_len, d_model):
         """Create standard transformer positional encoding."""
-        pe = np.zeros((max_len, d_model))
-        position = np.arange(0, max_len)[:, np.newaxis]
+        positions = np.arange(max_len)[:, np.newaxis]
         div_term = np.exp(np.arange(0, d_model, 2) * -(np.log(10000.0) / d_model))
         
-        pe[:, 0::2] = np.sin(position * div_term)
-        pe[:, 1::2] = np.cos(position * div_term)
+        pos_encoding = np.zeros((max_len, d_model))
+        pos_encoding[:, 0::2] = np.sin(positions * div_term)
+        pos_encoding[:, 1::2] = np.cos(positions * div_term)
         
-        return tf.cast(pe[np.newaxis, ...], dtype=tf.float32)
+        # Add batch dimension and convert to TF tensor
+        return tf.cast(pos_encoding[np.newaxis, ...], dtype=tf.float32)
     
+    def _build_model(self):
+        """Initialize model weights by running a forward pass with dummy data."""
+        dummy_input = tf.zeros((1, self.acc_frames, self.acc_coords))
+        self({"accelerometer": dummy_input}, training=False)
+    
+    @tf.function
     def call(self, inputs, training=False):
-        """Forward pass of the student model."""
-        # Handle different input formats
+        """Forward pass with memory optimization and XLA compatibility."""
+        # Extract input data
         if isinstance(inputs, dict):
-            if 'accelerometer' in inputs:
-                x = inputs['accelerometer']
-            elif 'acc' in inputs:
-                x = inputs['acc']
-            else:
-                raise ValueError("Accelerometer data is required in the input")
+            x = inputs['accelerometer']
         else:
             x = inputs
-        
-        # Ensure input has the right shape
-        if len(x.shape) < 3:
-            x = tf.expand_dims(x, axis=-1)
         
         # Apply input projection
         x = self.input_projection(x, training=training)
         
         # Add positional encoding
-        x += self.pos_encoding[:, :x.shape[1], :]
-        
-        # Store attention weights for visualization/distillation
-        attention_weights = []
+        seq_len = tf.shape(x)[1]
+        x = x + self.pos_encoding[:, :seq_len, :]
         
         # Apply transformer encoder blocks
         for encoder_block in self.encoder_blocks:
-            x, weights = encoder_block(x, training=training)
-            attention_weights.append(weights)
+            x, _ = encoder_block(x, training=training)
         
-        # Apply layer normalization
+        # Apply normalization and global pooling
         x = self.layernorm(x)
-        
-        # Extract features via global pooling
         features = self.pooling(x)
-        features = self.final_dropout(features, training=training)
+        
+        # Apply dropout during training
+        if training:
+            features = self.final_dropout(features, training=True)
         
         # Final classification
         logits = self.classifier(features)

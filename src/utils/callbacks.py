@@ -1,7 +1,6 @@
 import tensorflow as tf
 
 class EarlyStoppingTF:
-    """Early stopping callback for TensorFlow."""
     def __init__(self, patience=15, min_delta=0.00001):
         self.patience = patience
         self.min_delta = min_delta
@@ -19,7 +18,6 @@ class EarlyStoppingTF:
                 self.early_stop = True
 
 class CheckpointManagerTF:
-    """Manages TensorFlow checkpoints for model saving/loading."""
     def __init__(self, model, optimizer, model_path, max_to_keep=3):
         self.model = model
         self.optimizer = optimizer
@@ -29,7 +27,6 @@ class CheckpointManagerTF:
         self.best_loss = float('inf')
     
     def save_checkpoint(self, val_loss, epoch):
-        """Save checkpoint if validation loss improves."""
         path = self.manager.save(checkpoint_number=epoch)
         if val_loss < self.best_loss:
             self.best_loss = val_loss
@@ -37,6 +34,5 @@ class CheckpointManagerTF:
         return None
     
     def load_best_checkpoint(self):
-        """Load the best checkpoint."""
         status = self.ckpt.restore(self.manager.latest_checkpoint)
-        return status.expect_partial()
+        return status

@@ -2,7 +2,7 @@ import os
 import random
 import numpy as np
 import tensorflow as tf
-import yaml
+import importlib
 
 def str2bool(v):
     """Convert string to boolean."""
@@ -21,37 +21,28 @@ def init_seed(seed):
 
 def import_class(import_str):
     """Dynamically import a class."""
-    import sys
-    import traceback
-    
     mod_str, _sep, class_str = import_str.rpartition('.')
     try:
-        __import__(mod_str)
-        return getattr(sys.modules[mod_str], class_str)
+        # Try standard import
+        mod = importlib.import_module(mod_str)
+        return getattr(mod, class_str)
     except (ImportError, AttributeError):
+        # Try without 'src.' prefix
         if mod_str.startswith('src.'):
-            alt_mod_str = mod_str[4:]
             try:
-                __import__(alt_mod_str)
-                return getattr(sys.modules[alt_mod_str], class_str)
-            except: pass
+                alt_mod_str = mod_str[4:]
+                mod = importlib.import_module(alt_mod_str)
+                return getattr(mod, class_str)
+            except:
+                pass
+        # Re-raise the error with more information
+        import traceback
         print(f"Error importing {import_str}")
         print(traceback.format_exc())
         raise ImportError(f"Cannot import {import_str}")
 
-def save_config(src_path, dest_dir):
-    """Save configuration file to destination directory."""
-    config_filename = os.path.basename(src_path)
-    with open(src_path, 'r') as f_src:
-        with open(f'{dest_dir}/{config_filename}', 'w') as f_dst:
-            f_dst.write(f_src.read())
-
 def create_fold_splits(subjects, fold_index=None, validation_subjects=[38, 46]):
-    """Create train/val/test splits with leave-one-out cross-validation.
-    
-    If fold_index is provided, returns splits for that specific fold.
-    Otherwise, returns a list of all possible fold splits.
-    """
+    """Create train/val/test splits with leave-one-out cross-validation."""
     all_splits = []
     
     for i, test_subject in enumerate(subjects):
