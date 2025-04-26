@@ -23,7 +23,7 @@ def sliding_window(data, clearing_time_index, max_time, sub_window_size, stride_
     sub_windows = (
         start +
         np.expand_dims(np.arange(sub_window_size), 0) +
-        np.expand_dims(np.arange(max_time, step=stride_size), 0).T
+        np.expand_dims(np.arange(max_time, 10), 0).T
     )
 
     # labels = np.round(np.mean(labels[sub_windows], axis=1))

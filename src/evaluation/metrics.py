@@ -22,4 +22,5 @@ def f1(y_pred, y_true):
 def print_report(y_pred , y_true):
     print(f'Precision : {precision(y_pred=y_pred, y_true=y_true)}')
     print(f'Recall : {recall(y_pred, y_true)}')
+    print(f'Accuracy: {accuracy(y_pred,y_true)}')
     print(f'F1 score : {f1(y_pred, y_true)}')

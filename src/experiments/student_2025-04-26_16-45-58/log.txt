@@ -1,0 +1,66 @@
+# Parameters: 0.0
+Model size : 0.00 MB
+Parameters: 
+base_lr: 0.001
+batch_size: 32
+config: config/smartfallmm/student.yaml
+dataset: smartfallmm
+dataset_args:
+  age_group:
+  - young
+  max_length: 128
+  modalities:
+  - accelerometer
+  mode: sliding_window
+  sensors:
+  - watch
+  task: fd
+device: '0'
+feeder: null
+include_val: true
+loss: bce
+loss_args: '{}'
+model: src.models.transformer_student_tf.StudentTransformerTF
+model_args:
+  acc_coords: 4
+  acc_frames: 128
+  dropout: 0.2
+  embed_dim: 32
+  ff_dim: 64
+  num_classes: 2
+  num_heads: 2
+  num_layers: 2
+model_saved_name: student_model
+num_epoch: 50
+num_worker: 0
+optimizer: adamw
+phase: train
+print_log: true
+result_file: null
+seed: 2
+start_epoch: 0
+subjects:
+- 32
+- 39
+- 30
+- 31
+- 33
+- 34
+- 35
+- 37
+- 43
+- 44
+- 45
+- 36
+- 29
+test_batch_size: 32
+test_feeder_args: &id001 !!python/name:builtins.str ''
+train_feeder_args: *id001
+val_batch_size: 32
+val_feeder_args: *id001
+weight_decay: 0.0001
+weights: null
+work_dir: experiments/student_2025-04-26_16-45-58
+
+
+Model Parameters: 0.0

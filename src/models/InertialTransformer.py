@@ -16,7 +16,7 @@ student = keras.Sequential(
     name="student",
 )
 
-class InertialTransformer(tf.keras.Model):
+class TransModel(tf.keras.Model):
     def __init__(self, acc_frames = 256, num_joints = 32, acc_dim = 3, num_heads = 4, mlp_ratio = 2., num_classes = 2, depth = 4,  embed_size = 256, drop = 0.2, attn_drop = 0.4, num_patch = 4):
         super().__init__()
 
@@ -79,6 +79,6 @@ class InertialTransformer(tf.keras.Model):
 
 if __name__ == "__main__":
       
-      model = InertialTransformer()
+      model = TransModel()
       acc_data = tf.random.normal([32, 128,3])
       logits = model(acc_data)
