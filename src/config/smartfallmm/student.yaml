@@ -1,4 +1,4 @@
-# Student model configuration (optimized)
+# Student model configuration (optimized for TensorFlow)
 model: src.models.transformer_student_tf.StudentTransformerTF
 dataset: smartfallmm
 
@@ -7,13 +7,13 @@ subjects: [32, 39, 30, 31, 33, 34, 35, 37, 43, 44, 45, 36, 29]
 
 model_args:
   acc_frames: 128
-  num_classes: 1
+  num_classes: 1  # Binary classification for fall detection
   num_heads: 2
   acc_coords: 4  # 3 accelerometer axes + 1 signal magnitude vector
   num_layers: 2
   embed_dim: 32
   ff_dim: 64
-  dropout: 0.2
+  dropout: 0.5
 
 dataset_args: 
   mode: 'sliding_window'
@@ -23,7 +23,7 @@ dataset_args:
   age_group: ['young']
   sensors: ['watch']
 
-# Training parameters
+# Training parameters matched with PyTorch
 batch_size: 32
 test_batch_size: 32
 val_batch_size: 32
@@ -34,5 +34,8 @@ optimizer: adamw
 base_lr: 0.001
 weight_decay: 0.0001
 
-# Default phase
+# Training phase
 phase: 'train'
+
+# Disable mixed precision for better compatibility
+mixed_precision: false

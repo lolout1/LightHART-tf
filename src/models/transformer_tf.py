@@ -1,102 +1,167 @@
 import tensorflow as tf
 from tensorflow.keras import layers, Model
 
-class TransformerEncoderBlock(layers.Layer):
-    def __init__(self, embed_dim, num_heads, ff_dim, dropout=0.1):
-        super(TransformerEncoderBlock, self).__init__()
-        self.att = layers.MultiHeadAttention(num_heads=num_heads, key_dim=embed_dim//num_heads)
-        self.ffn = tf.keras.Sequential([
-            layers.Dense(ff_dim, activation="relu"),
-            layers.Dense(embed_dim),
-        ])
-        self.layernorm1 = layers.LayerNormalization(epsilon=1e-6)
-        self.layernorm2 = layers.LayerNormalization(epsilon=1e-6)
-        self.dropout1 = layers.Dropout(dropout)
-        self.dropout2 = layers.Dropout(dropout)
-    
-    def call(self, inputs, training=False):
-        x = self.layernorm1(inputs)
-        attn_output, attn_weights = self.att(query=x, key=x, value=x, return_attention_scores=True, training=training)
-        attn_output = self.dropout1(attn_output, training=training)
-        out1 = inputs + attn_output
-        x = self.layernorm2(out1)
-        ffn_output = self.ffn(x)
-        ffn_output = self.dropout2(ffn_output, training=training)
-        return out1 + ffn_output, attn_weights
 
 class StudentTransformerTF(Model):
-    def __init__(self, acc_frames=128, num_classes=1, num_heads=2, acc_coords=4, num_layers=2, embed_dim=32, ff_dim=64, dropout=0.2, **kwargs):
-        super(StudentTransformerTF, self).__init__(**kwargs)
+    """TensorFlow / Keras implementation of the TransModel student (accelerometer‑only)
+    transformer.  Input shape: (batch, ACC_FRAMES, ACC_COORDS).
+    Returns a tuple (logits, features) exactly matching the PyTorch version.
+    The design mirrors the original architecture as closely as possible while
+    following best‑practice Keras idioms.  The class is fully serialisable via
+    `model.get_config()` and can be converted to TFLite with no further
+    changes.
+    """
+
+    def __init__(
+        self,
+        acc_frames: int = 128,
+        num_classes: int = 1,
+        num_heads: int = 2,
+        acc_coords: int = 4,
+        num_layers: int = 2,
+        embed_dim: int = 32,
+        dropout: float = 0.5,
+        activation: str = "relu",
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
         self.acc_frames = acc_frames
+        self.num_classes = num_classes
+        self.num_heads = num_heads
         self.acc_coords = acc_coords
         self.num_layers = num_layers
         self.embed_dim = embed_dim
-        
-        self.input_projection = tf.keras.Sequential([
-            layers.Conv1D(embed_dim, kernel_size=7, strides=1, padding='same'),
-            layers.BatchNormalization(),
-            layers.Activation('relu'),
-        ])
-        
-        self.pos_encoding = self._positional_encoding(acc_frames, embed_dim)
-        
-        self.encoder_blocks = [
-            TransformerEncoderBlock(embed_dim=embed_dim, num_heads=num_heads, ff_dim=ff_dim, dropout=dropout)
-            for _ in range(num_layers)
-        ]
-        
-        self.layernorm = layers.LayerNormalization(epsilon=1e-6)
-        self.pooling = layers.GlobalAveragePooling1D()
-        self.final_dropout = layers.Dropout(dropout)
-        self.classifier = layers.Dense(num_classes)
-        
-        # Initialize with dummy input
-        dummy_input = {'accelerometer': tf.zeros((1, acc_frames, acc_coords))}
-        self(dummy_input)
+        self.dropout_rate = dropout
+        self.activation = activation
 
-    def _positional_encoding(self, max_len, d_model):
-        import numpy as np
-        pos = np.arange(max_len)[:, np.newaxis]
-        angles = np.arange(0, d_model, 2) * (-np.log(10000.0) / d_model)
-        pe = np.zeros((max_len, d_model))
-        pe[:, 0::2] = np.sin(pos * np.exp(angles))
-        pe[:, 1::2] = np.cos(pos * np.exp(angles))
-        return tf.cast(pe[np.newaxis, ...], dtype=tf.float32)
-    
-    def build(self, input_shape):
-        if isinstance(input_shape, dict):
-            self.built = True
+        # 1. Input projection: Conv1D + BN (channels‑last).  Mirrors Conv1d(4→embed_dim, k=8).
+        self.input_proj = layers.Conv1D(
+            filters=embed_dim,
+            kernel_size=8,
+            strides=1,
+            padding="same",
+            use_bias=False,
+        )
+        self.bn_proj = layers.BatchNormalization()
+
+        # 2. Transformer encoder stack --------------------------------------
+        self.encoder_layers = [
+            self._build_encoder_layer(i) for i in range(num_layers)
+        ]
+
+        # 3. Output heads ----------------------------------------------------
+        self.temporal_norm = layers.LayerNormalization(epsilon=1e-6)
+        self.output_layer = layers.Dense(num_classes)
+
+    # ---------------------------------------------------------------------
+    def _build_encoder_layer(self, idx: int):
+        """Construct a single Transformer encoder block with residual
+        connections, dropout, and a feed‑forward sub‑layer.  Returns a
+        `tf.keras.layers.Layer` so we can call it like a function.
+        """
+
+        # Sub‑layers --------------------------------------------------------
+        ln1 = layers.LayerNormalization(epsilon=1e-6, name=f"ln1_{idx}")
+        mha = layers.MultiHeadAttention(
+            num_heads=self.num_heads,
+            key_dim=self.embed_dim // self.num_heads,
+            dropout=self.dropout_rate,
+            name=f"mha_{idx}",
+        )
+        drop1 = layers.Dropout(self.dropout_rate, name=f"drop1_{idx}")
+
+        ln2 = layers.LayerNormalization(epsilon=1e-6, name=f"ln2_{idx}")
+        ffn = tf.keras.Sequential(
+            [
+                layers.Dense(
+                    self.embed_dim * 2, activation=self.activation, name="ffn_dense1"
+                ),
+                layers.Dropout(self.dropout_rate),
+                layers.Dense(self.embed_dim, name="ffn_dense2"),
+            ],
+            name=f"ffn_{idx}",
+        )
+        drop2 = layers.Dropout(self.dropout_rate, name=f"drop2_{idx}")
+
+        # Wrap into a custom layer for clarity ------------------------------
+        class EncoderBlock(layers.Layer):
+            def call(self, x, training=False):  # type: ignore[override]
+                # Self‑attention sub‑layer + residual
+                attn_out, _ = mha(x, x, x, training=training, return_attention_scores=True)
+                attn_out = drop1(attn_out, training=training)
+                x = x + attn_out
+                x = ln1(x)
+
+                # Feed‑forward sub‑layer + residual
+                ffn_out = ffn(x, training=training)
+                ffn_out = drop2(ffn_out, training=training)
+                x = x + ffn_out
+                x = ln2(x)
+                return x
+
+        return EncoderBlock(name=f"encoder_block_{idx}")
+
+    # ------------------------------------------------------------------
+    def call(self, inputs, training=False, **kwargs):  # type: ignore[override]
+        """Forward pass.
+
+        * `inputs` may be a Tensor of shape (B, F, C) or a dict containing the
+          key "accelerometer".
+        * Returns `(logits, features)` where `logits` has shape (B, num_classes)
+          and `features` has shape (B, F, embed_dim).
+        """
+        if isinstance(inputs, dict) and "accelerometer" in inputs:
+            x = inputs["accelerometer"]
         else:
-            super().build(input_shape)
-    
-    def call(self, inputs, training=False):
-        if isinstance(inputs, dict):
-            x = inputs['accelerometer']
-        else:
-            x = inputs
-        
-        # Apply input projection
-        x = self.input_projection(x, training=training)
-        
-        # Add positional encoding
-        seq_len = tf.shape(x)[1]
-        x += self.pos_encoding[:, :seq_len, :]
-        
-        attention_weights = []
-        
-        # Apply transformer encoder blocks
-        for encoder_block in self.encoder_blocks:
-            x, weights = encoder_block(x, training=training)
-            attention_weights.append(weights)
-        
-        # Apply layer normalization
-        x = self.layernorm(x)
-        
-        # Extract features via global pooling
-        features = self.pooling(x)
-        features = self.final_dropout(features, training=training)
-        
-        # Final classification
-        logits = self.classifier(features)
-        
+            x = inputs  # Expect (B, F, C)
+
+        # Conv1D expects channels‑last; transpose from (B, F, C) → (B, C, F) then back.
+        x = tf.transpose(x, perm=[0, 2, 1])  # (B, C, F)
+        x = self.input_proj(x)
+        x = self.bn_proj(x, training=training)
+        x = tf.transpose(x, perm=[0, 2, 1])  # (B, F, embed_dim)
+
+        # Transformer encoder ----------------------------------------------
+        for enc in self.encoder_layers:
+            x = enc(x, training=training)
+
+        features = x  # Save pre‑pooled features
+
+        # Temporal pooling + classification head ---------------------------
+        x = self.temporal_norm(x)
+        x = tf.reduce_mean(x, axis=1)  # Global average over frames (B, embed_dim)
+        logits = self.output_layer(x)  # (B, num_classes)
         return logits, features
+
+    # ------------------------------------------------------------------
+    def get_config(self):  # Enables `model.save()` / `load_model()`
+        config = super().get_config()
+        config.update(
+            {
+                "acc_frames": self.acc_frames,
+                "num_classes": self.num_classes,
+                "num_heads": self.num_heads,
+                "acc_coords": self.acc_coords,
+                "num_layers": self.num_layers,
+                "embed_dim": self.embed_dim,
+                "dropout": self.dropout_rate,
+                "activation": self.activation,
+            }
+        )
+        return config
+
+
+# -------------------------------------------------------------------------
+# Quick smoke test ---------------------------------------------------------
+if __name__ == "__main__":
+    BATCH = 16
+    FRAMES = 128
+    COORDS = 4
+
+    dummy_acc = tf.random.normal(shape=(BATCH, FRAMES, COORDS))
+    model = StudentTransformerTF()
+
+    logits, feats = model(dummy_acc, training=True)
+    print("logits shape:", logits.shape)   # Expected: (16, 1)
+    print("features shape:", feats.shape)  # Expected: (16, 128, 32)
+

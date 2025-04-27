@@ -1,55 +1,66 @@
 import tensorflow as tf
 from tensorflow.keras import layers, Model
-import numpy as np
 
 class TransformerEncoderBlock(layers.Layer):
-    def __init__(self, embed_dim, num_heads, ff_dim, dropout=0.1):
+    """Transformer encoder block implementation matching PyTorch"""
+    def __init__(self, embed_dim, num_heads, ff_dim, dropout=0.5):
         super(TransformerEncoderBlock, self).__init__()
-        self.att = layers.MultiHeadAttention(
-            num_heads=num_heads, 
-            key_dim=embed_dim//num_heads
-        )
-        self.ffn = tf.keras.Sequential([
-            layers.Dense(ff_dim, activation="relu"),
-            layers.Dense(embed_dim),
-        ])
-        self.layernorm1 = layers.LayerNormalization(epsilon=1e-6)
-        self.layernorm2 = layers.LayerNormalization(epsilon=1e-6)
-        self.dropout1 = layers.Dropout(dropout)
-        self.dropout2 = layers.Dropout(dropout)
         
         # Save parameters for serialization
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.ff_dim = ff_dim
-        self.dropout = dropout
+        self.dropout_rate = dropout
+        
+        # Initialize attention
+        self.att = layers.MultiHeadAttention(
+            num_heads=num_heads, 
+            key_dim=embed_dim//num_heads,
+            dropout=dropout
+        )
+        
+        # Feed-forward network
+        self.ffn = tf.keras.Sequential([
+            layers.Dense(ff_dim, activation="relu"),
+            layers.Dropout(dropout),
+            layers.Dense(embed_dim),
+            layers.Dropout(dropout),
+        ])
+        
+        # Layer normalization
+        self.layernorm1 = layers.LayerNormalization(epsilon=1e-6)
+        self.layernorm2 = layers.LayerNormalization(epsilon=1e-6)
     
     def get_config(self):
+        """Configuration for serialization"""
         config = super().get_config()
         config.update({
             "embed_dim": self.embed_dim,
             "num_heads": self.num_heads,
             "ff_dim": self.ff_dim,
-            "dropout": self.dropout
+            "dropout_rate": self.dropout_rate
         })
         return config
     
     def call(self, inputs, training=False):
-        # Pre-norm transformer architecture
+        """Forward pass with residual connections"""
+        # Layer normalization and attention
         x = self.layernorm1(inputs)
-        
-        # Multi-head attention with residual connection
         attn_output = self.att(x, x, x, training=training)
-        attn_output = self.dropout1(attn_output, training=training)
+        
+        # First residual connection
         out1 = inputs + attn_output
         
-        # Feed-forward network with residual connection
+        # Layer normalization and feed-forward
         x = self.layernorm2(out1)
-        ffn_output = self.ffn(x)
-        ffn_output = self.dropout2(ffn_output, training=training)
+        ffn_output = self.ffn(x, training=training)
+        
+        # Second residual connection
         return out1 + ffn_output
 
+
 class StudentTransformerTF(Model):
+    """Student transformer model matched to PyTorch implementation"""
     def __init__(
             self,
             acc_frames=128,
@@ -59,7 +70,7 @@ class StudentTransformerTF(Model):
             num_layers=2,
             embed_dim=32,
             ff_dim=64,
-            dropout=0.2,
+            dropout=0.5,
             **kwargs
         ):
         super(StudentTransformerTF, self).__init__(**kwargs)
@@ -72,40 +83,39 @@ class StudentTransformerTF(Model):
         self.num_layers = num_layers
         self.embed_dim = embed_dim
         self.ff_dim = ff_dim
-        self.dropout = dropout
+        self.dropout_rate = dropout
         
-        # Input projection
-        self.input_projection = tf.keras.Sequential([
-            layers.Conv1D(
-                embed_dim, 
-                kernel_size=7, 
-                strides=1, 
-                padding='same',
-                data_format='channels_last'
-            ),
-            layers.BatchNormalization(),
-            layers.Activation('relu'),
-        ])
+        # Input projection layers (separately defined for clarity)
+        self.conv_layer = layers.Conv1D(
+            filters=embed_dim, 
+            kernel_size=8, 
+            strides=1, 
+            padding='same',
+            data_format='channels_last',
+            name="input_conv"
+        )
+        
+        self.batch_norm = layers.BatchNormalization(name="input_bn")
         
         # Initialize encoder blocks
         self.encoder_blocks = []
-        for _ in range(num_layers):
+        for i in range(num_layers):
             self.encoder_blocks.append(
                 TransformerEncoderBlock(
                     embed_dim=embed_dim,
                     num_heads=num_heads,
-                    ff_dim=ff_dim,
+                    ff_dim=embed_dim*2,  # Match original (embed_dim*2)
                     dropout=dropout
                 )
             )
         
         # Output layers
-        self.layernorm = layers.LayerNormalization(epsilon=1e-6)
-        self.pooling = layers.GlobalAveragePooling1D()
-        self.final_dropout = layers.Dropout(dropout)
-        self.classifier = layers.Dense(num_classes)
+        self.layernorm = layers.LayerNormalization(epsilon=1e-6, name="final_layernorm")
+        self.global_pooling = layers.GlobalAveragePooling1D(name="global_pool")
+        self.classifier = layers.Dense(num_classes, name="classifier")
     
     def get_config(self):
+        """Configuration for serialization"""
         config = super().get_config()
         config.update({
             "acc_frames": self.acc_frames,
@@ -115,52 +125,34 @@ class StudentTransformerTF(Model):
             "num_layers": self.num_layers,
             "embed_dim": self.embed_dim,
             "ff_dim": self.ff_dim,
-            "dropout": self.dropout
+            "dropout_rate": self.dropout_rate
         })
         return config
     
-    def build(self, input_shape):
-        # Create positional encoding
-        positions = np.arange(self.acc_frames)[:, np.newaxis]
-        div_term = np.exp(np.arange(0, self.embed_dim, 2) * -(np.log(10000.0) / self.embed_dim))
-        
-        pos_encoding = np.zeros((self.acc_frames, self.embed_dim))
-        pos_encoding[:, 0::2] = np.sin(positions * div_term)
-        pos_encoding[:, 1::2] = np.cos(positions * div_term)
-        
-        self.pos_encoding = tf.constant(pos_encoding[np.newaxis, ...], dtype=tf.float32)
-        
-        super().build(input_shape)
-    
     def call(self, inputs, training=False):
-        """Forward pass"""
-        # Extract input data
-        if isinstance(inputs, dict):
-            x = inputs['accelerometer']
+        """Forward pass handling both dict and tensor inputs"""
+        # Handle different input types
+        if isinstance(inputs, dict) and "accelerometer" in inputs:
+            x = inputs["accelerometer"]
         else:
             x = inputs
         
         # Apply input projection
-        x = self.input_projection(x)
+        x = self.conv_layer(x)
+        x = self.batch_norm(x, training=training)
         
-        # Add positional encoding
-        seq_len = tf.shape(x)[1]
-        x = x + self.pos_encoding[:, :seq_len, :]
-        
-        # Apply transformer encoder blocks
+        # Pass through encoder blocks
         features = x
         for encoder_block in self.encoder_blocks:
             features = encoder_block(features, training=training)
         
-        # Apply normalization and global pooling
+        # Apply normalization
         features = self.layernorm(features)
-        features_pooled = self.pooling(features)
         
-        # Apply dropout during training
-        if training:
-            features_pooled = self.final_dropout(features_pooled)
+        # Global pooling
+        x = self.global_pooling(features)
         
         # Final classification
-        logits = self.classifier(features_pooled)
+        logits = self.classifier(x)
         
         return logits, features

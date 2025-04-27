@@ -1,0 +1,39 @@
+# Improved Student Transformer configuration with StochasticDepth regularization
+model: src.models.transformer_test.StudentTransformerTF
+dataset: smartfallmm
+
+# Subjects for fall detection
+subjects: [32, 39, 30, 31, 33, 34, 35, 37, 43, 44, 45, 36, 29]
+
+model_args:
+  acc_frames: 128
+  num_classes: 1
+  num_heads: 2
+  acc_coords: 4
+  num_layers: 2
+  embed_dim: 32
+  dropout: 0.3
+  drop_path: 0.1
+  activation: "gelu"
+
+dataset_args:
+  mode: 'sliding_window'
+  max_length: 128
+  task: 'fd'
+  modalities: ['accelerometer']
+  age_group: ['young']
+  sensors: ['watch']
+
+# Training parameters
+batch_size: 64
+test_batch_size: 64
+val_batch_size: 64
+num_epoch: 80
+
+# Optimization parameters
+optimizer: adamw
+base_lr: 0.001
+weight_decay: 0.0004
+
+# Training phase
+phase: 'train'

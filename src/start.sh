@@ -9,7 +9,7 @@ export XLA_FLAGS=--xla_gpu_cuda_data_dir=$CONDA_PREFIX/lib
 
 # Run training script
 python train.py \
-  --config config/smartfallmm/student.yaml \
+  --config config/smartfallmm/student_improved.yaml \
   --work-dir ../experiments/student_$(date +%Y-%m-%d_%H-%M-%S) \
   --model-saved-name student_model \
   --device 0
