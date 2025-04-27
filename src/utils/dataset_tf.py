@@ -2,10 +2,8 @@ import os
 import numpy as np
 import tensorflow as tf
 from collections import defaultdict
-import time
 from tqdm import tqdm
 from multiprocessing import Pool, cpu_count
-from .loaders import csvloader_tf, butterworth_filter_tf, align_sequence_tf, sliding_window_tf, normalize_data_tf
 
 class SmartFallMM_TF:
     def __init__(self, root_dir):
@@ -28,7 +26,6 @@ class SmartFallMM_TF:
         self.selected_sensors[modality_name] = sensor_name
     
     def load_files(self):
-        matched_count = 0
         for age_group, modalities in self.age_groups.items():
             for modality_name in modalities:
                 if modality_name == "skeleton":
@@ -54,7 +51,7 @@ class SmartFallMM_TF:
                                 file_path = os.path.join(root, file)
                                 self._add_to_matched_trials(modality_name, subject_id, action_id, sequence_number, file_path)
                                 file_count += 1
-                            except Exception as e:
+                            except Exception:
                                 # Skip files with naming errors
                                 pass
                 
@@ -96,109 +93,110 @@ class SmartFallMM_TF:
 
 class UTD_MM_TF(tf.keras.utils.Sequence):
     def __init__(self, dataset, batch_size):
+        # Initialize data safely
         self.acc_data = dataset.get('accelerometer', None)
         self.skl_data = dataset.get('skeleton', None)
         self.labels = dataset.get('labels', None)
         
+        # Handle empty/missing data
         if self.acc_data is None or len(self.acc_data) == 0:
-            self.acc_data = np.zeros((1, 128, 3))
+            print("Warning: Empty accelerometer data")
+            self.acc_data = np.zeros((1, 128, 3), dtype=np.float32)
             self.num_samples = 1
-            self.acc_seq = 128
-            self.channels = 3
         else:
             self.num_samples = self.acc_data.shape[0]
-            self.acc_seq = self.acc_data.shape[1]
-            self.channels = self.acc_data.shape[2]
-        
+            
+        # Handle skeleton data if present
         if self.skl_data is not None and len(self.skl_data) > 0:
             if len(self.skl_data.shape) == 3:
-                self.skl_seq, self.skl_length, self.skl_features = self.skl_data.shape
-                joints = self.skl_features // 3
-                self.skl_data = np.reshape(self.skl_data, (self.skl_seq, self.skl_length, joints, 3))
-            
+                self.skl_data = np.reshape(
+                    self.skl_data,
+                    (self.skl_data.shape[0], self.skl_data.shape[1], -1, 3)
+                )
+        
+        # Ensure labels match data
         if self.labels is None or len(self.labels) == 0:
             self.labels = np.zeros(self.num_samples, dtype=np.int32)
-        elif len(self.labels) != self.num_samples and self.num_samples > 0:
+        elif len(self.labels) != self.num_samples:
             if len(self.labels) > self.num_samples:
                 self.labels = self.labels[:self.num_samples]
             else:
-                self.labels = np.pad(self.labels, (0, self.num_samples - len(self.labels)), 'constant')
+                self.labels = np.pad(
+                    self.labels, 
+                    (0, self.num_samples - len(self.labels)), 
+                    'constant'
+                )
         
         self.batch_size = batch_size
+        self.smv_cache = None
         
-        # Pre-compute signal magnitude vector to speed up batch retrieval
+        # Pre-compute signal magnitude vector
         self._prepare_data()
     
     def _prepare_data(self):
-        """Pre-process and prepare data for faster batch retrieval."""
-        # Convert to TensorFlow tensors for faster operations
+        """Pre-process data for faster batch retrieval"""
         try:
+            # Convert to TensorFlow tensors
             self.acc_data = tf.convert_to_tensor(self.acc_data, dtype=tf.float32)
-            self.smv_cache = self.cal_smv(self.acc_data)
+            self.labels = tf.convert_to_tensor(self.labels, dtype=tf.int32)
             
+            # Calculate signal magnitude vector
+            mean = tf.reduce_mean(self.acc_data, axis=1, keepdims=True)
+            zero_mean = self.acc_data - mean
+            sum_squared = tf.reduce_sum(tf.square(zero_mean), axis=-1, keepdims=True)
+            self.smv_cache = tf.sqrt(sum_squared)
+            
+            # Convert skeleton data if present
             if self.skl_data is not None and len(self.skl_data) > 0:
                 self.skl_data = tf.convert_to_tensor(self.skl_data, dtype=tf.float32)
-                
-            self.labels = tf.convert_to_tensor(self.labels, dtype=tf.int32)
         except Exception as e:
             print(f"Error preparing data: {e}")
     
     def __len__(self):
-        return max(1, int(np.ceil(self.num_samples / self.batch_size)))
+        """Return number of batches"""
+        return max(1, (self.num_samples + self.batch_size - 1) // self.batch_size)
     
     def __getitem__(self, idx):
-        """Retrieve a batch with optimized performance."""
+        """Get batch at position idx"""
         try:
+            # Calculate start and end indices safely
             start_idx = idx * self.batch_size
-            end_idx = min((idx + 1) * self.batch_size, self.num_samples)
+            end_idx = min(start_idx + self.batch_size, self.num_samples)
             
-            batch_indices = tf.range(start_idx, end_idx)
+            # Ensure indices are within bounds
+            if start_idx >= self.num_samples:
+                start_idx = 0
+                end_idx = min(self.batch_size, self.num_samples)
             
-            # Gather data for the batch
-            batch_acc = tf.gather(self.acc_data, batch_indices)
-            batch_smv = tf.gather(self.smv_cache, batch_indices)
+            # Get batch indices
+            indices = tf.range(start_idx, end_idx)
+            
+            # Get data for the batch
+            batch_acc = tf.gather(self.acc_data, indices)
+            batch_smv = tf.gather(self.smv_cache, indices)
+            
+            # Combine accelerometer and SMV
             batch_data = {'accelerometer': tf.concat([batch_smv, batch_acc], axis=-1)}
             
+            # Add skeleton data if available
             if hasattr(self, 'skl_data') and self.skl_data is not None and len(self.skl_data) > 0:
-                batch_data['skeleton'] = tf.gather(self.skl_data, batch_indices)
+                batch_data['skeleton'] = tf.gather(self.skl_data, indices)
             
-            batch_labels = tf.gather(self.labels, batch_indices)
+            # Get batch labels
+            batch_labels = tf.gather(self.labels, indices)
             
-            return batch_data, batch_labels, batch_indices.numpy()
+            return batch_data, batch_labels, indices.numpy()
             
         except Exception as e:
-            # Return dummy data on error
-            dummy_data = {'accelerometer': tf.zeros((1, self.acc_seq, self.channels+1))}
+            print(f"Error generating batch {idx}: {e}")
+            # Return safe dummy data
+            dummy_data = {'accelerometer': tf.zeros((1, 128, 4), dtype=tf.float32)}
             return dummy_data, tf.zeros(1, dtype=tf.int32), np.array([0])
-    
-    def cal_smv(self, sample):
-        """Calculate Signal Magnitude Vector efficiently."""
-        try:
-            mean = tf.reduce_mean(sample, axis=1, keepdims=True)
-            zero_mean = sample - mean
-            sum_squared = tf.reduce_sum(tf.square(zero_mean), axis=-1, keepdims=True)
-            return tf.sqrt(sum_squared)
-        except Exception as e:
-            # Return zero tensor on error
-            return tf.zeros((*sample.shape[:-1], 1), dtype=tf.float32)
-
-def prepare_smartfallmm_tf(arg):
-    """Prepare SmartFallMM dataset."""
-    data_dir = os.path.join(os.getcwd(), 'data/smartfallmm')
-    print(f"Loading data from {data_dir}")
-    
-    sm_dataset = SmartFallMM_TF(root_dir=data_dir)
-    sm_dataset.set_args(arg)
-    sm_dataset.pipe_line(
-        age_group=arg.dataset_args['age_group'],
-        modalities=arg.dataset_args['modalities'],
-        sensors=arg.dataset_args['sensors']
-    )
-    
-    return sm_dataset
 
 def _process_trial(args):
-    """Process a single trial (for parallel processing)."""
+    """Process a single trial for parallel processing"""
+    from utils.loaders import csvloader_tf, butterworth_filter_tf, align_sequence_tf, sliding_window_tf
+    
     trial, subjects, builder_args, verbose = args
     
     if trial["subject_id"] not in subjects:
@@ -228,60 +226,69 @@ def _process_trial(args):
                     trial_data[modality] = unimodal_data
             except Exception as e:
                 if verbose:
-                    print(f"Error loading {modality} file {file_path}: {e}")
+                    print(f"Error loading {modality} file: {e}")
+                continue
         
         # Skip if modalities are missing
-        if not trial_data or len(trial_data) < len(trial["files"]):
+        if not trial_data:
             return None
         
-        if len(trial_data) > 0:
-            # Apply DTW alignment
-            trial_data = align_sequence_tf(trial_data, verbose=verbose)
+        # Apply DTW alignment
+        trial_data = align_sequence_tf(trial_data, verbose=verbose)
+        
+        # Apply windowing based on mode
+        if builder_args and 'mode' in builder_args:
+            mode = builder_args['mode']
+            max_length = builder_args.get('max_length', 128)
             
-            # Apply windowing based on mode
-            if builder_args and 'mode' in builder_args:
-                mode = builder_args['mode']
-                max_length = builder_args.get('max_length', 128)
-                
-                if mode == 'sliding_window':
-                    processed_data = sliding_window_tf(trial_data, max_length, label, verbose=verbose)
-                else:
-                    processed_data = {k: v[:max_length] if len(v) > max_length else v for k, v in trial_data.items()}
-                    processed_data['labels'] = np.array([label])
+            if mode == 'sliding_window':
+                processed_data = sliding_window_tf(trial_data, max_length, label, verbose=verbose)
             else:
-                processed_data = sliding_window_tf(trial_data, 128, label, verbose=verbose)
-            
-            # Check if processed data is valid
-            if processed_data and any(len(v) > 0 for k, v in processed_data.items() if k != 'labels'):
-                return processed_data
+                # For avg_pool mode
+                processed_data = {}
+                for k, v in trial_data.items():
+                    if len(v) > max_length:
+                        processed_data[k] = v[:max_length]
+                    else:
+                        processed_data[k] = v
+                processed_data['labels'] = np.array([label])
+        else:
+            processed_data = sliding_window_tf(trial_data, 128, label, verbose=verbose)
+        
+        # Ensure we have valid data
+        if processed_data and any(len(v) > 0 for k, v in processed_data.items() if k != 'labels'):
+            return processed_data
         
         return None
     except Exception as e:
         if verbose:
-            print(f"Error processing trial for subject {trial['subject_id']}: {e}")
+            print(f"Error processing trial: {e}")
         return None
 
 def split_by_subjects_tf(builder, subjects, fuse=False):
-    """Split dataset by subjects using parallel processing with enhanced error handling."""
+    """Split dataset by subjects using parallel processing"""
     import time
     from multiprocessing import Pool, cpu_count
+    from utils.loaders import normalize_data_tf
     
     print(f"Processing data for subjects {subjects} using parallel processing")
     start_time = time.time()
     
-    # Determine number of CPU cores to use (limit to 48)
-    num_cores = min(cpu_count(), 48)
+    # Limit CPU cores
+    num_cores = min(cpu_count(), 16)
     print(f"Using {num_cores} CPU cores for preprocessing")
     
     # Prepare arguments for parallel processing
-    verbose = False  # Set to True for detailed debugging
-    process_args = [(trial, subjects, builder.args.dataset_args if builder.args else None, verbose) 
-                   for trial in builder.matched_trials]
+    verbose = False
+    process_args = [
+        (trial, subjects, builder.args.dataset_args if hasattr(builder, 'args') else None, verbose) 
+        for trial in builder.matched_trials
+    ]
     
     data = defaultdict(list)
     processed_trials = 0
     
-    # Use multiprocessing to process trials in parallel
+    # Process trials in parallel
     with Pool(processes=num_cores) as pool:
         results = list(tqdm(
             pool.imap(_process_trial, process_args),
@@ -335,3 +342,18 @@ def split_by_subjects_tf(builder, subjects, fuse=False):
     print(f"Total preprocessing time: {time.time()-start_time:.2f}s")
     
     return data
+
+def prepare_smartfallmm_tf(arg):
+    """Prepare SmartFallMM dataset"""
+    data_dir = os.path.join(os.getcwd(), 'data/smartfallmm')
+    print(f"Loading data from {data_dir}")
+    
+    sm_dataset = SmartFallMM_TF(root_dir=data_dir)
+    sm_dataset.set_args(arg)
+    sm_dataset.pipe_line(
+        age_group=arg.dataset_args['age_group'],
+        modalities=arg.dataset_args['modalities'],
+        sensors=arg.dataset_args['sensors']
+    )
+    
+    return sm_dataset

@@ -7,8 +7,7 @@ class TransformerEncoderBlock(layers.Layer):
         super(TransformerEncoderBlock, self).__init__()
         self.att = layers.MultiHeadAttention(
             num_heads=num_heads, 
-            key_dim=embed_dim//num_heads,
-            value_dim=embed_dim//num_heads
+            key_dim=embed_dim//num_heads
         )
         self.ffn = tf.keras.Sequential([
             layers.Dense(ff_dim, activation="relu"),
@@ -18,6 +17,22 @@ class TransformerEncoderBlock(layers.Layer):
         self.layernorm2 = layers.LayerNormalization(epsilon=1e-6)
         self.dropout1 = layers.Dropout(dropout)
         self.dropout2 = layers.Dropout(dropout)
+        
+        # Save parameters for serialization
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.ff_dim = ff_dim
+        self.dropout = dropout
+    
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "embed_dim": self.embed_dim,
+            "num_heads": self.num_heads,
+            "ff_dim": self.ff_dim,
+            "dropout": self.dropout
+        })
+        return config
     
     def call(self, inputs, training=False):
         # Pre-norm transformer architecture
@@ -32,13 +47,9 @@ class TransformerEncoderBlock(layers.Layer):
         x = self.layernorm2(out1)
         ffn_output = self.ffn(x)
         ffn_output = self.dropout2(ffn_output, training=training)
-        return out1 + ffn_output, None  # Return None for attention weights to save memory
+        return out1 + ffn_output
 
 class StudentTransformerTF(Model):
-    """
-    Efficient Transformer model for accelerometer-based human activity recognition.
-    Optimized for compatibility with TensorFlow's GPU operations.
-    """
     def __init__(
             self,
             acc_frames=128,
@@ -53,30 +64,30 @@ class StudentTransformerTF(Model):
         ):
         super(StudentTransformerTF, self).__init__(**kwargs)
         
-        # Model parameters
+        # Save parameters for serialization
         self.acc_frames = acc_frames
+        self.num_classes = num_classes
+        self.num_heads = num_heads
         self.acc_coords = acc_coords
         self.num_layers = num_layers
         self.embed_dim = embed_dim
+        self.ff_dim = ff_dim
+        self.dropout = dropout
         
-        # Explicitly set data_format to channels_last for better compatibility
+        # Input projection
         self.input_projection = tf.keras.Sequential([
             layers.Conv1D(
                 embed_dim, 
                 kernel_size=7, 
                 strides=1, 
                 padding='same',
-                data_format='channels_last',
-                kernel_initializer='glorot_uniform'
+                data_format='channels_last'
             ),
             layers.BatchNormalization(),
             layers.Activation('relu'),
         ])
         
-        # Create positional encoding
-        self.pos_encoding = self._positional_encoding(acc_frames, embed_dim)
-        
-        # Create transformer encoder blocks
+        # Initialize encoder blocks
         self.encoder_blocks = []
         for _ in range(num_layers):
             self.encoder_blocks.append(
@@ -92,34 +103,37 @@ class StudentTransformerTF(Model):
         self.layernorm = layers.LayerNormalization(epsilon=1e-6)
         self.pooling = layers.GlobalAveragePooling1D()
         self.final_dropout = layers.Dropout(dropout)
-        self.classifier = layers.Dense(
-            num_classes,
-            kernel_initializer=tf.keras.initializers.GlorotUniform()
-        )
-        
-        # Initialize with dummy input to build the model
-        self._build_model()
+        self.classifier = layers.Dense(num_classes)
     
-    def _positional_encoding(self, max_len, d_model):
-        """Create standard transformer positional encoding."""
-        positions = np.arange(max_len)[:, np.newaxis]
-        div_term = np.exp(np.arange(0, d_model, 2) * -(np.log(10000.0) / d_model))
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "acc_frames": self.acc_frames,
+            "num_classes": self.num_classes,
+            "num_heads": self.num_heads,
+            "acc_coords": self.acc_coords,
+            "num_layers": self.num_layers,
+            "embed_dim": self.embed_dim,
+            "ff_dim": self.ff_dim,
+            "dropout": self.dropout
+        })
+        return config
+    
+    def build(self, input_shape):
+        # Create positional encoding
+        positions = np.arange(self.acc_frames)[:, np.newaxis]
+        div_term = np.exp(np.arange(0, self.embed_dim, 2) * -(np.log(10000.0) / self.embed_dim))
         
-        pos_encoding = np.zeros((max_len, d_model))
+        pos_encoding = np.zeros((self.acc_frames, self.embed_dim))
         pos_encoding[:, 0::2] = np.sin(positions * div_term)
         pos_encoding[:, 1::2] = np.cos(positions * div_term)
         
-        # Add batch dimension and convert to TF tensor
-        return tf.cast(pos_encoding[np.newaxis, ...], dtype=tf.float32)
+        self.pos_encoding = tf.constant(pos_encoding[np.newaxis, ...], dtype=tf.float32)
+        
+        super().build(input_shape)
     
-    def _build_model(self):
-        """Initialize model weights by running a forward pass with dummy data."""
-        dummy_input = tf.zeros((1, self.acc_frames, self.acc_coords))
-        self({"accelerometer": dummy_input}, training=False)
-    
-    @tf.function
     def call(self, inputs, training=False):
-        """Forward pass with memory optimization and XLA compatibility."""
+        """Forward pass"""
         # Extract input data
         if isinstance(inputs, dict):
             x = inputs['accelerometer']
@@ -127,25 +141,26 @@ class StudentTransformerTF(Model):
             x = inputs
         
         # Apply input projection
-        x = self.input_projection(x, training=training)
+        x = self.input_projection(x)
         
         # Add positional encoding
         seq_len = tf.shape(x)[1]
         x = x + self.pos_encoding[:, :seq_len, :]
         
         # Apply transformer encoder blocks
+        features = x
         for encoder_block in self.encoder_blocks:
-            x, _ = encoder_block(x, training=training)
+            features = encoder_block(features, training=training)
         
         # Apply normalization and global pooling
-        x = self.layernorm(x)
-        features = self.pooling(x)
+        features = self.layernorm(features)
+        features_pooled = self.pooling(features)
         
         # Apply dropout during training
         if training:
-            features = self.final_dropout(features, training=True)
+            features_pooled = self.final_dropout(features_pooled)
         
         # Final classification
-        logits = self.classifier(features)
+        logits = self.classifier(features_pooled)
         
         return logits, features

@@ -1,8 +1,12 @@
 import os
 import argparse
+import sys
+current_dir = os.path.dirname(os.path.abspath(__file__))
+if current_dir not in sys.path:
+    sys.path.append(current_dir)
 import yaml
 import tensorflow as tf
-
+from trainer.base_trainer import Trainer
 def str2bool(v):
     if v.lower() in ('yes', 'true', 't', 'y', '1'):
         return True
@@ -56,43 +60,34 @@ def get_args():
 if __name__ == "__main__":
     # Parse arguments
     parser = get_args()
-    args = parser.parse_args()
+    p = parser.parse_args()
     
     # Load configuration from YAML
-    if args.config is not None:
-        with open(args.config, 'r') as f:
+    if p.config is not None:
+        with open(p.config, 'r') as f:
             config = yaml.safe_load(f)
             
         # Update arguments from config
         for k, v in config.items():
-            if k not in vars(args):
+            if k not in vars(p):
                 print(f'WARNING: Config key "{k}" not in arguments')
             else:
-                # Handle special cases
-                if k == 'device' and isinstance(v, int):
-                    v = str(v)
-                setattr(args, k, v)
+                setattr(p, k, v)
     
     # Initialize random seed
-    init_seed(args.seed)
+    init_seed(p.seed)
     
     # Configure GPU
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(p.device)
     gpus = tf.config.list_physical_devices('GPU')
     if gpus:
-        try:
-            for gpu in gpus:
+        for gpu in gpus:
+            try:
                 tf.config.experimental.set_memory_growth(gpu, True)
-            print(f"Found {len(gpus)} GPU(s), enabled memory growth")
-        except RuntimeError as e:
-            print(e)
-    
-    # Enable mixed precision if requested
-    if args.mixed_precision:
-        policy = tf.keras.mixed_precision.Policy('mixed_float16')
-        tf.keras.mixed_precision.set_global_policy(policy)
-        print(f"Enabled mixed precision with policy: {policy}")
+                print(f"Found GPU: {gpu.name}")
+            except Exception as e:
+                print(f"Error configuring GPU: {e}")
     
     # Create trainer and start training/testing
-    from trainer.base_trainer import Trainer
-    trainer = Trainer(args)
+    trainer = Trainer(p)
     trainer.start()
