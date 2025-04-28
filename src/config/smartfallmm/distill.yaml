@@ -1,40 +1,58 @@
-phase: distill
-model: models.mm_transformer.MMTransformerTF
-teacher_model: models.mm_transformer.MMTransformerTF
+# config/smartfallmm/distill.yaml
+teacher_model: models.mm_transformer.MMTransformer
+model: models.transformer_optimized.TransModel
 dataset: smartfallmm
-subjects: [32, 39, 30, 31, 33, 34, 35, 37, 43, 44, 45, 36, 29]
+
+subjects: [32, 39, 30, 31, 34, 35, 37, 43, 44, 45, 36, 29]
+
+teacher_args:
+  mocap_frames: 128
+  acc_frames: 128
+  num_joints: 32
+  in_chans: 3
+  num_patch: 2
+  acc_coords: 3
+  spatial_embed: 32
+  sdepth: 2
+  adepth: 2
+  tdepth: 2
+  num_heads: 2
+  num_classes: 1
+
 model_args:
   num_classes: 1
-  num_joints: 32
-  embed_dim: 128
-  num_heads: 2  # Reduced to mitigate XLA warnings
-  num_layers: 1  # Reduced to mitigate XLA warnings
-  window_size: 64
-teacher_args:
-  num_classes: 1
-  num_joints: 32
-  embed_dim: 128
-  num_heads: 2  # Reduced to mitigate XLA warnings
-  num_layers: 1  # Reduced to mitigate XLA warnings
-  window_size: 64
-dataset_args:
-  mode: sliding_window
-  max_length: 64  # Aligned with log to reduce padding
-  task: fd
-  modalities: ['skeleton']  # Skeleton-only for teacher training
-  age_group: [young]
-  sensors: []  # No sensors for skeleton data
-  use_dtw: false  # Disabled for skeleton-only training
-batch_size: 4  # Reduced to mitigate XLA warnings
-val_batch_size: 4
-test_batch_size: 4
-num_epoch: 60
+  num_heads: 4
+  embed_dim: 32
+  num_layers: 2
+  dropout: 0.5
+  activation: 'relu'
+  acc_frames: 128
+  acc_coords: 3
+
+dataset_args: 
+  mode: 'sliding_window'
+  max_length: 128
+  task: 'fd'
+  modalities: ['skeleton', 'accelerometer']
+  age_group: ['young']
+  sensors: ['watch']
+
+distill_args:
+  T: 2.0
+  alpha: 0.7
+  fuse: false
+
+batch_size: 64
+test_batch_size: 64
+val_batch_size: 64
+num_epoch: 100
+
+feeder: utils.dataset_tf.UTD_MM_TF
+
+seed: 2
 optimizer: adamw
-base_lr: 0.001
-weight_decay: 0.0004
-temperature: 4.5
-alpha: 0.6
-work_dir: experiments/distill
-model_saved_name: distilled_student
-teacher_weight: experiments/teacher
-print_log: true
+base_lr: 1e-3
+weight_decay: 1e-4
+
+# Point to your teacher model weights
+teacher_weight: ../exps/smartfall_fall_wokd/teacher/skeleton_with_experimental_90.57/spTransformer

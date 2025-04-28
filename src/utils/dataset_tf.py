@@ -546,7 +546,7 @@ class SmartFallMM:
         self.load_files()
         self.match_trials()
 
-def prepare_smartfallmm(arg) -> DatasetBuilder:
+def prepare_smartfallmm_tf(arg) -> DatasetBuilder:
     sm_dataset = SmartFallMM(root_dir=os.path.join(os.getcwd(), 'data/smartfallmm'))
     sm_dataset.pipe_line(
         age_group=arg.dataset_args['age_group'],

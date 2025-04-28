@@ -3,7 +3,7 @@
 import numpy as np
 import logging
 
-class EarlyStoppingTF:
+class EarlyStopping:
     """Early stopping callback for TensorFlow"""
     def __init__(self, patience=15, min_delta=0.00001, verbose=True):
         self.patience = patience

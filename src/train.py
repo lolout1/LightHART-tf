@@ -81,15 +81,25 @@ def get_args():
     # Model parameters
     parser.add_argument('--model', type=str, default=None, 
                         help='Model class path')
-    parser.add_argument('--model-args', type=str, default=None, 
+    parser.add_argument('--model-args', type=dict, default=None, 
                         help='Model arguments')
     parser.add_argument('--weights', type=str, default=None,
                         help='Path to pretrained weights')
     
+    # Distillation parameters
+    parser.add_argument('--teacher-model', type=str, default=None,
+                        help='Teacher model class path for distillation')
+    parser.add_argument('--teacher-args', type=dict, default=None,
+                        help='Teacher model arguments')
+    parser.add_argument('--teacher-weight', type=str, default=None,
+                        help='Path to teacher model weights')
+    parser.add_argument('--distill-args', type=dict, default=None,
+                        help='Distillation arguments')
+    
     # Dataset parameters
     parser.add_argument('--dataset', type=str, default='smartfallmm',
                         help='Dataset to use')
-    parser.add_argument('--dataset-args', type=str, default=None,
+    parser.add_argument('--dataset-args', type=dict, default=None,
                         help='Dataset arguments')
     parser.add_argument('--subjects', nargs='+', type=int, default=None,
                         help='Subject IDs to use')
@@ -179,10 +189,21 @@ def main():
         except Exception as e:
             logger.warning(f"Failed to enable mixed precision: {e}")
     
-    # Import base trainer
+    # Determine if we should use distillation (check if config file contains 'teacher_model')
+    is_distillation = hasattr(args, 'teacher_model') and args.teacher_model is not None
+    
+    # Import appropriate trainer
     try:
-        from trainer.base_trainer import BaseTrainer
-        trainer = BaseTrainer(args)
+        if is_distillation:
+            from trainer.distiller import DistillationTrainer
+            logger.info("Using knowledge distillation training")
+            trainer = DistillationTrainer(args)
+        else:
+            from trainer.base_trainer import BaseTrainer
+            logger.info("Using standard training")
+            trainer = BaseTrainer(args)
+        
+        # Start training
         trainer.start()
     except Exception as e:
         logger.error(f"Error initializing trainer: {e}")

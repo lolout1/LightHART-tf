@@ -244,10 +244,10 @@ class BaseTrainer:
 
     def load_data(self):
         try:
-            from utils.dataset_tf import prepare_smartfallmm, split_by_subjects, UTD_MM_TF
+            from utils.dataset_tf import prepare_smartfallmm_tf, split_by_subjects, UTD_MM_TF
 
             self.print_log(f"Creating dataset: {self.arg.dataset}")
-            builder = prepare_smartfallmm(self.arg)
+            builder = prepare_smartfallmm_tf(self.arg)
 
             self.print_log(f"Processing training data for subjects: {self.train_subjects}")
             self.norm_train = split_by_subjects(builder, self.train_subjects, self.fuse)
