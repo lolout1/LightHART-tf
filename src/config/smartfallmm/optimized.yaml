@@ -35,3 +35,4 @@ weight_decay: 0.0004
 phase: 'train'
 seed: 2
 print_log: True
+num_worker: 16

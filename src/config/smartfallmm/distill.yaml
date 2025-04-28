@@ -4,23 +4,30 @@ teacher_model: models.mm_transformer.MMTransformerTF
 dataset: smartfallmm
 subjects: [32, 39, 30, 31, 33, 34, 35, 37, 43, 44, 45, 36, 29]
 model_args:
-  acc_frames: 128
-  acc_coords: 3
   num_classes: 1
+  num_joints: 32
+  embed_dim: 128
+  num_heads: 2  # Reduced to mitigate XLA warnings
+  num_layers: 1  # Reduced to mitigate XLA warnings
+  window_size: 64
 teacher_args:
-  acc_frames: 128
   num_classes: 1
+  num_joints: 32
+  embed_dim: 128
+  num_heads: 2  # Reduced to mitigate XLA warnings
+  num_layers: 1  # Reduced to mitigate XLA warnings
+  window_size: 64
 dataset_args:
-  mode: 'sliding_window'
-  max_length: 64
-  task: 'fd'
-  modalities: ['accelerometer', 'skeleton']  # Keep both for DTW alignment
-  age_group: ['young']
-  sensors: ['watch']
-  use_dtw: true
-batch_size: 16
-val_batch_size: 16
-test_batch_size: 16
+  mode: sliding_window
+  max_length: 64  # Aligned with log to reduce padding
+  task: fd
+  modalities: ['skeleton']  # Skeleton-only for teacher training
+  age_group: [young]
+  sensors: []  # No sensors for skeleton data
+  use_dtw: false  # Disabled for skeleton-only training
+batch_size: 4  # Reduced to mitigate XLA warnings
+val_batch_size: 4
+test_batch_size: 4
 num_epoch: 60
 optimizer: adamw
 base_lr: 0.001

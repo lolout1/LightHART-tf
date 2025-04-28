@@ -38,11 +38,12 @@ export TF_FORCE_GPU_ALLOW_GROWTH=true
 # Run distillation
 echo "Starting distillation at $(date)" | tee -a "$LOG_FILE"
 python3 distillation.py --config "$CONFIG_PATH" 2>&1 | tee -a "$LOG_FILE"
+EXIT_STATUS=$?
 
-if [ $? -eq 0 ]; then
+if [ $EXIT_STATUS -eq 0 ]; then
     echo "Distillation completed successfully at $(date)" | tee -a "$LOG_FILE"
     echo "Results in: $WORK_DIR/scores.csv" | tee -a "$LOG_FILE"
 else
-    echo "Distillation failed! Check $LOG_FILE" | tee -a "$LOG_FILE"
-    exit 1
+    echo "Distillation failed with exit status $EXIT_STATUS! Check $LOG_FILE" | tee -a "$LOG_FILE"
+    exit $EXIT_STATUS
 fi

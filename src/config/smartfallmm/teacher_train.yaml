@@ -1,8 +1,30 @@
-data_path: './data'
-batch_size: 32
-shuffle_buffer: 1000
-num_folds: 5
-num_epochs_teacher: 50
-learning_rate: 0.001
-teacher_weights: './weights/teacher_fold_{fold}.h5'
-checkpoint_dir: './checkpoints'
+model: models.mm_transformer.MMTransformerTF
+dataset: smartfallmm
+subjects: [32, 39, 30, 31, 33, 34, 35, 37, 43, 44, 45, 36, 29]
+model_args:
+  num_classes: 1
+  num_joints: 32
+  embed_dim: 128
+  num_heads: 4
+  num_layers: 2
+  window_size: 128
+dataset_args:
+  mode: sliding_window
+  max_length: 128
+  task: fd
+  modalities: '[skeleton']
+  age_group: [young]
+  sensors: []
+  use_dtw: false
+batch_size: 16
+test_batch_size: 16
+val_batch_size: 16
+num_epoch: 60
+optimizer: adamw
+base_lr: 0.001
+weight_decay: 0.0004
+work_dir: experiments/teacher
+model_saved_name: teacher_model
+phase: train
+seed: 2
+print_log: true
