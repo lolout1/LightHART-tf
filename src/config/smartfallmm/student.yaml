@@ -15,7 +15,7 @@ model_args:
   norm_first: true
 
 dataset_args: 
-  mode: 'selective_sliding_window'
+  mode: 'sliding_window'
   max_length: 64 
   task: 'fd'
   modalities: ['accelerometer','skeleton']
