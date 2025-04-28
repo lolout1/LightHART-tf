@@ -7,6 +7,7 @@ if current_dir not in sys.path:
 import yaml
 import tensorflow as tf
 from trainer.base_trainer import Trainer
+
 def str2bool(v):
     if v.lower() in ('yes', 'true', 't', 'y', '1'):
         return True

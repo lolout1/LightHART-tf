@@ -6,10 +6,10 @@ import numpy as np
 import tensorflow as tf
 from tqdm import tqdm
 import matplotlib.pyplot as plt
-from collections import defaultdict
 import json
 import traceback
 import sys
+import logging
 
 class Trainer:
     def __init__(self, arg):
@@ -38,6 +38,8 @@ class Trainer:
             self.arg.test_batch_size = 32
         if not hasattr(self.arg, 'val_batch_size') or not self.arg.val_batch_size:
             self.arg.val_batch_size = 32
+        
+        logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
         
         from utils.common import import_class
         from utils.callbacks import EarlyStoppingTF
@@ -71,16 +73,19 @@ class Trainer:
             try:
                 for gpu in gpus:
                     tf.config.experimental.set_memory_growth(gpu, True)
-                print(f"Found {len(gpus)} GPU(s), enabled memory growth")
+                logging.info(f"Found {len(gpus)} GPU(s), enabled memory growth")
             except: 
-                print("Error configuring GPU")
+                logging.warning("Error configuring GPU")
         
         if self.arg.phase == 'train':
             self.model = self.load_model(arg.model, arg.model_args)
         else:
             try:
                 self.model = self.load_model(arg.model, arg.model_args)
-                self.model.load_weights(self.arg.weights)
+                if self.arg.weights.endswith('.h5'):
+                    self.model.load_weights(self.arg.weights)
+                else:
+                    self.model = tf.keras.models.load_model(self.arg.weights)
             except Exception as e:
                 self.print_log(f"Error loading model: {e}")
                 self.print_log(traceback.format_exc())
@@ -131,11 +136,8 @@ class Trainer:
         try:
             ModelClass = self.import_class(model_name)
             model = ModelClass(**model_args)
-            dummy_input = {
-                'accelerometer': tf.zeros((1, model_args.get('acc_frames', 128), 
-                                    model_args.get('acc_coords', 4)))
-            }
-            model(dummy_input, training=False)
+            sample_input = tf.zeros((1, model_args.get('acc_frames', 128), model_args.get('acc_coords', 4)))
+            model(sample_input)
             return model
         except Exception as e:
             self.print_log(f"Error loading model: {e}")
@@ -159,8 +161,7 @@ class Trainer:
                     y_true = tf.cast(y_true, tf.float32)
                     prob = tf.sigmoid(y_pred)
                     pt = tf.where(tf.equal(y_true, 1.0), prob, 1 - prob)
-                    alpha_t = tf.where(tf.equal(y_true, 1.0), 
-                                      self.alpha, 1 - self.alpha)
+                    alpha_t = tf.where(tf.equal(y_true, 1.0), self.alpha, 1 - self.alpha)
                     focal_loss = -alpha_t * tf.pow(1 - pt, self.gamma) * tf.math.log(tf.clip_by_value(pt, 1e-8, 1.0))
                     return focal_loss
             self.criterion = BinaryFocalLoss(alpha=0.75)
@@ -169,45 +170,45 @@ class Trainer:
     
     def load_optimizer(self):
         if self.arg.optimizer.lower() == 'adam':
-            self.optimizer = tf.keras.optimizers.Adam(
-                learning_rate=self.arg.base_lr
-            )
+            self.optimizer = tf.keras.optimizers.Adam(learning_rate=self.arg.base_lr)
         elif self.arg.optimizer.lower() == 'adamw':
             try:
                 self.optimizer = tf.keras.optimizers.AdamW(
                     learning_rate=self.arg.base_lr,
                     weight_decay=self.arg.weight_decay
                 )
-            except (ImportError, AttributeError):
+            except:
                 self.print_log("AdamW not available, using Adam with weight decay")
-                self.optimizer = tf.keras.optimizers.Adam(
-                    learning_rate=self.arg.base_lr
-                )
+                self.optimizer = tf.keras.optimizers.Adam(learning_rate=self.arg.base_lr)
         elif self.arg.optimizer.lower() == 'sgd':
-            self.optimizer = tf.keras.optimizers.SGD(
-                learning_rate=self.arg.base_lr
-            )
+            self.optimizer = tf.keras.optimizers.SGD(learning_rate=self.arg.base_lr)
         else:
-            self.optimizer = tf.keras.optimizers.Adam(
-                learning_rate=self.arg.base_lr
-            )
+            self.optimizer = tf.keras.optimizers.Adam(learning_rate=self.arg.base_lr)
     
     def load_data(self):
         if self.arg.phase == 'train':
             builder = self.prepare_smartfallmm_tf(self.arg)
-            self.norm_train = self.split_by_subjects_tf(builder, self.train_subjects, self.fuse)
-            self.norm_val = self.split_by_subjects_tf(builder, self.val_subject, self.fuse)
+            use_dtw = self.arg.dataset_args.get('use_dtw', True)
+            verbose = self.arg.dataset_args.get('verbose', True)
+            
+            self.norm_train = self.split_by_subjects_tf(builder, self.train_subjects, self.fuse, use_dtw, verbose)
+            self.norm_val = self.split_by_subjects_tf(builder, self.val_subject, self.fuse, use_dtw, verbose)
             if self.has_empty_value(list(self.norm_val.values())):
                 return False
+                
             self.data_loader['train'] = self.UTD_MM_TF(self.norm_train, self.arg.batch_size)
             self.data_loader['val'] = self.UTD_MM_TF(self.norm_val, self.arg.val_batch_size)
+            
             self.cal_weights()
             self.distribution_viz(self.norm_train['labels'], self.arg.work_dir, 'train')
-            self.norm_test = self.split_by_subjects_tf(builder, self.test_subject, self.fuse)
+            
+            self.norm_test = self.split_by_subjects_tf(builder, self.test_subject, self.fuse, use_dtw, verbose)
             if self.has_empty_value(list(self.norm_test.values())):
                 return False
+                
             self.data_loader['test'] = self.UTD_MM_TF(self.norm_test, self.arg.test_batch_size)
             self.distribution_viz(self.norm_test['labels'], self.arg.work_dir, f'test_{self.test_subject[0]}')
+            
             return True
     
     def distribution_viz(self, labels, work_dir, mode):
@@ -236,6 +237,9 @@ class Trainer:
                 print(string, file=f)
     
     def loss_viz(self, train_loss, val_loss):
+        if not train_loss or not val_loss or len(train_loss) == 0 or len(val_loss) == 0:
+            return
+            
         epochs = range(len(train_loss))
         plt.figure()
         plt.plot(epochs, train_loss, 'b', label='Training Loss')
@@ -250,67 +254,76 @@ class Trainer:
     def create_df(self):
         return []
     
-    def save_to_h5(self, model, save_path):
+    def save_model(self, model, save_path, save_format='weights'):
         try:
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
-            model.save(save_path)
-            self.print_log(f"Model weights saved to {save_path}")
+            
+            if save_format == 'weights':
+                model.save_weights(save_path, save_format='h5')
+                self.print_log(f"Model weights saved to {save_path}")
+            elif save_format == 'keras':
+                if save_path.endswith('.h5'):
+                    save_path = save_path[:-3] + '.keras'
+                model.save(save_path, save_format='keras')
+                self.print_log(f"Full model saved to {save_path}")
+            else:
+                model.save(save_path, save_format='h5')
+                self.print_log(f"Full model saved to {save_path} in HDF5 format")
+                
             return True
         except Exception as e:
-            self.print_log(f"Error saving model weights: {e}")
+            self.print_log(f"Error saving model: {str(e)}")
             self.print_log(traceback.format_exc())
             return False
-    
-    def save_to_tflite(self, save_path, output_path):
+
+    def export_to_tflite(self, model, output_path, sample_batch=None):
         try:
-            ModelClass = self.import_class(self.arg.model)
-            model = ModelClass(**self.arg.model_args)
-            model.load_weights(save_path)
+            if sample_batch is None:
+                sample_shape = (1, 128, 4)
+                sample_input = tf.constant(np.zeros(sample_shape, dtype=np.float32))
+                sample_dict = {'accelerometer': sample_input}
+            else:
+                sample_dict = sample_batch
             
-            @tf.function(input_signature=[
-                tf.TensorSpec([1, 128, 4], tf.float32, name='accelerometer')
-            ])
-            def serving_fn(accelerometer):
-                return model({'accelerometer': accelerometer})
+            # Create a wrapped model with a defined signature
+            class WrappedModel(tf.Module):
+                def __init__(self, model):
+                    super().__init__()
+                    self.model = model
+                
+                @tf.function(input_signature=[tf.TensorSpec(shape=[1, 128, 4], dtype=tf.float32)])
+                def __call__(self, x):
+                    logits, _ = self.model(x, training=False)
+                    return {'output': tf.sigmoid(logits)}
+                    
+            wrapped_model = WrappedModel(model)
             
-            concrete_func = serving_fn.get_concrete_function()
-            converter = tf.lite.TFLiteConverter.from_concrete_functions([concrete_func])
+            # Test the wrapped model
+            wrapped_model(sample_input)
+            
+            # Convert to TFLite
+            converter = tf.lite.TFLiteConverter.from_concrete_functions(
+                [wrapped_model.__call__.get_concrete_function()]
+            )
+            
+            converter.target_spec.supported_ops = [
+                tf.lite.OpsSet.TFLITE_BUILTINS,
+                tf.lite.OpsSet.SELECT_TF_OPS
+            ]
+            
             converter.optimizations = [tf.lite.Optimize.DEFAULT]
             tflite_model = converter.convert()
             
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
             with open(output_path, 'wb') as f:
                 f.write(tflite_model)
                 
-            self.print_log(f"Successfully converted model to TFLite: {output_path}")
+            self.print_log(f"Successfully exported model to TFLite: {output_path}")
             return True
         except Exception as e:
-            self.print_log(f"Error converting to TFLite: {e}")
+            self.print_log(f"Error exporting to TFLite: {str(e)}")
             self.print_log(traceback.format_exc())
             return False
-    
-    @tf.function
-    def train_step(self, data, labels):
-        with tf.GradientTape() as tape:
-            logits, _ = self.model(data, training=True)
-            logits = tf.reshape(logits, [-1])
-            labels = tf.cast(labels, tf.float32)
-            loss = self.criterion(labels, logits)
-            loss = tf.reduce_mean(loss)
-        
-        gradients = tape.gradient(loss, self.model.trainable_variables)
-        self.optimizer.apply_gradients(zip(gradients, self.model.trainable_variables))
-        preds = tf.cast(tf.sigmoid(logits) > 0.5, tf.int32)
-        return loss, preds
-    
-    @tf.function
-    def test_step(self, data, labels):
-        logits, _ = self.model(data, training=False)
-        logits = tf.reshape(logits, [-1])
-        labels = tf.cast(labels, tf.float32)
-        loss = self.criterion(labels, logits)
-        loss = tf.reduce_mean(loss)
-        preds = tf.cast(tf.sigmoid(logits) > 0.5, tf.int32)
-        return loss, preds
     
     def train(self, epoch):
         self.model.trainable = True
@@ -324,14 +337,38 @@ class Trainer:
         train_loss = 0
         cnt = 0
         
+        # Initialize optimizer variables with a warm-up step if needed
+        try:
+            # Warm-up step to initialize optimizer variables
+            if epoch == 0:
+                warm_data = next(iter(loader))[0]
+                with tf.GradientTape() as tape:
+                    logits, _ = self.model(warm_data, training=True)
+                    dummy_loss = tf.reduce_mean(logits)
+                gradients = tape.gradient(dummy_loss, self.model.trainable_variables)
+                self.optimizer.apply_gradients(zip(gradients, self.model.trainable_variables))
+        except Exception as e:
+            self.print_log(f"Warm-up step failed, but training will continue: {e}")
+        
+        # Main training loop - WITHOUT tf.function to avoid variable creation issues
         for batch_idx in tqdm(range(len(loader)), desc=f"Epoch {epoch+1}"):
             try:
                 batch_data, batch_targets, _ = loader[batch_idx]
                 timer['dataloader'] += self.split_time()
                 
-                loss, preds = self.train_step(batch_data, batch_targets)
+                # Manual training step
+                with tf.GradientTape() as tape:
+                    logits, _ = self.model(batch_data, training=True)
+                    logits = tf.reshape(logits, [-1])
+                    batch_targets = tf.cast(batch_targets, tf.float32)
+                    loss = self.criterion(batch_targets, logits)
+                    loss = tf.reduce_mean(loss)
                 
-                train_loss += loss
+                gradients = tape.gradient(loss, self.model.trainable_variables)
+                self.optimizer.apply_gradients(zip(gradients, self.model.trainable_variables))
+                
+                train_loss += loss.numpy()
+                preds = tf.cast(tf.sigmoid(logits) > 0.5, tf.int32)
                 label_list.extend(batch_targets.numpy())
                 pred_list.extend(preds.numpy())
                 cnt += 1
@@ -344,9 +381,11 @@ class Trainer:
         
         if cnt > 0:
             train_loss /= cnt
-            accuracy, f1, recall, precision, auc_score = self.calculate_metrics(label_list, pred_list)
+            metrics_dict, (accuracy, f1, recall, precision, auc_score) = self.calculate_metrics(
+                label_list, pred_list
+            )
             
-            self.train_loss_summary.append(train_loss.numpy())
+            self.train_loss_summary.append(train_loss)
             
             proportion = {
                 k: '{:02d}%'.format(int(round(v * 100 / sum(timer.values()))))
@@ -354,7 +393,7 @@ class Trainer:
             }
             
             self.print_log(
-                f'\tTraining Loss: {train_loss.numpy():.4f}, Acc: {accuracy:.2f}%, F1: {f1:.2f}%, '
+                f'\tTraining Loss: {train_loss:.4f}, Acc: {accuracy:.2f}%, F1: {f1:.2f}%, '
                 f'Precision: {precision:.2f}%, Recall: {recall:.2f}%, AUC: {auc_score:.2f}%'
             )
             
@@ -362,8 +401,6 @@ class Trainer:
             
             val_loss, val_metrics = self.eval(epoch, loader_name='val', result_file=self.arg.result_file)
             self.val_loss_summary.append(val_loss)
-            
-            self.early_stop(val_loss)
     
     def eval(self, epoch, loader_name='val', result_file=None):
         self.model.trainable = False
@@ -384,9 +421,15 @@ class Trainer:
             try:
                 batch_data, batch_targets, _ = loader[batch_idx]
                 
-                batch_loss, preds = self.test_step(batch_data, batch_targets)
+                # Forward pass without tf.function
+                logits, _ = self.model(batch_data, training=False)
+                logits = tf.reshape(logits, [-1])
+                batch_targets = tf.cast(batch_targets, tf.float32)
+                batch_loss = self.criterion(batch_targets, logits)
+                batch_loss = tf.reduce_mean(batch_loss)
                 
-                loss += batch_loss
+                loss += batch_loss.numpy()
+                preds = tf.cast(tf.sigmoid(logits) > 0.5, tf.int32)
                 label_list.extend(batch_targets.numpy())
                 pred_list.extend(preds.numpy())
                 cnt += 1
@@ -395,16 +438,10 @@ class Trainer:
                 self.print_log(traceback.format_exc())
         
         if cnt > 0:
-            loss /= cnt
-            accuracy, f1, recall, precision, auc_score = self.calculate_metrics(label_list, pred_list)
-            
-            metrics = {
-                'accuracy': accuracy,
-                'f1': f1,
-                'recall': recall,
-                'precision': precision,
-                'auc': auc_score
-            }
+            loss = loss / cnt
+            metrics_dict, (accuracy, f1, recall, precision, auc_score) = self.calculate_metrics(
+                label_list, pred_list
+            )
             
             if result_file is not None:
                 for i, x in enumerate(pred_list):
@@ -412,23 +449,35 @@ class Trainer:
                 f_r.close()
             
             self.print_log(
-                f'{loader_name.capitalize()} Loss: {loss.numpy():.4f}, Acc: {accuracy:.2f}%, '
+                f'{loader_name.capitalize()} Loss: {loss:.4f}, Acc: {accuracy:.2f}%, '
                 f'F1: {f1:.2f}%, Precision: {precision:.2f}%, Recall: {recall:.2f}%, AUC: {auc_score:.2f}%'
             )
             
             if loader_name == 'val':
-                if loss < self.best_loss or f1 > self.best_f1:
-                    if loss < self.best_loss:
-                        self.best_loss = loss
-                    if f1 > self.best_f1:
-                        self.best_f1 = f1
-                    
+                is_best_loss = loss < self.best_loss
+                is_best_f1 = f1 > self.best_f1
+                
+                if is_best_loss:
+                    self.best_loss = loss
+                    self.print_log(f"New best validation loss: {loss:.6f}")
+                
+                if is_best_f1:
+                    self.best_f1 = f1
+                    self.print_log(f"New best validation F1: {f1:.2f}%")
+                
+                if is_best_loss or is_best_f1:
                     checkpoint_dir = os.path.join(self.arg.work_dir, 'models')
                     model_save_path = os.path.join(checkpoint_dir, f'{self.arg.model_saved_name}_{self.test_subject[0]}.h5')
                     
-                    if self.save_to_h5(self.model, model_save_path):
-                        tflite_path = os.path.join(checkpoint_dir, f'{self.arg.model_saved_name}_{self.test_subject[0]}.tflite')
-                        self.save_to_tflite(model_save_path, tflite_path)
+                    # Save weights only - more reliable
+                    if self.save_model(self.model, model_save_path, save_format='weights'):
+                        # Only try to export to TFLite once per fold with the best model
+                        if not hasattr(self, f'exported_tflite_{self.test_subject[0]}'):
+                            tflite_path = os.path.join(checkpoint_dir, f'{self.arg.model_saved_name}_{self.test_subject[0]}.tflite')
+                            if self.export_to_tflite(self.model, tflite_path, batch_data):
+                                setattr(self, f'exported_tflite_{self.test_subject[0]}', True)
+                
+                self.early_stop(loss)
             else:
                 self.test_accuracy = accuracy
                 self.test_f1 = f1
@@ -436,7 +485,7 @@ class Trainer:
                 self.test_precision = precision
                 self.test_auc = auc_score
             
-            return loss.numpy(), metrics
+            return loss, metrics_dict
         
         return float('inf'), None
     
@@ -478,6 +527,7 @@ class Trainer:
                 try:
                     self.load_optimizer()
                     self.load_loss()
+                    self.early_stop.early_stop = False  # Reset early stopping
                     
                     for epoch in range(self.arg.start_epoch, self.arg.num_epoch):
                         self.train(epoch)
@@ -485,6 +535,7 @@ class Trainer:
                             self.print_log("Early stopping triggered")
                             break
                     
+                    # Load best model for testing
                     best_model_path = os.path.join(self.arg.work_dir, 'models', f'{self.arg.model_saved_name}_{self.test_subject[0]}.h5')
                     if os.path.exists(best_model_path):
                         try:

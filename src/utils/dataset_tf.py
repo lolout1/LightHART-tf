@@ -4,6 +4,7 @@ import tensorflow as tf
 from collections import defaultdict
 from tqdm import tqdm
 from multiprocessing import Pool, cpu_count
+import logging
 
 class SmartFallMM_TF:
     def __init__(self, root_dir):
@@ -26,23 +27,26 @@ class SmartFallMM_TF:
         self.selected_sensors[modality_name] = sensor_name
     
     def load_files(self):
+        total_files = 0
+        loaded_files = 0
+        
         for age_group, modalities in self.age_groups.items():
             for modality_name in modalities:
                 if modality_name == "skeleton":
                     modality_dir = os.path.join(self.root_dir, age_group, modality_name)
                 else:
                     sensor_name = self.selected_sensors.get(modality_name)
-                    if not sensor_name:
-                        continue
+                    if not sensor_name: continue
                     modality_dir = os.path.join(self.root_dir, age_group, modality_name, sensor_name)
                 
                 if not os.path.exists(modality_dir):
-                    print(f"Directory not found: {modality_dir}")
+                    logging.warning(f"Directory not found: {modality_dir}")
                     continue
-                    
+                
                 file_count = 0
                 for root, _, files in os.walk(modality_dir):
                     for file in files:
+                        total_files += 1
                         if file.endswith('.csv'):
                             try:
                                 subject_id = int(file[1:3])
@@ -51,15 +55,16 @@ class SmartFallMM_TF:
                                 file_path = os.path.join(root, file)
                                 self._add_to_matched_trials(modality_name, subject_id, action_id, sequence_number, file_path)
                                 file_count += 1
-                            except Exception:
-                                # Skip files with naming errors
+                                loaded_files += 1
+                            except Exception as e:
                                 pass
                 
-                print(f"Loaded {file_count} files from {modality_dir}")
+                logging.info(f"Loaded {file_count} files from {modality_dir}")
         
-        print(f"Found {len(self.matched_trials)} matched trials")
+        logging.info(f"Found {len(self.matched_trials)} matched trials from {loaded_files}/{total_files} files")
     
     def _add_to_matched_trials(self, modality_name, subject_id, action_id, sequence_number, file_path):
+        # Find or create a matched trial
         matched_trial = None
         for trial in self.matched_trials:
             if (trial["subject_id"] == subject_id and 
@@ -93,31 +98,33 @@ class SmartFallMM_TF:
 
 class UTD_MM_TF(tf.keras.utils.Sequence):
     def __init__(self, dataset, batch_size):
-        # Initialize data safely
         self.acc_data = dataset.get('accelerometer', None)
         self.skl_data = dataset.get('skeleton', None)
         self.labels = dataset.get('labels', None)
         
-        # Handle empty/missing data
         if self.acc_data is None or len(self.acc_data) == 0:
-            print("Warning: Empty accelerometer data")
+            logging.warning("Empty accelerometer data in dataset")
             self.acc_data = np.zeros((1, 128, 3), dtype=np.float32)
             self.num_samples = 1
         else:
             self.num_samples = self.acc_data.shape[0]
-            
-        # Handle skeleton data if present
+        
         if self.skl_data is not None and len(self.skl_data) > 0:
             if len(self.skl_data.shape) == 3:
-                self.skl_data = np.reshape(
-                    self.skl_data,
-                    (self.skl_data.shape[0], self.skl_data.shape[1], -1, 3)
-                )
+                try:
+                    joints = self.skl_data.shape[2] // 3
+                    self.skl_data = np.reshape(
+                        self.skl_data,
+                        (self.skl_data.shape[0], self.skl_data.shape[1], joints, 3)
+                    )
+                except Exception as e:
+                    logging.error(f"Error reshaping skeleton data: {e}")
         
-        # Ensure labels match data
         if self.labels is None or len(self.labels) == 0:
-            self.labels = np.zeros(self.num_samples, dtype=np.int32)
+            logging.warning("No labels in dataset, using zeros")
+            self.labels = np.zeros(self.num_samples, dtype=np.int64)
         elif len(self.labels) != self.num_samples:
+            logging.warning(f"Labels length {len(self.labels)} doesn't match data samples {self.num_samples}")
             if len(self.labels) > self.num_samples:
                 self.labels = self.labels[:self.num_samples]
             else:
@@ -129,49 +136,40 @@ class UTD_MM_TF(tf.keras.utils.Sequence):
         
         self.batch_size = batch_size
         self.smv_cache = None
-        
-        # Pre-compute signal magnitude vector
         self._prepare_data()
     
     def _prepare_data(self):
-        """Pre-process data for faster batch retrieval"""
         try:
-            # Convert to TensorFlow tensors
+            # Convert to tensors
             self.acc_data = tf.convert_to_tensor(self.acc_data, dtype=tf.float32)
             self.labels = tf.convert_to_tensor(self.labels, dtype=tf.int32)
             
-            # Calculate signal magnitude vector
+            # Calculate signal magnitude vector (SMV)
             mean = tf.reduce_mean(self.acc_data, axis=1, keepdims=True)
             zero_mean = self.acc_data - mean
             sum_squared = tf.reduce_sum(tf.square(zero_mean), axis=-1, keepdims=True)
             self.smv_cache = tf.sqrt(sum_squared)
             
-            # Convert skeleton data if present
             if self.skl_data is not None and len(self.skl_data) > 0:
                 self.skl_data = tf.convert_to_tensor(self.skl_data, dtype=tf.float32)
         except Exception as e:
-            print(f"Error preparing data: {e}")
+            logging.error(f"Error preparing data: {e}")
     
     def __len__(self):
-        """Return number of batches"""
         return max(1, (self.num_samples + self.batch_size - 1) // self.batch_size)
     
     def __getitem__(self, idx):
-        """Get batch at position idx"""
         try:
-            # Calculate start and end indices safely
             start_idx = idx * self.batch_size
             end_idx = min(start_idx + self.batch_size, self.num_samples)
             
-            # Ensure indices are within bounds
             if start_idx >= self.num_samples:
                 start_idx = 0
                 end_idx = min(self.batch_size, self.num_samples)
             
-            # Get batch indices
             indices = tf.range(start_idx, end_idx)
             
-            # Get data for the batch
+            # Get batch data
             batch_acc = tf.gather(self.acc_data, indices)
             batch_smv = tf.gather(self.smv_cache, indices)
             
@@ -188,105 +186,32 @@ class UTD_MM_TF(tf.keras.utils.Sequence):
             return batch_data, batch_labels, indices.numpy()
             
         except Exception as e:
-            print(f"Error generating batch {idx}: {e}")
-            # Return safe dummy data
+            logging.error(f"Error in batch generation {idx}: {e}")
+            # Return dummy data on error
             dummy_data = {'accelerometer': tf.zeros((1, 128, 4), dtype=tf.float32)}
             return dummy_data, tf.zeros(1, dtype=tf.int32), np.array([0])
 
-def _process_trial(args):
-    """Process a single trial for parallel processing"""
-    from utils.loaders import csvloader_tf, butterworth_filter_tf, align_sequence_tf, sliding_window_tf
-    
-    trial, subjects, builder_args, verbose = args
-    
-    if trial["subject_id"] not in subjects:
-        return None
-        
-    try:
-        # Determine label based on task
-        if builder_args and 'task' in builder_args:
-            task = builder_args['task']
-            if task == 'fd':
-                label = int(trial["action_id"] > 9)
-            elif task == 'age':
-                label = int(trial["subject_id"] < 29 or trial["subject_id"] > 46)
-            else:
-                label = trial["action_id"] - 1
-        else:
-            label = trial["action_id"] - 1
-        
-        # Load data for each modality
-        trial_data = defaultdict(np.ndarray)
-        for modality, file_path in trial["files"].items():
-            try:
-                unimodal_data = csvloader_tf(file_path, verbose=verbose)
-                if unimodal_data is not None and len(unimodal_data) > 0:
-                    if modality == 'accelerometer':
-                        unimodal_data = butterworth_filter_tf(unimodal_data, verbose=verbose)
-                    trial_data[modality] = unimodal_data
-            except Exception as e:
-                if verbose:
-                    print(f"Error loading {modality} file: {e}")
-                continue
-        
-        # Skip if modalities are missing
-        if not trial_data:
-            return None
-        
-        # Apply DTW alignment
-        trial_data = align_sequence_tf(trial_data, verbose=verbose)
-        
-        # Apply windowing based on mode
-        if builder_args and 'mode' in builder_args:
-            mode = builder_args['mode']
-            max_length = builder_args.get('max_length', 128)
-            
-            if mode == 'sliding_window':
-                processed_data = sliding_window_tf(trial_data, max_length, label, verbose=verbose)
-            else:
-                # For avg_pool mode
-                processed_data = {}
-                for k, v in trial_data.items():
-                    if len(v) > max_length:
-                        processed_data[k] = v[:max_length]
-                    else:
-                        processed_data[k] = v
-                processed_data['labels'] = np.array([label])
-        else:
-            processed_data = sliding_window_tf(trial_data, 128, label, verbose=verbose)
-        
-        # Ensure we have valid data
-        if processed_data and any(len(v) > 0 for k, v in processed_data.items() if k != 'labels'):
-            return processed_data
-        
-        return None
-    except Exception as e:
-        if verbose:
-            print(f"Error processing trial: {e}")
-        return None
-
-def split_by_subjects_tf(builder, subjects, fuse=False):
-    """Split dataset by subjects using parallel processing"""
+def split_by_subjects_tf(builder, subjects, fuse=False, use_dtw=True, verbose=False):
     import time
     from multiprocessing import Pool, cpu_count
-    from utils.loaders import normalize_data_tf
+    from utils.loaders import normalize_data_tf, _process_trial
     
-    print(f"Processing data for subjects {subjects} using parallel processing")
     start_time = time.time()
+    logging.info(f"Processing data for subjects {subjects} using parallel processing")
     
-    # Limit CPU cores
-    num_cores = min(cpu_count(), 16)
-    print(f"Using {num_cores} CPU cores for preprocessing")
+    # Limit CPU cores for stability
+    num_cores = min(cpu_count(), 8)
+    logging.info(f"Using {num_cores} CPU cores for preprocessing")
     
     # Prepare arguments for parallel processing
-    verbose = False
     process_args = [
-        (trial, subjects, builder.args.dataset_args if hasattr(builder, 'args') else None, verbose) 
+        (trial, subjects, builder.args.dataset_args if hasattr(builder, 'args') else None, verbose, use_dtw) 
         for trial in builder.matched_trials
     ]
     
     data = defaultdict(list)
     processed_trials = 0
+    failed_trials = 0
     
     # Process trials in parallel
     with Pool(processes=num_cores) as pool:
@@ -296,7 +221,7 @@ def split_by_subjects_tf(builder, subjects, fuse=False):
             desc=f"Processing {len(process_args)} trials"
         ))
     
-    # Collect results
+    # Collect and merge results
     for result in results:
         if result is not None:
             for key, value in result.items():
@@ -309,51 +234,59 @@ def split_by_subjects_tf(builder, subjects, fuse=False):
                 data['labels'].extend(result['labels'])
             
             processed_trials += 1
+        else:
+            failed_trials += 1
     
-    print(f"Successfully processed {processed_trials} trials in {time.time()-start_time:.2f}s")
+    logging.info(f"Successfully processed {processed_trials} trials, failed {failed_trials} trials")
     
     # Concatenate data
     for key in list(data.keys()):
         if key != 'labels':
             if len(data[key]) > 0:
                 try:
-                    print(f"Concatenating {len(data[key])} {key} arrays...")
+                    logging.info(f"Concatenating {len(data[key])} {key} arrays...")
                     data[key] = np.concatenate(data[key], axis=0)
-                    print(f"Final shape of {key}: {data[key].shape}")
+                    logging.info(f"Final shape of {key}: {data[key].shape}")
                 except Exception as e:
-                    print(f"Error concatenating {key} data: {e}")
+                    logging.error(f"Error concatenating {key} data: {e}")
                     del data[key]
             else:
                 del data[key]
         else:
-            data[key] = np.array(data[key])
-            print(f"Final labels shape: {data[key].shape}, class distribution: {np.unique(data[key], return_counts=True)}")
+            data[key] = np.array(data[key], dtype=np.int64)  # Ensure int64
+            unique_labels, counts = np.unique(data[key], return_counts=True)
+            logging.info(f"Final labels shape: {data[key].shape}, distribution: {list(zip(unique_labels, counts))}")
     
     # Normalize the data
-    print("Normalizing data...")
-    norm_start_time = time.time()
+    logging.info("Normalizing data...")
     try:
         if data:
             data = normalize_data_tf(data, verbose=verbose)
     except Exception as e:
-        print(f"Error normalizing data: {e}")
+        logging.error(f"Error normalizing data: {e}")
     
-    print(f"Normalization completed in {time.time()-norm_start_time:.2f}s")
-    print(f"Total preprocessing time: {time.time()-start_time:.2f}s")
-    
+    logging.info(f"Total preprocessing time: {time.time()-start_time:.2f}s")
     return data
 
 def prepare_smartfallmm_tf(arg):
-    """Prepare SmartFallMM dataset"""
     data_dir = os.path.join(os.getcwd(), 'data/smartfallmm')
-    print(f"Loading data from {data_dir}")
+    logging.info(f"Loading data from {data_dir}")
     
     sm_dataset = SmartFallMM_TF(root_dir=data_dir)
     sm_dataset.set_args(arg)
+    
+    verbose = arg.dataset_args.get('verbose', True)
+    
+    if verbose:
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s'
+        )
+    
     sm_dataset.pipe_line(
         age_group=arg.dataset_args['age_group'],
         modalities=arg.dataset_args['modalities'],
         sensors=arg.dataset_args['sensors']
     )
     
-    return sm_dataset
+    return sm_dataset 

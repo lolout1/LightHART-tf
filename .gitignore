@@ -1,11 +1,14 @@
 __pycache__/
 *.py[cod]
-
+.out
+*.out
 cache/
 .cache/
-
+experiments/
 exp/
 data/
-
+src/experiments/
 .DS_Store
 datasets/
+src/*.out
+src/.out
