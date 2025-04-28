@@ -15,7 +15,7 @@ model_args:
   norm_first: true
 
 dataset_args: 
-  mode: 'sliding_window'
+  mode: 'selective_sliding_window'
   max_length: 64 
   task: 'fd'
   modalities: ['accelerometer','skeleton']
@@ -24,9 +24,9 @@ dataset_args:
   use_dtw: true
   verbose: true  # Enable detailed logging
 
-batch_size: 64
-test_batch_size: 64
-val_batch_size: 64
+batch_size: 16
+test_batch_size: 16
+val_batch_size: 16
 num_epoch: 80
 
 optimizer: adamw
@@ -34,3 +34,4 @@ base_lr: 0.001
 weight_decay: 0.0004
 
 phase: 'train'
+num_worker: 8
