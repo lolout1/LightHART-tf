@@ -1,0 +1,8 @@
+data_path: './data'
+batch_size: 32
+shuffle_buffer: 1000
+num_folds: 5
+num_epochs_teacher: 50
+learning_rate: 0.001
+teacher_weights: './weights/teacher_fold_{fold}.h5'
+checkpoint_dir: './checkpoints'

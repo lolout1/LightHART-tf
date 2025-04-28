@@ -1,0 +1,49 @@
+# General settings
+seed: 2
+batch_size: 64
+test_batch_size: 64
+val_batch_size: 64
+num_epoch: 10
+
+# Model
+model: models.mm_transformer.MMTransformerTF
+model_args:
+  acc_frames: 128
+  num_joints: 32
+  num_classes: 1
+  spatial_embed: 32
+  adepth: 2
+  sdepth: 2
+  num_heads: 2
+  mocap_frames: 128
+  num_patch: 2
+
+# Dataset
+dataset: 'smartfallmm'
+subjects: [32, 39, 30, 31, 33, 34, 35, 37, 43, 44, 45, 36, 29]
+dataset_args:
+  mode: 'sliding_window'
+  max_length: 128
+  task: 'fd'
+  modalities: ['skeleton', 'accelerometer']
+  age_group: ['young']
+  sensors: ['watch']
+
+# Loss (for teacher training)
+loss_args:
+  beta: 0.2
+
+# Dataloader
+feeder: feeder.make_dataset.SmartFallMMDataset  # Adjust to your TensorFlow feeder
+train_feeder_args:
+  batch_size: 32
+val_feeder_args:
+  batch_size: 32
+test_feeder_args:
+  batch_size: 32
+
+# Optimizer
+optimizer: adamw
+
+# Output
+teacher_weights: 'exps/teacher_weights.h5'

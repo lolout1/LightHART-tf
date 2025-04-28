@@ -1,0 +1,33 @@
+phase: distill
+model: models.mm_transformer.MMTransformerTF
+teacher_model: models.mm_transformer.MMTransformerTF
+dataset: smartfallmm
+subjects: [32, 39, 30, 31, 33, 34, 35, 37, 43, 44, 45, 36, 29]
+model_args:
+  acc_frames: 128
+  acc_coords: 3
+  num_classes: 1
+teacher_args:
+  acc_frames: 128
+  num_classes: 1
+dataset_args:
+  mode: 'sliding_window'
+  max_length: 64
+  task: 'fd'
+  modalities: ['accelerometer', 'skeleton']  # Keep both for DTW alignment
+  age_group: ['young']
+  sensors: ['watch']
+  use_dtw: true
+batch_size: 16
+val_batch_size: 16
+test_batch_size: 16
+num_epoch: 60
+optimizer: adamw
+base_lr: 0.001
+weight_decay: 0.0004
+temperature: 4.5
+alpha: 0.6
+work_dir: experiments/distill
+model_saved_name: distilled_student
+teacher_weight: experiments/teacher
+print_log: true

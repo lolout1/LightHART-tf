@@ -29,7 +29,7 @@ val_batch_size: 16
 num_epoch: 80
 
 optimizer: adamw
-base_lr: 0.001
+base_lr: 0.0005
 weight_decay: 0.0004
 
 phase: 'train'
