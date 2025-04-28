@@ -1,5 +1,5 @@
+# train.py
 #!/usr/bin/env python
-# -*- coding: utf-8 -*-
 import os
 import argparse
 import yaml
@@ -12,10 +12,7 @@ import numpy as np
 import tensorflow as tf
 
 # Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger('lightheart-tf')
 
 def str2bool(v):
@@ -30,9 +27,9 @@ def init_seed(seed):
     np.random.seed(seed)
     tf.random.set_seed(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
-    os.environ['TF_DETERMINISTIC_OPS'] = '0'  # Disable determinism to allow timestamp
+    os.environ['TF_DETERMINISTIC_OPS'] = '0'
     
-    # Set more permissive GPU memory allocation
+    # Configure GPU memory growth
     physical_devices = tf.config.list_physical_devices('GPU')
     if physical_devices:
         for device in physical_devices:
@@ -126,10 +123,6 @@ def setup_gpu(device_id):
             for device in physical_devices:
                 tf.config.experimental.set_memory_growth(device, True)
             logger.info(f"Using GPU: {device_id}")
-            
-            # Log GPU info
-            devices_str = ", ".join([f"'{d.name}'" for d in physical_devices])
-            logger.info(f"Found {len(physical_devices)} GPU(s): [{devices_str}]")
             return True
         except Exception as e:
             logger.warning(f"Error configuring GPU: {e}")
@@ -156,7 +149,7 @@ def main():
                 logger.error(f"Error loading config file: {e}")
                 sys.exit(1)
     
-    # Create output directory with timestamp
+    # Create output directory
     timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
     if not hasattr(args, 'work_dir') or args.work_dir is None:
         args.work_dir = f"./experiments/run_{timestamp}"
@@ -175,21 +168,16 @@ def main():
         yaml.dump(vars(args), f, default_flow_style=False)
     
     # Set up GPU
-    has_gpu = setup_gpu(args.device)
+    setup_gpu(args.device)
     
     # Set random seed
     init_seed(args.seed)
     
-    # Enable mixed precision if requested
-    if args.mixed_precision and has_gpu:
-        try:
-            policy = tf.keras.mixed_precision.Policy('mixed_float16')
-            tf.keras.mixed_precision.set_global_policy(policy)
-            logger.info(f"Mixed precision enabled with policy: {policy}")
-        except Exception as e:
-            logger.warning(f"Failed to enable mixed precision: {e}")
+    # Initialize distill_args if not present
+    if not hasattr(args, 'distill_args') or args.distill_args is None:
+        args.distill_args = {}
     
-    # Determine if we should use distillation (check if config file contains 'teacher_model')
+    # Determine if we should use distillation
     is_distillation = hasattr(args, 'teacher_model') and args.teacher_model is not None
     
     # Import appropriate trainer

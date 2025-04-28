@@ -1,4 +1,5 @@
-model: src.models.mmtransformer_tf.MMTransformer
+# teacher.yaml - Configuration for training the teacher model
+model: models.mm_transformer.MMTransformer
 dataset: smartfallmm
 
 # Subjects for fall detection
@@ -10,15 +11,16 @@ model_args:
   num_joints: 32
   in_chans: 3
   num_patch: 2
-  acc_coords: 3
-  spatial_embed: 32
+  acc_coords: 4
+  spatial_embed: 96
   sdepth: 2
   adepth: 2
   tdepth: 2
   num_heads: 2
   num_classes: 1
+  mlp_ratio: 2
 
-dataset_args: 
+dataset_args:
   mode: 'sliding_window'
   max_length: 128
   task: 'fd'
@@ -26,10 +28,10 @@ dataset_args:
   age_group: ['young']
   sensors: ['watch']
 
-batch_size: 64
-test_batch_size: 64
-val_batch_size: 64
-num_epoch: 10
+batch_size: 16
+test_batch_size: 16
+val_batch_size: 16
+num_epoch: 50
 
 feeder: utils.dataset_tf.UTD_MM_TF
 optimizer: adamw
