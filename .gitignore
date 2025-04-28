@@ -12,3 +12,4 @@ src/experiments/
 datasets/
 src/*.out
 src/.out
+src/logs

@@ -1,20 +1,15 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""
-Main training script for LightHART-TF
-
-This script provides command line interface for training and evaluating
-fall detection models based on the TensorFlow implementation of LightHART.
-"""
 import os
 import argparse
 import yaml
 import json
 import sys
 import logging
+import time
 from datetime import datetime
-import tensorflow as tf
 import numpy as np
+import tensorflow as tf
 
 # Configure logging
 logging.basicConfig(
@@ -24,7 +19,6 @@ logging.basicConfig(
 logger = logging.getLogger('lightheart-tf')
 
 def str2bool(v):
-    """Convert string to boolean"""
     if v.lower() in ('yes', 'true', 't', 'y', '1'):
         return True
     elif v.lower() in ('no', 'false', 'f', 'n', '0'):
@@ -33,20 +27,21 @@ def str2bool(v):
         raise argparse.ArgumentTypeError('Unsupported value encountered.')
 
 def init_seed(seed):
-    """Initialize random seeds for reproducibility"""
     np.random.seed(seed)
     tf.random.set_seed(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
-    os.environ['TF_DETERMINISTIC_OPS'] = '1'
+    os.environ['TF_DETERMINISTIC_OPS'] = '0'  # Disable determinism to allow timestamp
     
-    # Set deterministic operations if available
-    try:
-        tf.config.experimental.enable_op_determinism()
-    except:
-        pass
+    # Set more permissive GPU memory allocation
+    physical_devices = tf.config.list_physical_devices('GPU')
+    if physical_devices:
+        for device in physical_devices:
+            try:
+                tf.config.experimental.set_memory_growth(device, True)
+            except:
+                pass
 
 def get_args():
-    """Parse command line arguments"""
     parser = argparse.ArgumentParser(description='Fall Detection Training')
     
     # Basic arguments
@@ -84,9 +79,9 @@ def get_args():
                         help='Weight decay factor')
     
     # Model parameters
-    parser.add_argument('--model', default=None, 
+    parser.add_argument('--model', type=str, default=None, 
                         help='Model class path')
-    parser.add_argument('--model-args', default=None, 
+    parser.add_argument('--model-args', type=str, default=None, 
                         help='Model arguments')
     parser.add_argument('--weights', type=str, default=None,
                         help='Path to pretrained weights')
@@ -94,11 +89,11 @@ def get_args():
     # Dataset parameters
     parser.add_argument('--dataset', type=str, default='smartfallmm',
                         help='Dataset to use')
-    parser.add_argument('--dataset-args', default=None,
+    parser.add_argument('--dataset-args', type=str, default=None,
                         help='Dataset arguments')
     parser.add_argument('--subjects', nargs='+', type=int, default=None,
                         help='Subject IDs to use')
-    parser.add_argument('--feeder', default=None,
+    parser.add_argument('--feeder', type=str, default=None,
                         help='Data feeder class path')
     
     # Other parameters
@@ -114,7 +109,6 @@ def get_args():
     return parser
 
 def setup_gpu(device_id):
-    """Configure GPU settings"""
     os.environ['CUDA_VISIBLE_DEVICES'] = str(device_id)
     physical_devices = tf.config.list_physical_devices('GPU')
     if physical_devices:
@@ -122,6 +116,10 @@ def setup_gpu(device_id):
             for device in physical_devices:
                 tf.config.experimental.set_memory_growth(device, True)
             logger.info(f"Using GPU: {device_id}")
+            
+            # Log GPU info
+            devices_str = ", ".join([f"'{d.name}'" for d in physical_devices])
+            logger.info(f"Found {len(physical_devices)} GPU(s): [{devices_str}]")
             return True
         except Exception as e:
             logger.warning(f"Error configuring GPU: {e}")
@@ -130,7 +128,6 @@ def setup_gpu(device_id):
     return False
 
 def main():
-    """Main function"""
     # Parse command line arguments
     parser = get_args()
     args = parser.parse_args()
@@ -138,16 +135,22 @@ def main():
     # Load configuration from YAML file
     if args.config and os.path.exists(args.config):
         with open(args.config, 'r') as f:
-            config = yaml.safe_load(f)
-            
-        # Update arguments with values from config
-        for k, v in config.items():
-            if not hasattr(args, k) or getattr(args, k) is None:
-                setattr(args, k, v)
+            try:
+                config = yaml.safe_load(f)
+                
+                # Update arguments with values from config
+                for k, v in config.items():
+                    if not hasattr(args, k) or getattr(args, k) is None:
+                        setattr(args, k, v)
+            except yaml.YAMLError as e:
+                logger.error(f"Error loading config file: {e}")
+                sys.exit(1)
     
     # Create output directory with timestamp
     timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-    if hasattr(args, 'work_dir') and os.path.exists(args.work_dir):
+    if not hasattr(args, 'work_dir') or args.work_dir is None:
+        args.work_dir = f"./experiments/run_{timestamp}"
+    elif os.path.exists(args.work_dir):
         args.work_dir = f"{args.work_dir}_{timestamp}"
     
     os.makedirs(args.work_dir, exist_ok=True)
@@ -169,9 +172,12 @@ def main():
     
     # Enable mixed precision if requested
     if args.mixed_precision and has_gpu:
-        policy = tf.keras.mixed_precision.Policy('mixed_float16')
-        tf.keras.mixed_precision.set_global_policy(policy)
-        logger.info(f"Mixed precision enabled with policy: {policy}")
+        try:
+            policy = tf.keras.mixed_precision.Policy('mixed_float16')
+            tf.keras.mixed_precision.set_global_policy(policy)
+            logger.info(f"Mixed precision enabled with policy: {policy}")
+        except Exception as e:
+            logger.warning(f"Failed to enable mixed precision: {e}")
     
     # Import base trainer
     try:

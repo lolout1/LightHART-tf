@@ -1,12 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""
-Metrics Module for LightHART-TF
-
-Contains functions for calculating and reporting metrics
-"""
 import numpy as np
-from collections import Counter
 import tensorflow as tf
 from sklearn.metrics import confusion_matrix, f1_score, accuracy_score, precision_score, recall_score, roc_auc_score
 
@@ -44,36 +38,24 @@ def calculate_metrics(targets, predictions):
             auc = 50.0  # Undefined AUC for single class
         else:
             # Imperfect prediction with one class
-            if 1 in unique_targets:  # Positive class exists in targets
-                tp = np.sum((predictions == 1) & (targets == 1))
-                fn = np.sum((predictions == 0) & (targets == 1))
-                fp = np.sum((predictions == 1) & (targets == 0))
-                
-                precision = 100.0 * tp / (tp + fp) if (tp + fp) > 0 else 0.0
-                recall = 100.0 * tp / (tp + fn) if (tp + fn) > 0 else 0.0
-                f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
-            else:
-                precision = 0.0
-                recall = 0.0
-                f1 = 0.0
+            tp = np.sum((predictions == 1) & (targets == 1))
+            fn = np.sum((predictions == 0) & (targets == 1))
+            fp = np.sum((predictions == 1) & (targets == 0))
+            
+            precision = 100.0 * tp / (tp + fp) if (tp + fp) > 0 else 0.0
+            recall = 100.0 * tp / (tp + fn) if (tp + fn) > 0 else 0.0
+            f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
             auc = 50.0
     else:
         # Normal case with multiple classes
+        precision = precision_score(targets, predictions, zero_division=0) * 100
+        recall = recall_score(targets, predictions, zero_division=0) * 100
+        f1 = f1_score(targets, predictions, zero_division=0) * 100
+        
         try:
-            precision = precision_score(targets, predictions, zero_division=0) * 100
-            recall = recall_score(targets, predictions, zero_division=0) * 100
-            f1 = f1_score(targets, predictions, zero_division=0) * 100
-            
-            try:
-                auc = roc_auc_score(targets, predictions) * 100
-            except:
-                auc = 50.0  # Default AUC when calculation fails
-        except Exception as e:
-            print(f"Error calculating metrics: {e}")
-            precision = 0.0
-            recall = 0.0
-            f1 = 0.0
-            auc = 50.0
+            auc = roc_auc_score(targets, predictions) * 100
+        except:
+            auc = 50.0  # Default AUC when calculation fails
     
     return {
         'accuracy': accuracy,
@@ -97,30 +79,3 @@ def add_avg_df(results):
     
     results.append(avg_result)
     return results
-
-def calculate_class_weights(labels, logger=None):
-    """Calculate class weights for imbalanced training"""
-    # Fix error handling for empty labels
-    if labels is None or (hasattr(labels, 'size') and labels.size == 0):
-        if logger:
-            logger("No labels found, using default pos_weight=1.0")
-        return tf.constant(1.0)
-
-    # Count class occurrences
-    label_count = Counter(labels)
-
-    # Ensure there are positive examples
-    if 1 in label_count and label_count[1] > 0 and 0 in label_count:
-        # Calculate ratio of negative to positive examples
-        pos_weight = float(label_count[0]) / float(label_count[1])
-    else:
-        pos_weight = 1.0
-
-    # Log class distribution
-    if logger:
-        neg_count = label_count.get(0, 0)
-        pos_count = label_count.get(1, 0)
-        logger(f"Class balance - Negative: {neg_count}, Positive: {pos_count}")
-        logger(f"Positive class weight: {pos_weight:.4f}")
-
-    return tf.constant(pos_weight)

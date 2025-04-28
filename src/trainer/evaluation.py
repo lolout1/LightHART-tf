@@ -1,18 +1,12 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""
-Evaluation Module for LightHART-TF
-
-Functions for model evaluation and results reporting
-"""
 import os
 import json
 import numpy as np
 import tensorflow as tf
-from tqdm import tqdm
+from tqdm.auto import tqdm
 from utils.metrics import calculate_metrics
 from utils.visualization import plot_confusion_matrix
-from trainer.training_loop import eval_step
 
 def evaluate_test_set(model, criterion, data_loader, subject_id, work_dir, logger=None):
     """Evaluate model on test set with comprehensive reporting"""
@@ -25,32 +19,62 @@ def evaluate_test_set(model, criterion, data_loader, subject_id, work_dir, logge
     all_logits = []
     steps = 0
     
-    # Create progress bar
-    total_steps = len(data_loader)
-    desc = f"Eval {name} ({epoch+1})"
-    progress_bar = tqdm(data_loader, desc=desc, total=total_steps) 
-    # Iterate through batches
-    for batch_idx, (inputs, targets, _) in enumerate(progress_bar):
+    # Create quiet progress bar
+    desc = f"Testing subject {subject_id}"
+    
+    # Process batches without tqdm
+    batch_count = len(data_loader)
+    
+    if logger:
+        logger(f"Evaluating {batch_count} batches for subject {subject_id}")
+    
+    for batch_idx, (inputs, targets, _) in enumerate(data_loader):
+        if logger and batch_idx % 5 == 0:
+            logger(f"Processing test batch {batch_idx+1}/{batch_count}")
+            
         try:
             # Convert targets to float32
             targets = tf.cast(targets, tf.float32)
             
             # Forward pass
-            loss, predictions, logits = eval_step(model, inputs, targets, criterion)
+            outputs = model(inputs, training=False)
+            
+            # Extract logits (model may return (logits, features))
+            if isinstance(outputs, tuple) and len(outputs) > 0:
+                logits = outputs[0]
+            else:
+                logits = outputs
+            
+            # Compute loss
+            if len(logits.shape) > 1 and logits.shape[-1] > 1:
+                # Multi-class case
+                loss = criterion(targets, logits)
+            else:
+                # Binary case - ensure proper shape
+                loss = criterion(targets, tf.squeeze(logits))
+            
+            # Get predictions
+            if len(logits.shape) > 1 and logits.shape[-1] > 1:
+                # Multi-class case
+                predictions = tf.argmax(logits, axis=-1)
+            else:
+                # Binary case
+                predictions = tf.cast(tf.sigmoid(logits) > 0.5, tf.int32)
             
             # Update metrics
             loss_val = loss.numpy() if isinstance(loss, tf.Tensor) else float(loss)
             test_loss += loss_val
             all_labels.extend(targets.numpy())
             all_preds.extend(predictions.numpy())
-            all_logits.extend(logits.numpy())
+            if len(logits.shape) == 1 or (len(logits.shape) > 1 and logits.shape[-1] == 1):
+                # Binary case - use raw logits for AUC
+                all_logits.extend(tf.squeeze(logits).numpy())
+            else:
+                # Multi-class case
+                all_logits.extend(logits.numpy())
             steps += 1
             
-            # Update progress bar
-            progress_bar.set_postfix({
-                'loss': f"{test_loss/steps:.4f}"
-            })
-        except tf.errors.InvalidArgumentError as e:
+        except Exception as e:
             if logger:
                 logger(f"Error in batch {batch_idx}: {e}")
             continue
@@ -100,6 +124,4 @@ def evaluate_test_set(model, criterion, data_loader, subject_id, work_dir, logge
     with open(results_file, 'w') as f:
         json.dump(results, f, indent=2)
     
-    # Return metrics dictionary for further use
     return metrics
-

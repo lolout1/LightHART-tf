@@ -5,7 +5,7 @@ dataset: smartfallmm
 subjects: [32, 39, 30, 31, 33, 34, 35, 37, 43, 44, 45, 36, 29]
 
 model_args:
-  acc_frames: 128
+  acc_frames: 64 
   num_classes: 1
   num_heads: 4
   acc_coords: 3  # Original accelerometer channels (SMV is added internally)
