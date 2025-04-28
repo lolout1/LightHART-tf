@@ -1,135 +1,10 @@
-# src/train.py
-"""
-Main training script for LightHART-TF
-
-This script initializes and runs the training process for fall detection
-models from the LightHART-TF framework.
-"""
 import os
-import argparse
-import sys
-import yaml
-import json
-import logging
-import tensorflow as tf
-import numpy as np
-from datetime import datetime
-from base_trainer import BaseTrainer
-from utils.tflite_converter import convert_to_tflite
-
-def str2bool(v):
-    """Convert string to boolean"""
-    if v.lower() in ('yes', 'true', 't', 'y', '1'):
-        return True
-    elif v.lower() in ('no', 'false', 'f', 'n', '0'):
-        return False
-    else:
-        raise argparse.ArgumentTypeError('Unsupported value encountered.')
-
-def init_seed(seed):
-    """Initialize random seeds for reproducibility"""
-    np.random.seed(seed)
-    tf.random.set_seed(seed)
-    os.environ['PYTHONHASHSEED'] = str(seed)
-    os.environ['TF_DETERMINISTIC_OPS'] = '1'
-    
-    # Set deterministic operations if available
-    try:
-        tf.config.experimental.enable_op_determinism()
-    except:
-        pass
-
-def get_args():
-    """Parse command line arguments"""
-    parser = argparse.ArgumentParser(description='Fall Detection Training')
-    
-    # Basic arguments
-    parser.add_argument('--config', default='./config/smartfallmm/student.yaml',
-                        help='Path to configuration file')
-    parser.add_argument('--work-dir', type=str, default='./experiments',
-                        help='Working directory for outputs')
-    parser.add_argument('--model-saved-name', type=str, default='model',
-                        help='Base name for saving model')
-    parser.add_argument('--device', default='0',
-                        help='GPU device ID')
-    parser.add_argument('--phase', type=str, default='train',
-                        choices=['train', 'test'],
-                        help='Training or testing phase')
-    parser.add_argument('--result-file', type=str, 
-                        help='File to save testing results')
-    parser.add_argument('--seed', type=int, default=2,
-                        help='Random seed for reproducibility')
-    parser.add_argument('--print-log', type=str2bool, default=True,
-                        help='Whether to print logs')
-    
-    return parser
-
-def main():
-    """Main function"""
-    # Parse arguments
-    parser = get_args()
-    args = parser.parse_args()
-    
-    # Load configuration from YAML
-    with open(args.config, 'r') as f:
-        config = yaml.safe_load(f)
-    
-    # Update arguments from configuration
-    for k, v in config.items():
-        if not hasattr(args, k) or getattr(args, k) is None:
-            setattr(args, k, v)
-    
-    # Set up working directory
-    timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-    if os.path.exists(args.work_dir):
-        args.work_dir = f"{args.work_dir}_{timestamp}"
-    os.makedirs(args.work_dir, exist_ok=True)
-    
-    # Configure logging
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler(os.path.join(args.work_dir, 'training.log')),
-            logging.StreamHandler()
-        ]
-    )
-    
-    # Save configuration
-    with open(os.path.join(args.work_dir, 'config.yaml'), 'w') as f:
-        yaml.dump(vars(args), f)
-    
-    # Set GPU device
-    os.environ['CUDA_VISIBLE_DEVICES'] = args.device
-    
-    # Configure GPU memory growth
-    physical_devices = tf.config.list_physical_devices('GPU')
-    if physical_devices:
-        try:
-            for device in physical_devices:
-                tf.config.experimental.set_memory_growth(device, True)
-            logging.info(f"Using GPU: {args.device}")
-        except:
-            logging.info("Failed to configure GPU, using default settings")
-    else:
-        logging.info("No GPU found, using CPU")
-    
-    # Set random seed
-    init_seed(args.seed)
-    
-    # Create TFLite converter utility if it doesn't exist
-    if not os.path.exists('src/utils/tflite_converter.py'):
-        tflite_converter_path = 'src/utils/tflite_converter.py'
-        os.makedirs(os.path.dirname(tflite_converter_path), exist_ok=True)
-        
-        with open(tflite_converter_path, 'w') as f:
-            f.write("""import os
 import tensorflow as tf
 import logging
 import numpy as np
 
 def convert_to_tflite(model, save_path, input_shape=(1, 128, 3), quantize=False):
-    \"\"\"Convert model to TFLite format with accelerometer-only input.
+    """Convert model to TFLite format with accelerometer-only input.
     
     This function creates a TFLite model that only takes accelerometer data as input,
     even if the original model was trained with both skeleton and accelerometer data.
@@ -142,7 +17,7 @@ def convert_to_tflite(model, save_path, input_shape=(1, 128, 3), quantize=False)
         
     Returns:
         bool: Success status
-    \"\"\"
+    """
     try:
         # Ensure the directory exists
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
@@ -251,11 +126,3 @@ def convert_to_tflite(model, save_path, input_shape=(1, 128, 3), quantize=False)
         import traceback
         traceback.print_exc()
         return False
-""")
-    
-    # Create and start trainer
-    trainer = BaseTrainer(args)
-    trainer.start()
-
-if __name__ == "__main__":
-    main()

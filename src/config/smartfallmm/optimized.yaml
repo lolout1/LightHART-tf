@@ -5,25 +5,24 @@ dataset: smartfallmm
 subjects: [32, 39, 30, 31, 33, 34, 35, 37, 43, 44, 45, 36, 29]
 
 model_args:
+  acc_frames: 128
   num_classes: 1
   num_heads: 4
-  embed_dim: 32
+  acc_coords: 3  # Original accelerometer channels (SMV is added internally)
+  embed_dim: 32  # Match PyTorch implementation
   num_layers: 2
-  dim_feedforward: 64
   dropout: 0.5
   activation: 'relu'
-  norm_first: true
 
 dataset_args: 
   mode: 'sliding_window'
-  max_length: 64 
+  max_length: 128
   task: 'fd'
-  modalities: ['accelerometer','skeleton']
+  modalities: ['accelerometer', 'skeleton']  # Keep both for DTW alignment
   age_group: ['young']
   sensors: ['watch']
   use_dtw: true
-  verbose: true  # Enable detailed logging
-
+feeder: utils.dataset_tf.UTD_MM_TF
 batch_size: 16
 test_batch_size: 16
 val_batch_size: 16
@@ -34,4 +33,5 @@ base_lr: 0.001
 weight_decay: 0.0004
 
 phase: 'train'
-num_worker: 8
+seed: 2
+print_log: True

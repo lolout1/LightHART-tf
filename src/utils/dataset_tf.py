@@ -634,7 +634,7 @@ class SmartFallMM:
         self.match_trials()
 
 # Helper functions for SmartFallMM dataset
-def prepare_smartfallmm(arg) -> DatasetBuilder:
+def prepare_smartfallmm_tf(arg) -> DatasetBuilder:
     '''Function for dataset preparation - exact match to PyTorch'''
     sm_dataset = SmartFallMM(root_dir=os.path.join(os.getcwd(), 'data/smartfallmm'))
     sm_dataset.pipe_line(
@@ -650,7 +650,7 @@ def prepare_smartfallmm(arg) -> DatasetBuilder:
     )
     return builder
 
-def split_by_subjects(builder: DatasetBuilder, subjects: List[int], fuse: bool) -> Dict[str, np.ndarray]:
+def split_by_subjects_tf(builder: DatasetBuilder, subjects: List[int], fuse: bool) -> Dict[str, np.ndarray]:
     '''Function to filter by subjects - exact match to PyTorch'''
     builder.make_dataset(subjects, fuse)
     norm_data = builder.normalization()

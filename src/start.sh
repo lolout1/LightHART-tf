@@ -1,4 +1,5 @@
 #!/bin/bash
+# src/start.sh
 set -e
 
 # Create timestamp for this run
@@ -33,10 +34,9 @@ mkdir -p config/smartfallmm
 # Run with error trapping
 {
     python train.py \
-      --config config/smartfallmm/student.yaml \
+      --config config/smartfallmm/optimized.yaml \
       --work-dir $work_dir \
-      --model-saved-name student_model \
-      --device 0 2>&1 | tee -a $logfile
+      --model-saved-name student_model 2>&1 | tee -a $logfile
     
     training_status=${PIPESTATUS[0]}
     
