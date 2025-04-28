@@ -1,15 +1,14 @@
 import os
 import time
 import datetime
-import yaml
 import numpy as np
 import tensorflow as tf
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import json
 import traceback
-import sys
 import logging
+from collections import defaultdict
 
 class Trainer:
     def __init__(self, arg):
@@ -57,8 +56,6 @@ class Trainer:
         self.inertial_modality = [m for m in arg.dataset_args['modalities'] if m != 'skeleton']
         self.fuse = len(self.inertial_modality) > 1
         
-        self.project_root = self.get_project_root()
-        
         if os.path.exists(self.arg.work_dir):
             self.arg.work_dir = f"{self.arg.work_dir}_{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
         os.makedirs(self.arg.work_dir, exist_ok=True)
@@ -70,37 +67,20 @@ class Trainer:
         
         gpus = tf.config.list_physical_devices('GPU')
         if gpus:
-            try:
-                for gpu in gpus:
-                    tf.config.experimental.set_memory_growth(gpu, True)
-                logging.info(f"Found {len(gpus)} GPU(s), enabled memory growth")
-            except: 
-                logging.warning("Error configuring GPU")
+            for gpu in gpus:
+                tf.config.experimental.set_memory_growth(gpu, True)
         
         if self.arg.phase == 'train':
             self.model = self.load_model(arg.model, arg.model_args)
         else:
-            try:
-                self.model = self.load_model(arg.model, arg.model_args)
-                if self.arg.weights.endswith('.h5'):
-                    self.model.load_weights(self.arg.weights)
-                else:
-                    self.model = tf.keras.models.load_model(self.arg.weights)
-            except Exception as e:
-                self.print_log(f"Error loading model: {e}")
-                self.print_log(traceback.format_exc())
-                raise
+            self.model = self.load_model(arg.model, arg.model_args)
+            if self.arg.weights and os.path.exists(self.arg.weights):
+                self.model.load_weights(self.arg.weights)
         
         self.include_val = arg.include_val
         num_params = self.count_parameters(self.model)
         self.print_log(f'# Parameters: {num_params}')
         self.print_log(f'Model size: {num_params/(1024 ** 2):.2f} MB')
-    
-    def get_project_root(self):
-        cwd = os.getcwd()
-        if os.path.basename(cwd) == 'scripts':
-            return os.path.dirname(cwd)
-        return cwd
     
     def save_config(self, src_path, desc_path):
         config_filename = os.path.basename(src_path)
@@ -116,44 +96,25 @@ class Trainer:
     
     def count_parameters(self, model):
         total_params = 0
-        try:
-            for variable in model.trainable_variables:
-                total_params += np.prod(variable.shape)
-            if total_params == 0:
-                for variable in model.trainable_weights:
-                    total_params += np.prod(variable.shape)
-        except:
-            try:
-                total_params = model.count_params()
-            except:
-                pass
+        for variable in model.trainable_variables:
+            total_params += np.prod(variable.shape)
         return total_params
     
     def has_empty_value(self, *lists):
         return any(not lst or len(lst) == 0 for lst in lists)
     
     def load_model(self, model_name, model_args):
-        try:
-            ModelClass = self.import_class(model_name)
-            model = ModelClass(**model_args)
-            sample_input = tf.zeros((1, model_args.get('acc_frames', 128), model_args.get('acc_coords', 4)))
-            model(sample_input)
-            return model
-        except Exception as e:
-            self.print_log(f"Error loading model: {e}")
-            self.print_log(traceback.format_exc())
-            raise
+        ModelClass = self.import_class(model_name)
+        model = ModelClass(**model_args)
+        return model
     
     def load_loss(self):
         if self.arg.loss.lower() == 'bce':
-            self.criterion = tf.keras.losses.BinaryCrossentropy(
-                from_logits=True,
-                reduction=tf.keras.losses.Reduction.NONE
-            )
+            self.criterion = tf.keras.losses.BinaryCrossentropy(from_logits=True, reduction=tf.keras.losses.Reduction.NONE)
         elif self.arg.loss.lower() == 'binary_focal':
             class BinaryFocalLoss(tf.keras.losses.Loss):
                 def __init__(self, alpha=0.75, gamma=2.0):
-                    super(BinaryFocalLoss, self).__init__()
+                    super().__init__()
                     self.alpha = alpha
                     self.gamma = gamma
                 
@@ -172,14 +133,7 @@ class Trainer:
         if self.arg.optimizer.lower() == 'adam':
             self.optimizer = tf.keras.optimizers.Adam(learning_rate=self.arg.base_lr)
         elif self.arg.optimizer.lower() == 'adamw':
-            try:
-                self.optimizer = tf.keras.optimizers.AdamW(
-                    learning_rate=self.arg.base_lr,
-                    weight_decay=self.arg.weight_decay
-                )
-            except:
-                self.print_log("AdamW not available, using Adam with weight decay")
-                self.optimizer = tf.keras.optimizers.Adam(learning_rate=self.arg.base_lr)
+            self.optimizer = tf.keras.optimizers.AdamW(learning_rate=self.arg.base_lr, weight_decay=self.arg.weight_decay)
         elif self.arg.optimizer.lower() == 'sgd':
             self.optimizer = tf.keras.optimizers.SGD(learning_rate=self.arg.base_lr)
         else:
@@ -239,7 +193,6 @@ class Trainer:
     def loss_viz(self, train_loss, val_loss):
         if not train_loss or not val_loss or len(train_loss) == 0 or len(val_loss) == 0:
             return
-            
         epochs = range(len(train_loss))
         plt.figure()
         plt.plot(epochs, train_loss, 'b', label='Training Loss')
@@ -259,49 +212,49 @@ class Trainer:
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
             
             if save_format == 'weights':
-                model.save_weights(save_path, save_format='h5')
+                if not save_path.endswith('.weights.h5'):
+                    base_path = save_path.rsplit('.', 1)[0] if '.' in save_path else save_path
+                    save_path = f"{base_path}.weights.h5"
+                model.save_weights(save_path)
                 self.print_log(f"Model weights saved to {save_path}")
-            elif save_format == 'keras':
-                if save_path.endswith('.h5'):
-                    save_path = save_path[:-3] + '.keras'
-                model.save(save_path, save_format='keras')
-                self.print_log(f"Full model saved to {save_path}")
+                return True
             else:
-                model.save(save_path, save_format='h5')
-                self.print_log(f"Full model saved to {save_path} in HDF5 format")
-                
-            return True
+                model.save(save_path)
+                self.print_log(f"Full model saved to {save_path}")
+                return True
         except Exception as e:
             self.print_log(f"Error saving model: {str(e)}")
             self.print_log(traceback.format_exc())
             return False
-
+            
     def export_to_tflite(self, model, output_path, sample_batch=None):
         try:
-            if sample_batch is None:
-                sample_shape = (1, 128, 4)
-                sample_input = tf.constant(np.zeros(sample_shape, dtype=np.float32))
-                sample_dict = {'accelerometer': sample_input}
-            else:
-                sample_dict = sample_batch
+            sample_shape = (1, 64, 4)
+            sample_input = tf.constant(np.zeros(sample_shape, dtype=np.float32))
             
-            # Create a wrapped model with a defined signature
+            if sample_batch is not None:
+                if isinstance(sample_batch, dict) and 'accelerometer' in sample_batch:
+                    sample_input = sample_batch['accelerometer'][:1]
+                else:
+                    sample_input = sample_batch[:1]
+            
             class WrappedModel(tf.Module):
                 def __init__(self, model):
                     super().__init__()
                     self.model = model
                 
-                @tf.function(input_signature=[tf.TensorSpec(shape=[1, 128, 4], dtype=tf.float32)])
+                @tf.function(input_signature=[tf.TensorSpec(shape=[1, 64, 4], dtype=tf.float32)])
                 def __call__(self, x):
-                    logits, _ = self.model(x, training=False)
+                    output = self.model(x, training=False)
+                    if isinstance(output, tuple):
+                        logits = output[0]
+                    else:
+                        logits = output
                     return {'output': tf.sigmoid(logits)}
-                    
-            wrapped_model = WrappedModel(model)
             
-            # Test the wrapped model
+            wrapped_model = WrappedModel(model)
             wrapped_model(sample_input)
             
-            # Convert to TFLite
             converter = tf.lite.TFLiteConverter.from_concrete_functions(
                 [wrapped_model.__call__.get_concrete_function()]
             )
@@ -337,34 +290,40 @@ class Trainer:
         train_loss = 0
         cnt = 0
         
-        # Initialize optimizer variables with a warm-up step if needed
         try:
-            # Warm-up step to initialize optimizer variables
             if epoch == 0:
                 warm_data = next(iter(loader))[0]
                 with tf.GradientTape() as tape:
-                    logits, _ = self.model(warm_data, training=True)
+                    output = self.model(warm_data, training=True)
+                    if isinstance(output, tuple):
+                        logits = output[0]
+                    else:
+                        logits = output
                     dummy_loss = tf.reduce_mean(logits)
                 gradients = tape.gradient(dummy_loss, self.model.trainable_variables)
                 self.optimizer.apply_gradients(zip(gradients, self.model.trainable_variables))
         except Exception as e:
-            self.print_log(f"Warm-up step failed, but training will continue: {e}")
+            pass
         
-        # Main training loop - WITHOUT tf.function to avoid variable creation issues
         for batch_idx in tqdm(range(len(loader)), desc=f"Epoch {epoch+1}"):
             try:
                 batch_data, batch_targets, _ = loader[batch_idx]
                 timer['dataloader'] += self.split_time()
                 
-                # Manual training step
                 with tf.GradientTape() as tape:
-                    logits, _ = self.model(batch_data, training=True)
+                    output = self.model(batch_data, training=True)
+                    if isinstance(output, tuple):
+                        logits = output[0]
+                    else:
+                        logits = output
+                    
                     logits = tf.reshape(logits, [-1])
                     batch_targets = tf.cast(batch_targets, tf.float32)
                     loss = self.criterion(batch_targets, logits)
                     loss = tf.reduce_mean(loss)
                 
                 gradients = tape.gradient(loss, self.model.trainable_variables)
+                gradients = [tf.where(tf.math.is_nan(g), tf.zeros_like(g), g) for g in gradients]
                 self.optimizer.apply_gradients(zip(gradients, self.model.trainable_variables))
                 
                 train_loss += loss.numpy()
@@ -377,13 +336,10 @@ class Trainer:
                 timer['stats'] += self.split_time()
             except Exception as e:
                 self.print_log(f"Error in batch {batch_idx}: {e}")
-                self.print_log(traceback.format_exc())
         
         if cnt > 0:
             train_loss /= cnt
-            metrics_dict, (accuracy, f1, recall, precision, auc_score) = self.calculate_metrics(
-                label_list, pred_list
-            )
+            metrics_dict, (accuracy, f1, recall, precision, auc_score) = self.calculate_metrics(label_list, pred_list)
             
             self.train_loss_summary.append(train_loss)
             
@@ -399,8 +355,9 @@ class Trainer:
             
             self.print_log(f'\tTime consumption: [Data]{proportion["dataloader"]}, [Network]{proportion["model"]}')
             
-            val_loss, val_metrics = self.eval(epoch, loader_name='val', result_file=self.arg.result_file)
+            val_loss, val_metrics = self.eval(epoch, loader_name='val')
             self.val_loss_summary.append(val_loss)
+            self.early_stop(val_loss)
     
     def eval(self, epoch, loader_name='val', result_file=None):
         self.model.trainable = False
@@ -421,8 +378,12 @@ class Trainer:
             try:
                 batch_data, batch_targets, _ = loader[batch_idx]
                 
-                # Forward pass without tf.function
-                logits, _ = self.model(batch_data, training=False)
+                output = self.model(batch_data, training=False)
+                if isinstance(output, tuple):
+                    logits = output[0]
+                else:
+                    logits = output
+                
                 logits = tf.reshape(logits, [-1])
                 batch_targets = tf.cast(batch_targets, tf.float32)
                 batch_loss = self.criterion(batch_targets, logits)
@@ -435,13 +396,10 @@ class Trainer:
                 cnt += 1
             except Exception as e:
                 self.print_log(f"Error in evaluation batch {batch_idx}: {e}")
-                self.print_log(traceback.format_exc())
         
         if cnt > 0:
             loss = loss / cnt
-            metrics_dict, (accuracy, f1, recall, precision, auc_score) = self.calculate_metrics(
-                label_list, pred_list
-            )
+            metrics_dict, (accuracy, f1, recall, precision, auc_score) = self.calculate_metrics(label_list, pred_list)
             
             if result_file is not None:
                 for i, x in enumerate(pred_list):
@@ -454,30 +412,18 @@ class Trainer:
             )
             
             if loader_name == 'val':
-                is_best_loss = loss < self.best_loss
-                is_best_f1 = f1 > self.best_f1
-                
-                if is_best_loss:
+                if loss < self.best_loss:
                     self.best_loss = loss
                     self.print_log(f"New best validation loss: {loss:.6f}")
-                
-                if is_best_f1:
-                    self.best_f1 = f1
-                    self.print_log(f"New best validation F1: {f1:.2f}%")
-                
-                if is_best_loss or is_best_f1:
                     checkpoint_dir = os.path.join(self.arg.work_dir, 'models')
                     model_save_path = os.path.join(checkpoint_dir, f'{self.arg.model_saved_name}_{self.test_subject[0]}.h5')
+                    self.save_model(self.model, model_save_path, save_format='weights')
+                    tflite_path = os.path.join(checkpoint_dir, f'{self.arg.model_saved_name}_{self.test_subject[0]}.tflite')
+                    self.export_to_tflite(self.model, tflite_path, batch_data)
                     
-                    # Save weights only - more reliable
-                    if self.save_model(self.model, model_save_path, save_format='weights'):
-                        # Only try to export to TFLite once per fold with the best model
-                        if not hasattr(self, f'exported_tflite_{self.test_subject[0]}'):
-                            tflite_path = os.path.join(checkpoint_dir, f'{self.arg.model_saved_name}_{self.test_subject[0]}.tflite')
-                            if self.export_to_tflite(self.model, tflite_path, batch_data):
-                                setattr(self, f'exported_tflite_{self.test_subject[0]}', True)
-                
-                self.early_stop(loss)
+                if f1 > self.best_f1:
+                    self.best_f1 = f1
+                    self.print_log(f"New best validation F1: {f1:.2f}%")
             else:
                 self.test_accuracy = accuracy
                 self.test_f1 = f1
@@ -485,9 +431,9 @@ class Trainer:
                 self.test_precision = precision
                 self.test_auc = auc_score
             
-            return loss, metrics_dict
+            return loss
         
-        return float('inf'), None
+        return float('inf')
     
     def start(self):
         if self.arg.phase == 'train':
@@ -496,7 +442,6 @@ class Trainer:
                 self.print_log(f'  {key}: {value}')
             
             results = []
-            
             val_subjects = [38, 46]
             
             for test_subject in self.arg.subjects:
@@ -527,7 +472,7 @@ class Trainer:
                 try:
                     self.load_optimizer()
                     self.load_loss()
-                    self.early_stop.early_stop = False  # Reset early stopping
+                    self.early_stop.early_stop = False
                     
                     for epoch in range(self.arg.start_epoch, self.arg.num_epoch):
                         self.train(epoch)
@@ -535,15 +480,11 @@ class Trainer:
                             self.print_log("Early stopping triggered")
                             break
                     
-                    # Load best model for testing
-                    best_model_path = os.path.join(self.arg.work_dir, 'models', f'{self.arg.model_saved_name}_{self.test_subject[0]}.h5')
+                    best_model_path = os.path.join(self.arg.work_dir, 'models', f'{self.arg.model_saved_name}_{self.test_subject[0]}.weights.h5')
                     if os.path.exists(best_model_path):
-                        try:
-                            self.model = self.load_model(self.arg.model, self.arg.model_args)
-                            self.model.load_weights(best_model_path)
-                            self.print_log(f"Loaded weights from {best_model_path}")
-                        except Exception as e:
-                            self.print_log(f"Error loading saved model weights: {e}")
+                        self.model = self.load_model(self.arg.model, self.arg.model_args)
+                        self.model.load_weights(best_model_path)
+                        self.print_log(f"Loaded weights from {best_model_path}")
                     
                     self.print_log(f'Testing subject {self.test_subject[0]}')
                     _, test_metrics = self.eval(epoch=0, loader_name='test')
@@ -561,7 +502,6 @@ class Trainer:
                     })
                 except Exception as e:
                     self.print_log(f"Error during training for subject {test_subject}: {e}")
-                    self.print_log(traceback.format_exc())
             
             if results:
                 avg_result = {'test_subject': 'Average'}
@@ -574,5 +514,3 @@ class Trainer:
                 
                 with open(f'{self.arg.work_dir}/scores.json', 'w') as f:
                     json.dump(results, f, indent=4)
-                    
-                self.print_log(f"Results saved to {self.arg.work_dir}/scores.json")

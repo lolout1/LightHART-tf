@@ -3,7 +3,7 @@ from tensorflow.keras import layers, Model
 
 class TransformerEncoderLayer(layers.Layer):
     def __init__(self, embed_dim, num_heads, dim_feedforward, dropout=0.1, activation='relu', norm_first=True):
-        super(TransformerEncoderLayer, self).__init__()
+        super().__init__()
         self.norm_first = norm_first
         self.att = layers.MultiHeadAttention(num_heads=num_heads, key_dim=embed_dim)
         self.ffn = tf.keras.Sequential([
@@ -17,19 +17,16 @@ class TransformerEncoderLayer(layers.Layer):
 
     def call(self, inputs, training=False):
         if self.norm_first:
-            # Self-attention with pre-normalization
             attn_input = self.layernorm1(inputs)
             attn_output = self.att(attn_input, attn_input)
             attn_output = self.dropout1(attn_output, training=training)
             out1 = inputs + attn_output
-
-            # Feed-forward network with pre-normalization
+            
             ffn_input = self.layernorm2(out1)
             ffn_output = self.ffn(ffn_input)
             ffn_output = self.dropout2(ffn_output, training=training)
             return out1 + ffn_output
         else:
-            # Original post-normalization order
             attn_output = self.att(inputs, inputs)
             attn_output = self.dropout1(attn_output, training=training)
             out1 = self.layernorm1(inputs + attn_output)
@@ -39,13 +36,15 @@ class TransformerEncoderLayer(layers.Layer):
             return self.layernorm2(out1 + ffn_output)
 
 class TransModel(Model):
-    def __init__(self, num_classes=1, num_heads=4, embed_dim=32, num_layers=2, 
+    def __init__(self, num_classes=1, num_heads=4, embed_dim=32, num_layers=2,
                  dim_feedforward=64, dropout=0.5, activation='relu', norm_first=True, **kwargs):
-        super(TransModel, self).__init__()
+        super().__init__()
+        
         self.input_proj = tf.keras.Sequential([
-            layers.Conv1D(filters=embed_dim, kernel_size=8, strides=1, padding='same', input_shape=(128, 4)),
+            layers.Conv1D(filters=embed_dim, kernel_size=8, strides=1, padding='same'),
             layers.BatchNormalization()
         ])
+        
         self.encoder_layers = [
             TransformerEncoderLayer(
                 embed_dim=embed_dim,
@@ -56,11 +55,12 @@ class TransModel(Model):
                 norm_first=norm_first
             ) for _ in range(num_layers)
         ]
+        
         self.temporal_norm = layers.LayerNormalization(epsilon=1e-6)
         self.global_avg_pool = layers.GlobalAveragePooling1D()
         self.output_layer = layers.Dense(num_classes)
 
-    def call(self, inputs, training=False):
+    def call(self, inputs, training=False, **kwargs):
         if isinstance(inputs, dict) and 'accelerometer' in inputs:
             x = inputs['accelerometer']
         else:
@@ -79,5 +79,4 @@ class TransModel(Model):
         
         return output, features
 
-# For backward compatibility with previous API
 StudentTransformerTF = TransModel
