@@ -717,22 +717,13 @@ class UTD_MM_TF(tf.keras.utils.Sequence):
     def __getitem__(self, idx):
         '''Get a batch - compatible with PyTorch'''
         start_idx = idx * self.batch_size
-        if start_idx >= self.num_samples:
-            start_idx = 0  # Wrap around to the beginning
         end_idx = min(start_idx + self.batch_size, self.num_samples)
         
         # Create batch data
         batch_data = {}
         
         # Add accelerometer with SMV
-        # Ensure valid range (fix for the tf.range error)
-        if start_idx >= end_idx:
-            start_idx = 0
-            end_idx = min(self.batch_size, self.num_samples)
-            
-        indices = tf.range(start_idx, end_idx)
-        
-        batch_data['accelerometer'] = tf.gather(self.acc_data_with_smv, indices)
+        batch_data['accelerometer'] = tf.gather(self.acc_data_with_smv, tf.range(start_idx, end_idx))
         
         # Add skeleton if available
         if hasattr(self, 'skl_data') and self.skl_data is not None:

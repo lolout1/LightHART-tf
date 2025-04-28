@@ -1,21 +1,27 @@
-# src/train.py
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
 """
 Main training script for LightHART-TF
 
-This script initializes and runs the training process for fall detection
-models from the LightHART-TF framework.
+This script provides command line interface for training and evaluating
+fall detection models based on the TensorFlow implementation of LightHART.
 """
 import os
 import argparse
-import sys
 import yaml
 import json
+import sys
 import logging
+from datetime import datetime
 import tensorflow as tf
 import numpy as np
-from datetime import datetime
-from base_trainer import BaseTrainer
-from utils.tflite_converter import convert_to_tflite
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger('lightheart-tf')
 
 def str2bool(v):
     """Convert string to boolean"""
@@ -44,7 +50,7 @@ def get_args():
     parser = argparse.ArgumentParser(description='Fall Detection Training')
     
     # Basic arguments
-    parser.add_argument('--config', default='./config/smartfallmm/student.yaml',
+    parser.add_argument('--config', default='./config/smartfallmm/optimized.yaml',
                         help='Path to configuration file')
     parser.add_argument('--work-dir', type=str, default='./experiments',
                         help='Working directory for outputs')
@@ -53,209 +59,130 @@ def get_args():
     parser.add_argument('--device', default='0',
                         help='GPU device ID')
     parser.add_argument('--phase', type=str, default='train',
-                        choices=['train', 'test'],
-                        help='Training or testing phase')
-    parser.add_argument('--result-file', type=str, 
-                        help='File to save testing results')
+                        choices=['train', 'test', 'tflite'],
+                        help='Training, testing, or TFLite export phase')
+    
+    # Training parameters
+    parser.add_argument('--batch-size', type=int, default=16, 
+                        help='Training batch size')
+    parser.add_argument('--test-batch-size', type=int, default=16,
+                        help='Testing batch size')
+    parser.add_argument('--val-batch-size', type=int, default=16,
+                        help='Validation batch size')
+    parser.add_argument('--num-epoch', type=int, default=80,
+                        help='Number of training epochs')
+    parser.add_argument('--start-epoch', type=int, default=0,
+                        help='Starting epoch number')
+    
+    # Optimizer parameters
+    parser.add_argument('--optimizer', type=str, default='adamw',
+                        choices=['adam', 'adamw', 'sgd'],
+                        help='Optimizer type')
+    parser.add_argument('--base-lr', type=float, default=0.001,
+                        help='Base learning rate')
+    parser.add_argument('--weight-decay', type=float, default=0.0004,
+                        help='Weight decay factor')
+    
+    # Model parameters
+    parser.add_argument('--model', default=None, 
+                        help='Model class path')
+    parser.add_argument('--model-args', default=None, 
+                        help='Model arguments')
+    parser.add_argument('--weights', type=str, default=None,
+                        help='Path to pretrained weights')
+    
+    # Dataset parameters
+    parser.add_argument('--dataset', type=str, default='smartfallmm',
+                        help='Dataset to use')
+    parser.add_argument('--dataset-args', default=None,
+                        help='Dataset arguments')
+    parser.add_argument('--subjects', nargs='+', type=int, default=None,
+                        help='Subject IDs to use')
+    parser.add_argument('--feeder', default=None,
+                        help='Data feeder class path')
+    
+    # Other parameters
     parser.add_argument('--seed', type=int, default=2,
                         help='Random seed for reproducibility')
+    parser.add_argument('--result-file', type=str, default=None,
+                        help='File to save testing results')
     parser.add_argument('--print-log', type=str2bool, default=True,
                         help='Whether to print logs')
+    parser.add_argument('--mixed-precision', type=str2bool, default=False,
+                        help='Use mixed precision training')
     
     return parser
 
-def main():
-    """Main function"""
-    # Parse arguments
-    parser = get_args()
-    args = parser.parse_args()
-    
-    # Load configuration from YAML
-    with open(args.config, 'r') as f:
-        config = yaml.safe_load(f)
-    
-    # Update arguments from configuration
-    for k, v in config.items():
-        if not hasattr(args, k) or getattr(args, k) is None:
-            setattr(args, k, v)
-    
-    # Set up working directory
-    timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-    if os.path.exists(args.work_dir):
-        args.work_dir = f"{args.work_dir}_{timestamp}"
-    os.makedirs(args.work_dir, exist_ok=True)
-    
-    # Configure logging
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler(os.path.join(args.work_dir, 'training.log')),
-            logging.StreamHandler()
-        ]
-    )
-    
-    # Save configuration
-    with open(os.path.join(args.work_dir, 'config.yaml'), 'w') as f:
-        yaml.dump(vars(args), f)
-    
-    # Set GPU device
-    os.environ['CUDA_VISIBLE_DEVICES'] = args.device
-    
-    # Configure GPU memory growth
+def setup_gpu(device_id):
+    """Configure GPU settings"""
+    os.environ['CUDA_VISIBLE_DEVICES'] = str(device_id)
     physical_devices = tf.config.list_physical_devices('GPU')
     if physical_devices:
         try:
             for device in physical_devices:
                 tf.config.experimental.set_memory_growth(device, True)
-            logging.info(f"Using GPU: {args.device}")
-        except:
-            logging.info("Failed to configure GPU, using default settings")
-    else:
-        logging.info("No GPU found, using CPU")
+            logger.info(f"Using GPU: {device_id}")
+            return True
+        except Exception as e:
+            logger.warning(f"Error configuring GPU: {e}")
+    
+    logger.info("No GPU available, using CPU")
+    return False
+
+def main():
+    """Main function"""
+    # Parse command line arguments
+    parser = get_args()
+    args = parser.parse_args()
+    
+    # Load configuration from YAML file
+    if args.config and os.path.exists(args.config):
+        with open(args.config, 'r') as f:
+            config = yaml.safe_load(f)
+            
+        # Update arguments with values from config
+        for k, v in config.items():
+            if not hasattr(args, k) or getattr(args, k) is None:
+                setattr(args, k, v)
+    
+    # Create output directory with timestamp
+    timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+    if hasattr(args, 'work_dir') and os.path.exists(args.work_dir):
+        args.work_dir = f"{args.work_dir}_{timestamp}"
+    
+    os.makedirs(args.work_dir, exist_ok=True)
+    
+    # Configure file logging
+    file_handler = logging.FileHandler(os.path.join(args.work_dir, 'training.log'))
+    file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    logger.addHandler(file_handler)
+    
+    # Save configuration
+    with open(os.path.join(args.work_dir, 'config.yaml'), 'w') as f:
+        yaml.dump(vars(args), f, default_flow_style=False)
+    
+    # Set up GPU
+    has_gpu = setup_gpu(args.device)
     
     # Set random seed
     init_seed(args.seed)
     
-    # Create TFLite converter utility if it doesn't exist
-    if not os.path.exists('src/utils/tflite_converter.py'):
-        tflite_converter_path = 'src/utils/tflite_converter.py'
-        os.makedirs(os.path.dirname(tflite_converter_path), exist_ok=True)
-        
-        with open(tflite_converter_path, 'w') as f:
-            f.write("""import os
-import tensorflow as tf
-import logging
-import numpy as np
-
-def convert_to_tflite(model, save_path, input_shape=(1, 128, 3), quantize=False):
-    \"\"\"Convert model to TFLite format with accelerometer-only input.
+    # Enable mixed precision if requested
+    if args.mixed_precision and has_gpu:
+        policy = tf.keras.mixed_precision.Policy('mixed_float16')
+        tf.keras.mixed_precision.set_global_policy(policy)
+        logger.info(f"Mixed precision enabled with policy: {policy}")
     
-    This function creates a TFLite model that only takes accelerometer data as input,
-    even if the original model was trained with both skeleton and accelerometer data.
-    
-    Args:
-        model: TensorFlow model to convert
-        save_path: Path to save the TFLite model
-        input_shape: Input shape for accelerometer data (batch, frames, channels)
-        quantize: Whether to apply quantization
-        
-    Returns:
-        bool: Success status
-    \"\"\"
+    # Import base trainer
     try:
-        # Ensure the directory exists
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        
-        # Add .tflite extension if not present
-        if not save_path.endswith('.tflite'):
-            save_path += '.tflite'
-        
-        # Create concrete function for accelerometer-only input
-        @tf.function(input_signature=[
-            tf.TensorSpec(shape=input_shape, dtype=tf.float32, name='accelerometer')
-        ])
-        def serving_function(accelerometer):
-            # Calculate signal magnitude vector (SMV)
-            mean = tf.reduce_mean(accelerometer, axis=1, keepdims=True)
-            zero_mean = accelerometer - mean
-            sum_squared = tf.reduce_sum(tf.square(zero_mean), axis=-1, keepdims=True)
-            smv = tf.sqrt(sum_squared)
-            
-            # Concatenate SMV with original data
-            acc_with_smv = tf.concat([smv, accelerometer], axis=-1)
-            
-            # Create a dictionary for the model if it expects one
-            inputs = {'accelerometer': acc_with_smv}
-            
-            # Forward pass (handle both tuple and single output)
-            outputs = model(inputs, training=False)
-            
-            # Return only logits if model returns (logits, features)
-            if isinstance(outputs, tuple) and len(outputs) > 0:
-                return outputs[0]
-            return outputs
-        
-        # Create SavedModel with the concrete function
-        saved_model_dir = os.path.join(os.path.dirname(save_path), "temp_saved_model")
-        if os.path.exists(saved_model_dir):
-            import shutil
-            shutil.rmtree(saved_model_dir)
-            
-        tf.saved_model.save(
-            model, 
-            saved_model_dir,
-            signatures={
-                'serving_default': serving_function
-            }
-        )
-        
-        # Create converter from saved model
-        converter = tf.lite.TFLiteConverter.from_saved_model(
-            saved_model_dir,
-            signature_keys=['serving_default']
-        )
-        
-        # Set optimization options
-        if quantize:
-            converter.optimizations = [tf.lite.Optimize.DEFAULT]
-        
-        # Configure TFLite options
-        converter.target_spec.supported_ops = [
-            tf.lite.OpsSet.TFLITE_BUILTINS,
-            tf.lite.OpsSet.SELECT_TF_OPS  # Include TF ops for better compatibility
-        ]
-        
-        # Enable custom ops if needed
-        converter.allow_custom_ops = True
-        
-        # Convert to TFLite format
-        logging.info("Converting model to TFLite...")
-        tflite_model = converter.convert()
-        
-        # Save the converted model
-        with open(save_path, 'wb') as f:
-            f.write(tflite_model)
-        
-        logging.info(f"TFLite model saved to {save_path}")
-        
-        # Test the model with sample input
-        interpreter = tf.lite.Interpreter(model_content=tflite_model)
-        interpreter.allocate_tensors()
-        
-        # Get input and output details
-        input_details = interpreter.get_input_details()
-        output_details = interpreter.get_output_details()
-        
-        logging.info(f"Input details: {input_details}")
-        logging.info(f"Output details: {output_details}")
-        
-        # Create sample input
-        sample_input = np.random.randn(*input_shape).astype(np.float32)
-        
-        # Test inference
-        interpreter.set_tensor(input_details[0]['index'], sample_input)
-        interpreter.invoke()
-        output = interpreter.get_tensor(output_details[0]['index'])
-        
-        logging.info(f"TFLite test successful - output shape: {output.shape}")
-        
-        # Clean up temporary SavedModel
-        import shutil
-        if os.path.exists(saved_model_dir):
-            shutil.rmtree(saved_model_dir)
-            
-        return True
+        from trainer.base_trainer import BaseTrainer
+        trainer = BaseTrainer(args)
+        trainer.start()
     except Exception as e:
-        logging.error(f"TFLite conversion failed: {e}")
+        logger.error(f"Error initializing trainer: {e}")
         import traceback
         traceback.print_exc()
-        return False
-""")
-    
-    # Create and start trainer
-    trainer = BaseTrainer(args)
-    trainer.start()
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()

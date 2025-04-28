@@ -16,7 +16,7 @@ model_args:
 
 dataset_args: 
   mode: 'sliding_window'
-  max_length: 128
+  max_length: 64
   task: 'fd'
   modalities: ['accelerometer', 'skeleton']  # Keep both for DTW alignment
   age_group: ['young']
