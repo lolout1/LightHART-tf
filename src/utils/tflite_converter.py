@@ -29,7 +29,7 @@ def convert_to_tflite(model, save_path, input_shape=(1, 128, 3), quantize=False)
         # Use the model's built-in export method if available
         if hasattr(model, 'export_to_tflite'):
             logging.info("Using model's built-in TFLite export method")
-            return model.export_to_tflite(save_path, input_shape=input_shape, quantize=quantize)
+            return model.export_to_tflite(save_path, 64, False)
         
         logging.info(f"Starting TFLite conversion with input shape {input_shape}")
         

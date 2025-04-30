@@ -97,7 +97,9 @@ class BaseTrainer:
         self.early_stop = EarlyStopping(patience=15, min_delta=.001)
         
         self.setup_directories()
+        self.print_log("Checking Python dependencies...")
         self.model = self.load_model()
+        self.print_log("Model loaded successfully.")
         
         num_params = self.count_parameters(self.model)
         self.print_log(f"Model: {self.arg.model}")
@@ -548,16 +550,7 @@ class BaseTrainer:
             all_preds = []
             steps = 0
             
-            max_batch_time = 300
-            start_batch_time = time.time()
-            
             for batch_idx in range(total_batches):
-                batch_duration = time.time() - start_batch_time
-                if batch_duration > max_batch_time:
-                    self.print_log(f"WARNING: Batch {batch_idx} taking too long ({batch_duration:.1f}s), skipping")
-                    start_batch_time = time.time()
-                    continue
-                
                 if batch_idx % 5 == 0 or batch_idx + 1 == total_batches:
                     self.print_log(f"Training epoch {epoch+1}: batch {batch_idx+1}/{total_batches}")
                 
@@ -623,12 +616,9 @@ class BaseTrainer:
                     all_preds.extend(predictions.numpy())
                     steps += 1
                     
-                    start_batch_time = time.time()
-                    
                 except Exception as e:
                     self.print_log(f"Error in batch {batch_idx}: {e}")
                     self.print_log(traceback.format_exc())
-                    start_batch_time = time.time()
                     continue
             
             if steps > 0:
@@ -690,16 +680,7 @@ class BaseTrainer:
             all_logits = []
             steps = 0
             
-            max_batch_time = 300
-            start_batch_time = time.time()
-            
             for batch_idx in range(total_batches):
-                batch_duration = time.time() - start_batch_time
-                if batch_duration > max_batch_time:
-                    self.print_log(f"WARNING: Evaluation batch {batch_idx} taking too long ({batch_duration:.1f}s), skipping")
-                    start_batch_time = time.time()
-                    continue
-                
                 if batch_idx % 5 == 0 or batch_idx + 1 == total_batches:
                     self.print_log(f"Eval {loader_name} (epoch {epoch+1}): batch {batch_idx+1}/{total_batches}")
                 
@@ -719,7 +700,7 @@ class BaseTrainer:
                         logits = outputs[0]
                     else:
                         logits = outputs
-                    
+                        
                     batch_logits = logits.numpy()
                     all_logits.append(batch_logits)
                     
@@ -743,12 +724,9 @@ class BaseTrainer:
                     all_preds.extend(predictions.numpy())
                     steps += 1
                     
-                    start_batch_time = time.time()
-                    
                 except Exception as e:
                     self.print_log(f"Error in evaluation batch {batch_idx}: {e}")
                     self.print_log(traceback.format_exc())
-                    start_batch_time = time.time()
                     continue
             
             if steps > 0:
@@ -920,189 +898,11 @@ class BaseTrainer:
                 self.print_log(f"Warning: Could not save full model: {e}")
                 self.print_log(traceback.format_exc())
             
-            try:
-                if hasattr(self.model, 'export_to_tflite'):
-                    self.print_log("Using model's built-in TFLite export method")
-                    tflite_path = f"{base_filename}.tflite"
-                    success = self.model.export_to_tflite(tflite_path)
-                else:
-                    from utils.tflite_converter import convert_to_tflite
-                    
-                    acc_frames = self.arg.model_args.get('acc_frames', 128)
-                    
-                    tflite_path = f"{base_filename}.tflite"
-                    success = convert_to_tflite(
-                        model=self.model,
-                        save_path=tflite_path,
-                        input_shape=(1, acc_frames, 3),
-                        quantize=getattr(self.arg, 'quantize', False)
-                    )
-                
-                if success:
-                    self.print_log(f"Exported TFLite model to {tflite_path}")
-                    self.verify_tflite_model(tflite_path)
-                else:
-                    self.print_log("Warning: TFLite export failed")
-            except Exception as e:
-                self.print_log(f"Warning: TFLite export failed: {e}")
-                self.print_log(traceback.format_exc())
-            
             return True
         except Exception as e:
             self.print_log(f"Error saving model: {e}")
             self.print_log(traceback.format_exc())
             return False
-    
-    def verify_tflite_model(self, tflite_path, test_data=None):
-        try:
-            self.print_log("Verifying TFLite model output format...")
-            
-            # Skip TFLite testing to avoid READ_VARIABLE error
-            verification_note = os.path.join(os.path.dirname(tflite_path), "tflite_verification_status.txt")
-            with open(verification_note, 'w') as f:
-                f.write(f"TFLite model created successfully at {tflite_path}\n")
-                f.write("Direct testing skipped to avoid READ_VARIABLE errors\n")
-                
-            self.print_log(f"Verification info saved to {verification_note}")
-            return {'verified': True, 'message': 'TFLite model created, testing skipped to avoid errors'}
-            
-        except Exception as e:
-            self.print_log(f"Warning: Could not verify TFLite model: {e}")
-            return {'verified': False, 'error': str(e)}
-    
-    def compare_regular_and_tflite_inference(self, subject_id=None):
-        try:
-            if not self.test_subject:
-                self.print_log("No test subject specified for comparison")
-                return False
-                
-            subject_id = self.test_subject[0] if self.test_subject else "unknown"
-            self.print_log(f"Comparing regular model vs TFLite model for subject {subject_id}")
-            
-            weights_path = f"{self.model_path}_{subject_id}.weights.h5"
-            tflite_path = f"{self.model_path}_{subject_id}.tflite"
-            
-            if not os.path.exists(weights_path):
-                self.print_log(f"Model weights not found at {weights_path}")
-                return False
-                
-            if not os.path.exists(tflite_path):
-                self.print_log(f"TFLite model not found at {tflite_path}, skipping comparison")
-                return False
-                
-            self.model.load_weights(weights_path)
-            self.print_log(f"Loaded best weights from {weights_path}")
-            
-            loader = self.data_loader.get('test')
-            if loader is None:
-                self.print_log("No test data loader available")
-                return False
-                
-            self.print_log("Running inference with regular model...")
-            
-            max_eval_time = 60
-            start_eval_time = time.time()
-            
-            regular_preds = []
-            regular_logits = []
-            all_labels = []
-            
-            max_samples = 50
-            sample_count = 0
-            
-            for inputs, targets, _ in loader:
-                if time.time() - start_eval_time > max_eval_time:
-                    self.print_log("Warning: Evaluation taking too long, stopping early")
-                    break
-                    
-                outputs = self.model(inputs, training=False)
-                
-                if isinstance(outputs, tuple) and len(outputs) > 0:
-                    logits = outputs[0]
-                else:
-                    logits = outputs
-                    
-                regular_logits.extend(logits.numpy())
-                
-                if len(logits.shape) > 1 and logits.shape[-1] > 1:
-                    predictions = tf.argmax(logits, axis=-1)
-                else:
-                    predictions = tf.cast(tf.sigmoid(logits) > 0.5, tf.int32)
-                    
-                regular_preds.extend(predictions.numpy())
-                all_labels.extend(targets.numpy())
-                
-                sample_count += inputs['accelerometer'].shape[0]
-                if sample_count >= max_samples:
-                    self.print_log(f"Processed {sample_count} samples, stopping evaluation")
-                    break
-            
-            accuracy, f1, recall, precision, auc_score = self.calculate_metrics(all_labels, regular_preds)
-            
-            self.print_log(
-                f"Regular model metrics: "
-                f"Acc={accuracy:.2f}%, "
-                f"F1={f1:.2f}%, "
-                f"Prec={precision:.2f}%, "
-                f"Rec={recall:.2f}%, "
-                f"AUC={auc_score:.2f}%"
-            )
-            
-            if len(regular_logits) > 0:
-                self.print_log(f"Regular model logits sample: {regular_logits[0].flatten()[:5]}")
-            
-            comparison_file = os.path.join(
-                self.arg.work_dir,
-                'results',
-                f'model_evaluation_{subject_id}.json'
-            )
-            
-            comparison_results = {
-                "subject": subject_id,
-                "regular_model": {
-                    "accuracy": float(accuracy),
-                    "f1_score": float(f1),
-                    "precision": float(precision),
-                    "recall": float(recall),
-                    "auc": float(auc_score),
-                    "logits_sample": [float(x) for x in regular_logits[0].flatten()[:5]] if len(regular_logits) > 0 else []
-                }
-            }
-            
-            self.print_log("Skipping direct TFLite inference due to potential READ_VARIABLE errors")
-            comparison_results["tflite_notes"] = "TFLite model created but direct testing skipped to avoid READ_VARIABLE errors"
-            
-            with open(comparison_file, 'w') as f:
-                json.dump(comparison_results, f, indent=2)
-                
-            self.print_log(f"Comparison results saved to {comparison_file}")
-            
-            tflite_verification_file = os.path.join(os.path.dirname(tflite_path), "tflite_verification_status.txt")
-            with open(tflite_verification_file, 'w') as f:
-                f.write("TFLite model created successfully. Direct comparison skipped to avoid READ_VARIABLE errors.\n")
-                f.write(f"Regular model logits: {regular_logits[0].flatten()[:5]}\n")
-            
-            self.print_log(f"TFLite verification record created at {tflite_verification_file}")
-            self.print_log("TFLite comparison completed")
-            return True
-        except Exception as e:
-            self.print_log(f"Error in TFLite comparison: {e}")
-            self.print_log(traceback.format_exc())
-            return False
-    
-    def add_avg_df(self, results):
-        if not results:
-            return results
-        
-        avg_result = {'test_subject': 'Average'}
-        
-        for column in results[0].keys():
-            if column != 'test_subject':
-                values = [float(r[column]) for r in results]
-                avg_result[column] = round(sum(values) / len(values), 2)
-        
-        results.append(avg_result)
-        return results
     
     def evaluate_test_set(self, epoch=0):
         try:
@@ -1126,16 +926,7 @@ class BaseTrainer:
             all_logits = []
             steps = 0
             
-            max_batch_time = 300
-            start_batch_time = time.time()
-            
             for batch_idx in range(total_batches):
-                batch_duration = time.time() - start_batch_time
-                if batch_duration > max_batch_time:
-                    self.print_log(f"WARNING: Test batch {batch_idx} taking too long ({batch_duration:.1f}s), skipping")
-                    start_batch_time = time.time()
-                    continue
-                    
                 if batch_idx % 5 == 0 or batch_idx + 1 == total_batches:
                     self.print_log(f"Test batch {batch_idx+1}/{total_batches}")
                 
@@ -1173,12 +964,9 @@ class BaseTrainer:
                     all_preds.extend(predictions.numpy())
                     steps += 1
                     
-                    start_batch_time = time.time()
-                    
                 except Exception as e:
                     self.print_log(f"Error in test batch {batch_idx}: {e}")
                     self.print_log(traceback.format_exc())
-                    start_batch_time = time.time()
                     continue
             
             if steps > 0:
@@ -1225,8 +1013,6 @@ class BaseTrainer:
                 
                 with open(results_file, 'w') as f:
                     json.dump(results, f, indent=2)
-                
-                self.compare_regular_and_tflite_inference(subject_id)
                 
                 self.model.trainable = model_training
                 
@@ -1426,46 +1212,6 @@ class BaseTrainer:
                     self.print_log("Testing completed successfully")
                 else:
                     self.print_log("Testing failed")
-                
-            elif self.arg.phase == 'tflite':
-                self.print_log('Exporting TFLite model with parameters:')
-                for key, value in vars(self.arg).items():
-                    self.print_log(f'  {key}: {value}')
-                
-                if not hasattr(self.arg, 'weights') or not self.arg.weights:
-                    self.print_log("Must specify weights for TFLite export")
-                    return
-                
-                if hasattr(self.model, 'export_to_tflite'):
-                    self.print_log("Using model's built-in TFLite export method")
-                    tflite_path = os.path.join(self.arg.work_dir, f"{self.arg.model_saved_name}.tflite")
-                    success = self.model.export_to_tflite(tflite_path)
-                else:
-                    try:
-                        from utils.tflite_converter import convert_to_tflite
-                        
-                        acc_frames = self.arg.model_args.get('acc_frames', 128)
-                        
-                        tflite_path = os.path.join(self.arg.work_dir, f"{self.arg.model_saved_name}.tflite")
-                        
-                        self.print_log(f"Exporting model with input shape: (1, {acc_frames}, 3)")
-                        
-                        success = convert_to_tflite(
-                            model=self.model,
-                            save_path=tflite_path,
-                            input_shape=(1, acc_frames, 3),
-                            quantize=getattr(self.arg, 'quantize', False)
-                        )
-                        
-                    except Exception as e:
-                        self.print_log(f"Error exporting TFLite model: {e}")
-                        self.print_log(traceback.format_exc())
-                        success = False
-                
-                if success:
-                    self.print_log(f"TFLite model exported successfully to {tflite_path}")
-                else:
-                    self.print_log("TFLite export failed")
             
         except Exception as e:
             self.print_log(f"Fatal error in training process: {e}")
