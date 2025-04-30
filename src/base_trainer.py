@@ -31,14 +31,11 @@ class EarlyStopping:
             self.counter = 0
             self.wait = 0
             return False
-        
         self.counter += 1
         self.wait += 1
-        
         if self.counter >= self.patience:
             self.early_stop = True
             return True
-        
         return False
     
     def reset(self):
@@ -50,7 +47,6 @@ class EarlyStopping:
 class BaseTrainer:
     def __init__(self, arg):
         self.arg = arg
-        
         self.train_loss_summary = []
         self.val_loss_summary = []
         self.best_loss = float('inf')
@@ -124,64 +120,72 @@ class BaseTrainer:
         return total_params
     
     def load_model(self):
-        if self.arg.phase == 'train':
-            if self.arg.model is None:
-                raise ValueError("Model class path is required")
-                
-            model_class = self.import_class(self.arg.model)
-            model = model_class(**self.arg.model_args)
-            self.print_log(f"Created model: {self.arg.model}")
-            
-            try:
-                if 'accelerometer' in self.arg.dataset_args['modalities']:
-                    acc_frames = self.arg.model_args.get('acc_frames', 128)
-                    acc_coords = self.arg.model_args.get('acc_coords', 3)
-                    
-                    dummy_input = {
-                        'accelerometer': tf.zeros((2, acc_frames, acc_coords), dtype=tf.float32)
-                    }
-                    
-                    if 'skeleton' in self.arg.dataset_args['modalities']:
-                        dummy_input['skeleton'] = tf.zeros((2, acc_frames, 32, 3), dtype=tf.float32)
-                    
-                    _ = model(dummy_input, training=False)
-                    
-                    self.print_log("Model built successfully")
-            except Exception as e:
-                self.print_log(f"Warning: Could not pre-build model: {e}")
-            
-            return model
-        else:
-            if hasattr(self.arg, 'weights') and self.arg.weights:
-                try:
-                    model = tf.keras.models.load_model(self.arg.weights)
-                    self.print_log(f"Loaded model from {self.arg.weights}")
-                    return model
-                except Exception:
-                    if self.arg.model is None:
-                        raise ValueError("Model class path is required when weights cannot be directly loaded")
-                        
-                    model_class = self.import_class(self.arg.model)
-                    model = model_class(**self.arg.model_args)
-                    
-                    acc_frames = self.arg.model_args.get('acc_frames', 128)
-                    acc_coords = self.arg.model_args.get('acc_coords', 3)
-                    dummy_input = {'accelerometer': tf.zeros((2, acc_frames, acc_coords), dtype=tf.float32)}
-                    if 'skeleton' in self.arg.dataset_args.get('modalities', []):
-                        dummy_input['skeleton'] = tf.zeros((2, acc_frames, 32, 3), dtype=tf.float32)
-                    _ = model(dummy_input, training=False)
-                    
-                    model.load_weights(self.arg.weights)
-                    self.print_log(f"Loaded weights from {self.arg.weights}")
-                    return model
-            else:
+        try:
+            if self.arg.phase == 'train':
                 if self.arg.model is None:
                     raise ValueError("Model class path is required")
                     
                 model_class = self.import_class(self.arg.model)
                 model = model_class(**self.arg.model_args)
                 self.print_log(f"Created model: {self.arg.model}")
+                
+                try:
+                    if 'accelerometer' in self.arg.dataset_args['modalities']:
+                        acc_frames = self.arg.model_args.get('acc_frames', 128)
+                        acc_coords = self.arg.model_args.get('acc_coords', 3)
+                        
+                        dummy_input = {
+                            'accelerometer': tf.zeros((2, acc_frames, acc_coords), dtype=tf.float32)
+                        }
+                        
+                        if 'skeleton' in self.arg.dataset_args['modalities']:
+                            dummy_input['skeleton'] = tf.zeros((2, acc_frames, 32, 3), dtype=tf.float32)
+                        
+                        _ = model(dummy_input, training=False)
+                        
+                        self.print_log("Model built successfully")
+                except Exception as e:
+                    self.print_log(f"Warning: Could not pre-build model: {e}")
+                    self.print_log(traceback.format_exc())
+                
                 return model
+            else:
+                if hasattr(self.arg, 'weights') and self.arg.weights:
+                    try:
+                        model = tf.keras.models.load_model(self.arg.weights)
+                        self.print_log(f"Loaded model from {self.arg.weights}")
+                        return model
+                    except Exception:
+                        if self.arg.model is None:
+                            raise ValueError("Model class path is required when weights cannot be directly loaded")
+                            
+                        model_class = self.import_class(self.arg.model)
+                        model = model_class(**self.arg.model_args)
+                        
+                        acc_frames = self.arg.model_args.get('acc_frames', 128)
+                        acc_coords = self.arg.model_args.get('acc_coords', 3)
+                        dummy_input = {'accelerometer': tf.zeros((2, acc_frames, acc_coords), dtype=tf.float32)}
+                        
+                        if 'skeleton' in self.arg.dataset_args.get('modalities', []):
+                            dummy_input['skeleton'] = tf.zeros((2, acc_frames, 32, 3), dtype=tf.float32)
+                        
+                        _ = model(dummy_input, training=False)
+                        
+                        model.load_weights(self.arg.weights)
+                        self.print_log(f"Loaded weights from {self.arg.weights}")
+                        return model
+                else:
+                    if self.arg.model is None:
+                        raise ValueError("Model class path is required")
+                        
+                    model_class = self.import_class(self.arg.model)
+                    model = model_class(**self.arg.model_args)
+                    self.print_log(f"Created model: {self.arg.model}")
+                    return model
+        except Exception as e:
+            self.print_log(f"Error loading model: {e}")
+            self.print_log(traceback.format_exc())
+            raise
     
     def calculate_class_weights(self, labels):
         from collections import Counter
@@ -199,47 +203,59 @@ class BaseTrainer:
         return tf.constant(pos_weight, dtype=tf.float32)
     
     def load_optimizer(self):
-        if not hasattr(self.arg, 'optimizer'):
-            self.arg.optimizer = 'adam'
+        try:
+            if not hasattr(self.arg, 'optimizer'):
+                self.arg.optimizer = 'adam'
+                
+            if not hasattr(self.arg, 'base_lr'):
+                self.arg.base_lr = 0.001
+                
+            if not hasattr(self.arg, 'weight_decay'):
+                self.arg.weight_decay = 0.0004
             
-        if not hasattr(self.arg, 'base_lr'):
-            self.arg.base_lr = 0.001
-            
-        if not hasattr(self.arg, 'weight_decay'):
-            self.arg.weight_decay = 0.0004
-        
-        if self.arg.optimizer.lower() == "adam":
-            self.optimizer = tf.keras.optimizers.Adam(
-                learning_rate=self.arg.base_lr
-            )
-        elif self.arg.optimizer.lower() == "adamw":
-            self.optimizer = tf.keras.optimizers.AdamW(
-                learning_rate=self.arg.base_lr,
-                weight_decay=self.arg.weight_decay
-            )
-        elif self.arg.optimizer.lower() == "sgd":
-            self.optimizer = tf.keras.optimizers.SGD(
-                learning_rate=self.arg.base_lr,
-                momentum=0.9
-            )
-        else:
-            self.print_log(f"Unknown optimizer: {self.arg.optimizer}, using Adam")
-            self.optimizer = tf.keras.optimizers.Adam(learning_rate=self.arg.base_lr)
-            
-        self.print_log(f"Optimizer: {self.optimizer.__class__.__name__}, LR={self.arg.base_lr}")
+            if self.arg.optimizer.lower() == "adam":
+                self.optimizer = tf.keras.optimizers.Adam(
+                    learning_rate=self.arg.base_lr
+                )
+            elif self.arg.optimizer.lower() == "adamw":
+                self.optimizer = tf.keras.optimizers.AdamW(
+                    learning_rate=self.arg.base_lr,
+                    weight_decay=self.arg.weight_decay
+                )
+            elif self.arg.optimizer.lower() == "sgd":
+                self.optimizer = tf.keras.optimizers.SGD(
+                    learning_rate=self.arg.base_lr,
+                    momentum=0.9
+                )
+            else:
+                self.print_log(f"Unknown optimizer: {self.arg.optimizer}, using Adam")
+                self.optimizer = tf.keras.optimizers.Adam(learning_rate=self.arg.base_lr)
+                
+            self.print_log(f"Optimizer: {self.optimizer.__class__.__name__}, LR={self.arg.base_lr}")
+            return True
+        except Exception as e:
+            self.print_log(f"Error loading optimizer: {e}")
+            self.print_log(traceback.format_exc())
+            return False
     
     def load_loss(self):
-        if not hasattr(self, 'pos_weights') or self.pos_weights is None:
-            self.pos_weights = tf.constant(1.0)
-        
-        def weighted_bce(y_true, y_pred):
-            y_true = tf.cast(y_true, tf.float32)
-            bce = tf.nn.sigmoid_cross_entropy_with_logits(labels=y_true, logits=y_pred)
-            weights = y_true * (self.pos_weights - 1.0) + 1.0
-            return tf.reduce_mean(weights * bce)
-        
-        self.criterion = weighted_bce
-        self.print_log(f"Using BCE loss with pos_weight={self.pos_weights.numpy():.4f}")
+        try:
+            if not hasattr(self, 'pos_weights') or self.pos_weights is None:
+                self.pos_weights = tf.constant(1.0)
+            
+            def weighted_bce(y_true, y_pred):
+                y_true = tf.cast(y_true, tf.float32)
+                bce = tf.nn.sigmoid_cross_entropy_with_logits(labels=y_true, logits=y_pred)
+                weights = y_true * (self.pos_weights - 1.0) + 1.0
+                return tf.reduce_mean(weights * bce)
+            
+            self.criterion = weighted_bce
+            self.print_log(f"Using BCE loss with pos_weight={self.pos_weights.numpy():.4f}")
+            return True
+        except Exception as e:
+            self.print_log(f"Error loading loss function: {e}")
+            self.print_log(traceback.format_exc())
+            return False
     
     def load_data(self):
         try:
@@ -247,6 +263,10 @@ class BaseTrainer:
             
             feeder_class_path = getattr(self.arg, 'feeder', 'utils.dataset_tf.UTD_MM_TF')
             Feeder = self.import_class(feeder_class_path)
+            
+            # Get use_smv flag from config or default to False
+            use_smv = getattr(self.arg, 'use_smv', False)
+            self.print_log(f"Data loader configuration: use_smv={use_smv}")
             
             if self.arg.phase == 'train':
                 builder = prepare_smartfallmm_tf(self.arg)
@@ -262,10 +282,30 @@ class BaseTrainer:
                     self.print_log("Error: Training data is empty")
                     return False
                     
-                self.data_loader['train'] = Feeder(
-                    dataset=self.norm_train,
-                    batch_size=self.arg.batch_size
-                )
+                # Try with use_smv parameter first, fall back to without it
+                try:
+                    self.data_loader['train'] = Feeder(
+                        dataset=self.norm_train,
+                        batch_size=self.arg.batch_size,
+                        use_smv=use_smv
+                    )
+                except TypeError as e:
+                    if "unexpected keyword argument 'use_smv'" in str(e):
+                        self.print_log("Data loader doesn't support use_smv parameter, using default")
+                        self.data_loader['train'] = Feeder(
+                            dataset=self.norm_train,
+                            batch_size=self.arg.batch_size
+                        )
+                    else:
+                        raise
+                
+                # Check sample batch
+                try:
+                    sample_batch = next(iter(self.data_loader['train']))
+                    self.print_log(f"Train data sample shapes: {[(k, v.shape) for k, v in sample_batch[0].items()]}")
+                    self.print_log(f"Train labels shape: {sample_batch[1].shape}")
+                except Exception as e:
+                    self.print_log(f"Warning: Could not check train data shapes: {e}")
                 
                 self.pos_weights = self.calculate_class_weights(self.norm_train['labels'])
                 
@@ -290,10 +330,21 @@ class BaseTrainer:
                             k: v[:-val_size].copy() for k, v in self.norm_train.items()
                         }
                     
-                    self.data_loader['val'] = Feeder(
-                        dataset=self.norm_val,
-                        batch_size=self.arg.val_batch_size
-                    )
+                    # Try with use_smv parameter first, fall back to without it
+                    try:
+                        self.data_loader['val'] = Feeder(
+                            dataset=self.norm_val,
+                            batch_size=self.arg.val_batch_size,
+                            use_smv=use_smv
+                        )
+                    except TypeError as e:
+                        if "unexpected keyword argument 'use_smv'" in str(e):
+                            self.data_loader['val'] = Feeder(
+                                dataset=self.norm_val,
+                                batch_size=self.arg.val_batch_size
+                            )
+                        else:
+                            raise
                     
                     try:
                         self.distribution_viz(self.norm_val['labels'], self.arg.work_dir, 'val')
@@ -307,11 +358,22 @@ class BaseTrainer:
                     if any(len(x) == 0 for x in self.norm_test.values()):
                         self.print_log("Warning: Test data is empty")
                         return False
-                        
-                    self.data_loader['test'] = Feeder(
-                        dataset=self.norm_test,
-                        batch_size=self.arg.test_batch_size
-                    )
+                    
+                    # Try with use_smv parameter first, fall back to without it    
+                    try:
+                        self.data_loader['test'] = Feeder(
+                            dataset=self.norm_test,
+                            batch_size=self.arg.test_batch_size,
+                            use_smv=use_smv
+                        )
+                    except TypeError as e:
+                        if "unexpected keyword argument 'use_smv'" in str(e):
+                            self.data_loader['test'] = Feeder(
+                                dataset=self.norm_test,
+                                batch_size=self.arg.test_batch_size
+                            )
+                        else:
+                            raise
                     
                     subject_id = self.test_subject[0] if self.test_subject else 'unknown'
                     try:
@@ -337,17 +399,28 @@ class BaseTrainer:
                     self.print_log("Error: Test data is empty")
                     return False
                 
-                self.data_loader['test'] = Feeder(
-                    dataset=self.norm_test,
-                    batch_size=self.arg.test_batch_size
-                )
+                # Try with use_smv parameter first, fall back to without it
+                try:
+                    self.data_loader['test'] = Feeder(
+                        dataset=self.norm_test,
+                        batch_size=self.arg.test_batch_size,
+                        use_smv=use_smv
+                    )
+                except TypeError as e:
+                    if "unexpected keyword argument 'use_smv'" in str(e):
+                        self.data_loader['test'] = Feeder(
+                            dataset=self.norm_test,
+                            batch_size=self.arg.test_batch_size
+                        )
+                    else:
+                        raise
                 
                 self.print_log("Test data loading complete")
                 return True
                 
         except Exception as e:
             self.print_log(f"Error loading data: {e}")
-            traceback.print_exc()
+            self.print_log(traceback.format_exc())
             return False
     
     def distribution_viz(self, labels, work_dir, mode):
@@ -376,260 +449,344 @@ class BaseTrainer:
             self.print_log(f"Error visualizing distribution: {e}")
     
     def calculate_metrics(self, targets, predictions):
-        if isinstance(targets, tf.Tensor):
-            targets = targets.numpy()
-        if isinstance(predictions, tf.Tensor):
-            predictions = predictions.numpy()
-            
-        targets = np.array(targets).flatten()
-        predictions = np.array(predictions).flatten()
-        
-        accuracy = accuracy_score(targets, predictions) * 100
-        
-        unique_targets = np.unique(targets)
-        unique_preds = np.unique(predictions)
-        
-        if len(unique_targets) <= 1 or len(unique_preds) <= 1:
-            if len(unique_targets) == 1 and len(unique_preds) == 1 and unique_targets[0] == unique_preds[0]:
-                if unique_targets[0] == 1:
-                    precision = 100.0
-                    recall = 100.0
-                    f1 = 100.0
-                else:
-                    precision = 0.0
-                    recall = 0.0
-                    f1 = 0.0
-                auc = 50.0
-            else:
-                tp = np.sum((predictions == 1) & (targets == 1))
-                fp = np.sum((predictions == 1) & (targets == 0))
-                fn = np.sum((predictions == 0) & (targets == 1))
+        try:
+            if isinstance(targets, tf.Tensor):
+                targets = targets.numpy()
+            if isinstance(predictions, tf.Tensor):
+                predictions = predictions.numpy()
                 
-                precision = 100.0 * tp / (tp + fp) if (tp + fp) > 0 else 0.0
-                recall = 100.0 * tp / (tp + fn) if (tp + fn) > 0 else 0.0
-                f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
-                auc = 50.0
-        else:
-            precision = precision_score(targets, predictions, zero_division=0) * 100
-            recall = recall_score(targets, predictions, zero_division=0) * 100
-            f1 = f1_score(targets, predictions, zero_division=0) * 100
-            try:
-                auc = roc_auc_score(targets, predictions) * 100
-            except:
-                auc = 50.0
-        
-        return accuracy, f1, recall, precision, auc
+            targets = np.array(targets).flatten()
+            predictions = np.array(predictions).flatten()
+            
+            accuracy = accuracy_score(targets, predictions) * 100
+            
+            unique_targets = np.unique(targets)
+            unique_preds = np.unique(predictions)
+            
+            if len(unique_targets) <= 1 or len(unique_preds) <= 1:
+                if len(unique_targets) == 1 and len(unique_preds) == 1 and unique_targets[0] == unique_preds[0]:
+                    if unique_targets[0] == 1:
+                        precision = 100.0
+                        recall = 100.0
+                        f1 = 100.0
+                    else:
+                        precision = 0.0
+                        recall = 0.0
+                        f1 = 0.0
+                    auc = 50.0
+                else:
+                    tp = np.sum((predictions == 1) & (targets == 1))
+                    fp = np.sum((predictions == 1) & (targets == 0))
+                    fn = np.sum((predictions == 0) & (targets == 1))
+                    
+                    precision = 100.0 * tp / (tp + fp) if (tp + fp) > 0 else 0.0
+                    recall = 100.0 * tp / (tp + fn) if (tp + fn) > 0 else 0.0
+                    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+                    auc = 50.0
+            else:
+                precision = precision_score(targets, predictions, zero_division=0) * 100
+                recall = recall_score(targets, predictions, zero_division=0) * 100
+                f1 = f1_score(targets, predictions, zero_division=0) * 100
+                try:
+                    auc = roc_auc_score(targets, predictions) * 100
+                except Exception:
+                    auc = 50.0
+            
+            return accuracy, f1, recall, precision, auc
+        except Exception as e:
+            self.print_log(f"Error calculating metrics: {e}")
+            self.print_log(traceback.format_exc())
+            return 0.0, 0.0, 0.0, 0.0, 0.0
     
     def train(self, epoch):
-        start_time = time.time()
-        
-        # Get actual number of batches by iterating through data loader once
-        loader = self.data_loader['train']
-        num_samples = 0
-        for _, _, indices in loader:
-            num_samples += len(indices)
-        
-        # Calculate true number of batches
-        batch_size = self.arg.batch_size
-        total_batches = (num_samples + batch_size - 1) // batch_size
-        
-        # Reset data loader
-        loader = self.data_loader['train']
-        
-        train_loss = 0.0
-        all_labels = []
-        all_preds = []
-        steps = 0
-        
-        self.print_log(f"Starting epoch {epoch+1}/{self.arg.num_epoch} - {total_batches} batches ({num_samples} samples)")
-        
-        # Training loop
-        for batch_idx, (inputs, targets, _) in enumerate(loader):
-            if batch_idx % 20 == 0 or batch_idx + 1 == total_batches:
-                self.print_log(f"Epoch {epoch+1}: batch {batch_idx+1}/{total_batches}")
+        try:
+            self.print_log(f"Starting epoch {epoch+1} training")
+            start_time = time.time()
+            
+            # Count actual samples in loader
+            loader = self.data_loader['train']
+            num_samples = 0
+            batch_indices = []
+            for _, _, indices in loader:
+                batch_indices.append(indices)
+                num_samples += len(indices)
+            
+            # Calculate actual number of batches
+            batch_size = self.arg.batch_size
+            total_batches = len(batch_indices)
+            
+            # Reset data loader by recreating it
+            loader = self.data_loader['train']
+            
+            # Training variables
+            train_loss = 0.0
+            all_labels = []
+            all_preds = []
+            steps = 0
+            
+            self.print_log(f"Epoch {epoch+1}/{self.arg.num_epoch} - {total_batches} batches ({num_samples} samples)")
+            
+            # Training loop
+            for batch_idx, (inputs, targets, _) in enumerate(loader):
+                # Log batch progress
+                if batch_idx % 10 == 0 or batch_idx + 1 == total_batches:
+                    self.print_log(f"Training epoch {epoch+1}: batch {batch_idx+1}/{total_batches}")
                 
-            targets = tf.cast(targets, tf.float32)
-            
-            with tf.GradientTape() as tape:
-                outputs = self.model(inputs, training=True)
+                # For first batch, debug data shapes
+                if batch_idx == 0:
+                    for key, value in inputs.items():
+                        self.print_log(f"Input {key} shape: {value.shape}")
                 
-                if isinstance(outputs, tuple) and len(outputs) > 0:
-                    logits = outputs[0]
-                else:
-                    logits = outputs
+                # Ensure targets are float32
+                targets = tf.cast(targets, tf.float32)
                 
-                if len(logits.shape) > 1 and logits.shape[-1] > 1:
-                    loss = self.criterion(targets, logits)
-                else:
-                    loss = self.criterion(targets, tf.squeeze(logits))
-            
-            gradients = tape.gradient(loss, self.model.trainable_variables)
-            self.optimizer.apply_gradients(zip(gradients, self.model.trainable_variables))
-            
-            if len(logits.shape) > 1 and logits.shape[-1] > 1:
-                predictions = tf.argmax(logits, axis=-1)
-            else:
-                predictions = tf.cast(tf.sigmoid(logits) > 0.5, tf.int32)
-            
-            train_loss += loss.numpy()
-            all_labels.extend(targets.numpy())
-            all_preds.extend(predictions.numpy())
-            steps += 1
-            
-            # Don't continue after we've seen all samples
-            if batch_idx + 1 >= total_batches:
-                break
-        
-        # Calculate average loss and metrics
-        train_loss /= steps
-        accuracy, f1, recall, precision, auc_score = self.calculate_metrics(all_labels, all_preds)
-        
-        self.train_loss_summary.append(float(train_loss))
-        
-        epoch_time = time.time() - start_time
-        
-        self.print_log(
-            f"Epoch {epoch+1}: "
-            f"Train Loss={train_loss:.4f}, "
-            f"Acc={accuracy:.2f}%, "
-            f"F1={f1:.2f}%, "
-            f"Prec={precision:.2f}%, "
-            f"Rec={recall:.2f}%, "
-            f"AUC={auc_score:.2f}% "
-            f"({epoch_time:.2f}s)"
-        )
-        
-        val_loss = self.eval(epoch, loader_name='val')
-        
-        self.val_loss_summary.append(float(val_loss))
-        
-        self.early_stop(val_loss)
-    
-    def eval(self, epoch, loader_name='val', result_file=None):
-        start_time = time.time()
-        
-        loader = self.data_loader.get(loader_name)
-        if loader is None:
-            self.print_log(f"No data loader for {loader_name}")
-            return float('inf')
-        
-        # Get actual number of batches by iterating through data loader once
-        num_samples = 0
-        for _, _, indices in loader:
-            num_samples += len(indices)
-        
-        # Calculate true number of batches
-        batch_size = self.arg.val_batch_size if loader_name == 'val' else self.arg.test_batch_size
-        total_batches = (num_samples + batch_size - 1) // batch_size
-        
-        # Reset data loader
-        loader = self.data_loader[loader_name]
-        
-        eval_loss = 0.0
-        all_labels = []
-        all_preds = []
-        steps = 0
-        
-        self.print_log(f"Evaluating {loader_name} (epoch {epoch+1}) - {total_batches} batches ({num_samples} samples)")
-        
-        for batch_idx, (inputs, targets, _) in enumerate(loader):
-            if batch_idx % 5 == 0 or batch_idx + 1 == total_batches:
-                self.print_log(f"Eval {loader_name} (epoch {epoch+1}): batch {batch_idx+1}/{total_batches}")
+                try:
+                    # Forward and backward pass with gradient tape
+                    with tf.GradientTape() as tape:
+                        outputs = self.model(inputs, training=True)
+                        
+                        # Handle different output formats
+                        if isinstance(outputs, tuple) and len(outputs) > 0:
+                            logits = outputs[0]
+                        else:
+                            logits = outputs
+                        
+                        # Calculate loss based on output shape
+                        if len(logits.shape) > 1 and logits.shape[-1] > 1:
+                            loss = self.criterion(targets, logits)
+                        else:
+                            loss = self.criterion(targets, tf.squeeze(logits))
+                    
+                    # Calculate gradients
+                    gradients = tape.gradient(loss, self.model.trainable_variables)
+                    
+                    # Apply gradients
+                    self.optimizer.apply_gradients(zip(gradients, self.model.trainable_variables))
+                    
+                    # Get predictions
+                    if len(logits.shape) > 1 and logits.shape[-1] > 1:
+                        predictions = tf.argmax(logits, axis=-1)
+                    else:
+                        predictions = tf.cast(tf.sigmoid(logits) > 0.5, tf.int32)
+                    
+                    # Update statistics
+                    train_loss += loss.numpy()
+                    all_labels.extend(targets.numpy())
+                    all_preds.extend(predictions.numpy())
+                    steps += 1
+                    
+                except Exception as e:
+                    self.print_log(f"Error in batch {batch_idx}: {e}")
+                    self.print_log(traceback.format_exc())
+                    continue
                 
-            targets = tf.cast(targets, tf.float32)
+                # Don't continue after we've seen all samples
+                if batch_idx + 1 >= total_batches:
+                    break
             
-            outputs = self.model(inputs, training=False)
-            
-            if isinstance(outputs, tuple) and len(outputs) > 0:
-                logits = outputs[0]
-            else:
-                logits = outputs
-            
-            if len(logits.shape) > 1 and logits.shape[-1] > 1:
-                loss = self.criterion(targets, logits)
-            else:
-                loss = self.criterion(targets, tf.squeeze(logits))
-            
-            if len(logits.shape) > 1 and logits.shape[-1] > 1:
-                predictions = tf.argmax(logits, axis=-1)
-            else:
-                predictions = tf.cast(tf.sigmoid(logits) > 0.5, tf.int32)
-            
-            eval_loss += loss.numpy()
-            all_labels.extend(targets.numpy())
-            all_preds.extend(predictions.numpy())
-            steps += 1
-            
-            # Don't continue after we've seen all samples
-            if batch_idx + 1 >= total_batches:
-                break
-        
-        if steps > 0:
-            eval_loss /= steps
-            accuracy, f1, recall, precision, auc_score = self.calculate_metrics(all_labels, all_preds)
-            
-            self.print_log(
-                f"{loader_name.capitalize()}: "
-                f"Loss={eval_loss:.4f}, "
-                f"Acc={accuracy:.2f}%, "
-                f"F1={f1:.2f}%, "
-                f"Prec={precision:.2f}%, "
-                f"Rec={recall:.2f}%, "
-                f"AUC={auc_score:.2f}%"
-            )
-            
-            epoch_time = time.time() - start_time
-            self.print_log(f"{loader_name.capitalize()} time: {epoch_time:.2f}s")
-            
-            if loader_name == 'val':
-                is_best = False
+            # Calculate final metrics if we've completed any steps
+            if steps > 0:
+                train_loss /= steps
+                accuracy, f1, recall, precision, auc_score = self.calculate_metrics(all_labels, all_preds)
                 
-                if eval_loss < self.best_loss:
-                    self.best_loss = eval_loss
-                    is_best = True
-                    self.print_log(f"New best validation loss: {eval_loss:.4f}")
+                self.train_loss_summary.append(float(train_loss))
                 
-                if is_best:
-                    self.save_model(epoch)
-            
-            elif loader_name.startswith('test'):
-                self.test_accuracy = accuracy
-                self.test_f1 = f1
-                self.test_recall = recall
-                self.test_precision = precision
-                self.test_auc = auc_score
+                epoch_time = time.time() - start_time
                 
-                subject_id = self.test_subject[0] if self.test_subject else None
-                if subject_id:
-                    self.cm_viz(all_preds, all_labels, subject_id)
-                
-                results = {
-                    "subject": self.test_subject[0] if self.test_subject else "unknown",
-                    "accuracy": float(accuracy),
-                    "f1_score": float(f1),
-                    "precision": float(precision),
-                    "recall": float(recall),
-                    "auc": float(auc_score),
-                    "loss": float(eval_loss)
-                }
-                
-                results_file = os.path.join(
-                    self.arg.work_dir,
-                    'results',
-                    f'test_results_{self.test_subject[0] if self.test_subject else "unknown"}.json'
+                self.print_log(
+                    f"Epoch {epoch+1} results: "
+                    f"Train Loss={train_loss:.4f}, "
+                    f"Acc={accuracy:.2f}%, "
+                    f"F1={f1:.2f}%, "
+                    f"Prec={precision:.2f}%, "
+                    f"Rec={recall:.2f}%, "
+                    f"AUC={auc_score:.2f}% "
+                    f"({epoch_time:.2f}s)"
                 )
                 
-                with open(results_file, 'w') as f:
-                    json.dump(results, f, indent=2)
-                    
-                if result_file:
-                    with open(result_file, 'w') as f:
-                        for pred, true in zip(all_preds, all_labels):
-                            f.write(f"{pred} ==> {true}\n")
+                # Run validation
+                self.print_log(f"Running validation for epoch {epoch+1}")
+                val_loss = self.eval(epoch, loader_name='val')
+                
+                self.val_loss_summary.append(float(val_loss))
+                
+                # Check early stopping
+                if self.early_stop(val_loss):
+                    self.print_log(f"Early stopping at epoch {epoch+1}")
+                    return True
+                
+                return False
+            else:
+                self.print_log(f"No steps completed in epoch {epoch+1}")
+                return False
+                
+        except Exception as e:
+            self.print_log(f"Error in epoch {epoch+1}: {e}")
+            self.print_log(traceback.format_exc())
+            return False
+    
+    def eval(self, epoch, loader_name='val', result_file=None):
+        try:
+            start_time = time.time()
             
-            return eval_loss
-        else:
-            self.print_log(f"No evaluation steps for {loader_name}")
+            # Get the requested data loader
+            loader = self.data_loader.get(loader_name)
+            if loader is None:
+                self.print_log(f"No data loader for {loader_name}")
+                return float('inf')
+            
+            # Count samples
+            num_samples = 0
+            batch_indices = []
+            for _, _, indices in loader:
+                batch_indices.append(indices)
+                num_samples += len(indices)
+            
+            # Calculate actual number of batches
+            batch_size = self.arg.val_batch_size if loader_name == 'val' else self.arg.test_batch_size
+            total_batches = len(batch_indices)
+            
+            # Reset data loader
+            loader = self.data_loader[loader_name]
+            
+            # Evaluation variables
+            eval_loss = 0.0
+            all_labels = []
+            all_preds = []
+            steps = 0
+            
+            self.print_log(f"Evaluating {loader_name} (epoch {epoch+1}) - {total_batches} batches ({num_samples} samples)")
+            
+            # Evaluation loop
+            for batch_idx, (inputs, targets, _) in enumerate(loader):
+                # Log progress
+                if batch_idx % 5 == 0 or batch_idx + 1 == total_batches:
+                    self.print_log(f"Eval {loader_name} (epoch {epoch+1}): batch {batch_idx+1}/{total_batches}")
+                
+                # Debug shapes on first batch
+                if batch_idx == 0:
+                    for key, value in inputs.items():
+                        self.print_log(f"Eval input {key} shape: {value.shape}")
+                
+                # Ensure targets are float32
+                targets = tf.cast(targets, tf.float32)
+                
+                try:
+                    # Forward pass for evaluation (no gradients)
+                    outputs = self.model(inputs, training=False)
+                    
+                    # Handle different output formats
+                    if isinstance(outputs, tuple) and len(outputs) > 0:
+                        logits = outputs[0]
+                    else:
+                        logits = outputs
+                    
+                    # Calculate loss based on output shape
+                    if len(logits.shape) > 1 and logits.shape[-1] > 1:
+                        loss = self.criterion(targets, logits)
+                    else:
+                        loss = self.criterion(targets, tf.squeeze(logits))
+                    
+                    # Get predictions
+                    if len(logits.shape) > 1 and logits.shape[-1] > 1:
+                        predictions = tf.argmax(logits, axis=-1)
+                    else:
+                        predictions = tf.cast(tf.sigmoid(logits) > 0.5, tf.int32)
+                    
+                    # Update statistics
+                    eval_loss += loss.numpy()
+                    all_labels.extend(targets.numpy())
+                    all_preds.extend(predictions.numpy())
+                    steps += 1
+                    
+                except Exception as e:
+                    self.print_log(f"Error in eval batch {batch_idx}: {e}")
+                    self.print_log(traceback.format_exc())
+                    continue
+                
+                # Don't continue after we've seen all samples
+                if batch_idx + 1 >= total_batches:
+                    break
+            
+            # Calculate final metrics if we've completed any steps
+            if steps > 0:
+                eval_loss /= steps
+                accuracy, f1, recall, precision, auc_score = self.calculate_metrics(all_labels, all_preds)
+                
+                self.print_log(
+                    f"{loader_name.capitalize()}: "
+                    f"Loss={eval_loss:.4f}, "
+                    f"Acc={accuracy:.2f}%, "
+                    f"F1={f1:.2f}%, "
+                    f"Prec={precision:.2f}%, "
+                    f"Rec={recall:.2f}%, "
+                    f"AUC={auc_score:.2f}%"
+                )
+                
+                # Log evaluation time
+                epoch_time = time.time() - start_time
+                self.print_log(f"{loader_name.capitalize()} time: {epoch_time:.2f}s")
+                
+                # Handle validation results (best model saving)
+                if loader_name == 'val':
+                    is_best = False
+                    
+                    if eval_loss < self.best_loss:
+                        self.best_loss = eval_loss
+                        is_best = True
+                        self.print_log(f"New best validation loss: {eval_loss:.4f}")
+                    
+                    if is_best:
+                        self.save_model(epoch)
+                
+                # Handle test results
+                elif loader_name.startswith('test'):
+                    # Save metrics
+                    self.test_accuracy = accuracy
+                    self.test_f1 = f1
+                    self.test_recall = recall
+                    self.test_precision = precision
+                    self.test_auc = auc_score
+                    
+                    # Create confusion matrix
+                    subject_id = self.test_subject[0] if self.test_subject else None
+                    if subject_id:
+                        self.cm_viz(all_preds, all_labels, subject_id)
+                    
+                    # Save results to file
+                    results = {
+                        "subject": self.test_subject[0] if self.test_subject else "unknown",
+                        "accuracy": float(accuracy),
+                        "f1_score": float(f1),
+                        "precision": float(precision),
+                        "recall": float(recall),
+                        "auc": float(auc_score),
+                        "loss": float(eval_loss)
+                    }
+                    
+                    results_file = os.path.join(
+                        self.arg.work_dir,
+                        'results',
+                        f'test_results_{self.test_subject[0] if self.test_subject else "unknown"}.json'
+                    )
+                    
+                    with open(results_file, 'w') as f:
+                        json.dump(results, f, indent=2)
+                        
+                    # Save detailed predictions if requested
+                    if result_file:
+                        with open(result_file, 'w') as f:
+                            for pred, true in zip(all_preds, all_labels):
+                                f.write(f"{pred} ==> {true}\n")
+                
+                return eval_loss
+            else:
+                self.print_log(f"No evaluation steps for {loader_name}")
+                return float('inf')
+                
+        except Exception as e:
+            self.print_log(f"Error in evaluation: {e}")
+            self.print_log(traceback.format_exc())
             return float('inf')
     
     def cm_viz(self, y_pred, y_true, subject_id=None):
@@ -713,59 +870,46 @@ class BaseTrainer:
             else:
                 base_filename = f"{self.model_path}_epoch{epoch}"
             
+            # Save weights
             weights_path = f"{base_filename}.weights.h5"
             self.model.save_weights(weights_path)
             self.print_log(f"Saved model weights to {weights_path}")
             
-            model_path = f"{base_filename}.keras"
+            # Try to save full model
             try:
+                model_path = f"{base_filename}.keras"
                 self.model.save(model_path)
                 self.print_log(f"Saved full model to {model_path}")
             except Exception as e:
                 self.print_log(f"Warning: Could not save full model: {e}")
             
+            # Try to export TFLite model
             try:
-                # Create input
+                from utils.tflite_converter import convert_to_tflite
+                
                 acc_frames = self.arg.model_args.get('acc_frames', 128)
                 acc_coords = self.arg.model_args.get('acc_coords', 3)
                 
-                # Create standalone model for TFLite
-                inputs = tf.keras.Input(shape=(acc_frames, acc_coords), name='input')
-                
-                # Calculate SMV
-                mean = tf.reduce_mean(inputs, axis=1, keepdims=True)
-                zero_mean = inputs - mean
-                sum_squared = tf.reduce_sum(tf.square(zero_mean), axis=-1, keepdims=True)
-                smv = tf.sqrt(sum_squared)
-                processed = tf.concat([smv, inputs], axis=-1)
-                
-                # Create model inputs dict
-                model_inputs = {'accelerometer': processed}
-                
-                # Forward pass
-                outputs = self.model(model_inputs)
-                if isinstance(outputs, tuple):
-                    outputs = outputs[0]
-                
-                # Create new model
-                tflite_model = tf.keras.Model(inputs=inputs, outputs=outputs)
-                
-                # Save TFLite model
                 tflite_path = f"{base_filename}.tflite"
-                converter = tf.lite.TFLiteConverter.from_keras_model(tflite_model)
-                tflite_buffer = converter.convert()
+                success = convert_to_tflite(
+                    model=self.model,
+                    save_path=tflite_path,
+                    input_shape=(1, acc_frames, acc_coords),
+                    quantize=getattr(self.arg, 'quantize', False)
+                )
                 
-                with open(tflite_path, 'wb') as f:
-                    f.write(tflite_buffer)
-                
-                self.print_log(f"Exported TFLite model to {tflite_path}")
+                if success:
+                    self.print_log(f"Exported TFLite model to {tflite_path}")
+                else:
+                    self.print_log("Warning: TFLite export failed")
             except Exception as e:
                 self.print_log(f"Warning: TFLite export failed: {e}")
+                self.print_log(traceback.format_exc())
             
             return True
         except Exception as e:
             self.print_log(f"Error saving model: {e}")
-            traceback.print_exc()
+            self.print_log(traceback.format_exc())
             return False
     
     def add_avg_df(self, results):
@@ -783,116 +927,144 @@ class BaseTrainer:
         return results
     
     def evaluate_test_set(self, epoch=0):
-        model_training = self.model.trainable
-        self.model.trainable = False
-        
-        # Get test data loader
-        loader = self.data_loader.get('test')
-        if loader is None:
-            self.print_log("No test data loader available")
-            return
-        
-        # Get actual number of batches by iterating through data loader once
-        num_samples = 0
-        for _, _, indices in loader:
-            num_samples += len(indices)
-        
-        # Calculate true number of batches
-        batch_size = self.arg.test_batch_size
-        total_batches = (num_samples + batch_size - 1) // batch_size
-        
-        # Reset data loader
-        loader = self.data_loader['test']
-        
-        subject_id = self.test_subject[0] if self.test_subject else "unknown"
-        self.print_log(f"Testing subject {subject_id} - {total_batches} batches ({num_samples} samples)")
-        
-        test_loss = 0.0
-        all_labels = []
-        all_preds = []
-        steps = 0
-        
-        for batch_idx, (inputs, targets, _) in enumerate(loader):
-            if batch_idx % 5 == 0 or batch_idx + 1 == total_batches:
-                self.print_log(f"Test batch {batch_idx+1}/{total_batches}")
+        try:
+            model_training = self.model.trainable
+            self.model.trainable = False
+            
+            # Get test data loader
+            loader = self.data_loader.get('test')
+            if loader is None:
+                self.print_log("No test data loader available")
+                return None
+            
+            # Count samples
+            num_samples = 0
+            batch_indices = []
+            for _, _, indices in loader:
+                batch_indices.append(indices)
+                num_samples += len(indices)
+            
+            # Calculate actual number of batches
+            batch_size = self.arg.test_batch_size
+            total_batches = len(batch_indices)
+            
+            # Reset data loader
+            loader = self.data_loader['test']
+            
+            subject_id = self.test_subject[0] if self.test_subject else "unknown"
+            self.print_log(f"Testing subject {subject_id} - {total_batches} batches ({num_samples} samples)")
+            
+            # Test variables
+            test_loss = 0.0
+            all_labels = []
+            all_preds = []
+            steps = 0
+            
+            # Test loop
+            for batch_idx, (inputs, targets, _) in enumerate(loader):
+                # Log progress
+                if batch_idx % 5 == 0 or batch_idx + 1 == total_batches:
+                    self.print_log(f"Test batch {batch_idx+1}/{total_batches}")
                 
-            targets = tf.cast(targets, tf.float32)
+                # Ensure targets are float32
+                targets = tf.cast(targets, tf.float32)
+                
+                try:
+                    # Forward pass
+                    outputs = self.model(inputs, training=False)
+                    
+                    # Handle different output formats
+                    if isinstance(outputs, tuple) and len(outputs) > 0:
+                        logits = outputs[0]
+                    else:
+                        logits = outputs
+                    
+                    # Calculate loss based on output shape
+                    if len(logits.shape) > 1 and logits.shape[-1] > 1:
+                        loss = self.criterion(targets, logits)
+                    else:
+                        loss = self.criterion(targets, tf.squeeze(logits))
+                    
+                    # Get predictions
+                    if len(logits.shape) > 1 and logits.shape[-1] > 1:
+                        predictions = tf.argmax(logits, axis=-1)
+                    else:
+                        predictions = tf.cast(tf.sigmoid(logits) > 0.5, tf.int32)
+                    
+                    # Update statistics
+                    test_loss += loss.numpy()
+                    all_labels.extend(targets.numpy())
+                    all_preds.extend(predictions.numpy())
+                    steps += 1
+                    
+                except Exception as e:
+                    self.print_log(f"Error in test batch {batch_idx}: {e}")
+                    self.print_log(traceback.format_exc())
+                    continue
+                
+                # Don't continue after we've seen all samples
+                if batch_idx + 1 >= total_batches:
+                    break
             
-            outputs = self.model(inputs, training=False)
-            
-            if isinstance(outputs, tuple) and len(outputs) > 0:
-                logits = outputs[0]
+            if steps > 0:
+                # Calculate metrics
+                test_loss /= steps
+                accuracy, f1, recall, precision, auc_score = self.calculate_metrics(all_labels, all_preds)
+                
+                # Store metrics
+                self.test_accuracy = accuracy
+                self.test_f1 = f1
+                self.test_recall = recall
+                self.test_precision = precision
+                self.test_auc = auc_score
+                
+                # Log results
+                self.print_log(
+                    f"Test results for Subject {subject_id}: "
+                    f"Loss={test_loss:.4f}, "
+                    f"Acc={accuracy:.2f}%, "
+                    f"F1={f1:.2f}%, "
+                    f"Prec={precision:.2f}%, "
+                    f"Rec={recall:.2f}%, "
+                    f"AUC={auc_score:.2f}%"
+                )
+                
+                # Create confusion matrix
+                self.cm_viz(all_preds, all_labels, subject_id)
+                
+                # Save results
+                results = {
+                    "subject": subject_id,
+                    "accuracy": float(accuracy),
+                    "f1_score": float(f1),
+                    "precision": float(precision),
+                    "recall": float(recall),
+                    "auc": float(auc_score),
+                    "loss": float(test_loss)
+                }
+                
+                results_file = os.path.join(
+                    self.arg.work_dir,
+                    'results',
+                    f'test_results_{subject_id}.json'
+                )
+                
+                with open(results_file, 'w') as f:
+                    json.dump(results, f, indent=2)
+                
+                return results
             else:
-                logits = outputs
+                self.print_log(f"No valid test steps for subject {subject_id}")
+                return None
+                
+        except Exception as e:
+            self.print_log(f"Error in test evaluation: {e}")
+            self.print_log(traceback.format_exc())
+            return None
             
-            if len(logits.shape) > 1 and logits.shape[-1] > 1:
-                loss = self.criterion(targets, logits)
-            else:
-                loss = self.criterion(targets, tf.squeeze(logits))
-            
-            if len(logits.shape) > 1 and logits.shape[-1] > 1:
-                predictions = tf.argmax(logits, axis=-1)
-            else:
-                predictions = tf.cast(tf.sigmoid(logits) > 0.5, tf.int32)
-            
-            test_loss += loss.numpy()
-            all_labels.extend(targets.numpy())
-            all_preds.extend(predictions.numpy())
-            steps += 1
-            
-            # Don't continue after we've seen all samples
-            if batch_idx + 1 >= total_batches:
-                break
-        
-        # Calculate metrics
-        test_loss /= steps
-        accuracy, f1, recall, precision, auc_score = self.calculate_metrics(all_labels, all_preds)
-        
-        # Store metrics
-        self.test_accuracy = accuracy
-        self.test_f1 = f1
-        self.test_recall = recall
-        self.test_precision = precision
-        self.test_auc = auc_score
-        
-        # Log results
-        self.print_log(
-            f"Test results for Subject {subject_id}: "
-            f"Loss={test_loss:.4f}, "
-            f"Acc={accuracy:.2f}%, "
-            f"F1={f1:.2f}%, "
-            f"Prec={precision:.2f}%, "
-            f"Rec={recall:.2f}%, "
-            f"AUC={auc_score:.2f}%"
-        )
-        
-        # Create confusion matrix
-        self.cm_viz(all_preds, all_labels, subject_id)
-        
-        # Save results
-        results = {
-            "subject": subject_id,
-            "accuracy": float(accuracy),
-            "f1_score": float(f1),
-            "precision": float(precision),
-            "recall": float(recall),
-            "auc": float(auc_score),
-            "loss": float(test_loss)
-        }
-        
-        results_file = os.path.join(
-            self.arg.work_dir,
-            'results',
-            f'test_results_{subject_id}.json'
-        )
-        
-        with open(results_file, 'w') as f:
-            json.dump(results, f, indent=2)
-        
-        # Restore model training state
-        self.model.trainable = model_training
-        
-        return results
+        finally:
+            # Restore model training state
+            self.model.trainable = model_training
     
     def start(self):
         if self.arg.phase == 'train':
@@ -922,47 +1094,63 @@ class BaseTrainer:
                 self.print_log(f"Val: {len(self.val_subject)} subjects")
                 self.print_log(f"Test: Subject {test_subject}")
                 
+                # Create a fresh model for each fold
                 self.model = self.load_model()
                 
+                # Load data for this fold
                 if not self.load_data():
                     self.print_log(f"Skipping subject {test_subject} due to data issues")
                     continue
                 
-                self.load_optimizer()
-                self.load_loss()
+                # Initialize optimizer and loss
+                if not self.load_optimizer() or not self.load_loss():
+                    self.print_log(f"Skipping subject {test_subject} due to optimizer/loss issues")
+                    continue
                 
+                # Reset early stopping
                 self.early_stop = EarlyStopping(patience=15, min_delta=.001)
                 
+                # Training loop
+                early_stop = False
+                self.print_log(f"Starting training for subject {test_subject}")
+                
                 for epoch in range(self.arg.start_epoch, self.arg.num_epoch):
-                    self.train(epoch)
+                    early_stop = self.train(epoch)
                     
-                    if self.early_stop.early_stop:
+                    if early_stop:
                         self.print_log(f"Early stopping at epoch {epoch+1}")
                         break
                 
+                # Load best weights for final evaluation
                 best_weights = f"{self.model_path}_{test_subject}.weights.h5"
                 if os.path.exists(best_weights):
                     self.model.load_weights(best_weights)
                     self.print_log(f"Loaded best weights from {best_weights}")
                 
+                # Final evaluation
                 self.print_log(f"=== Final evaluation on subject {test_subject} ===")
-                self.evaluate_test_set()
+                result = self.evaluate_test_set()
                 
+                # Create loss visualization
                 self.loss_viz(self.train_loss_summary, self.val_loss_summary, subject_id=test_subject)
                 
-                subject_result = {
-                    'test_subject': str(test_subject),
-                    'accuracy': round(self.test_accuracy, 2),
-                    'f1_score': round(self.test_f1, 2),
-                    'precision': round(self.test_precision, 2),
-                    'recall': round(self.test_recall, 2),
-                    'auc': round(self.test_auc, 2)
-                }
+                # Add results to summary
+                if result:
+                    subject_result = {
+                        'test_subject': str(test_subject),
+                        'accuracy': round(self.test_accuracy, 2),
+                        'f1_score': round(self.test_f1, 2),
+                        'precision': round(self.test_precision, 2),
+                        'recall': round(self.test_recall, 2),
+                        'auc': round(self.test_auc, 2)
+                    }
+                    
+                    results.append(subject_result)
                 
-                results.append(subject_result)
-                
+                # Clear TensorFlow session to avoid memory issues
                 tf.keras.backend.clear_session()
             
+            # Generate final report
             if results:
                 results = self.add_avg_df(results)
                 
@@ -991,3 +1179,57 @@ class BaseTrainer:
                     )
             
             self.print_log("Training completed successfully")
+            
+        elif self.arg.phase == 'test':
+            self.print_log('Testing with parameters:')
+            for key, value in vars(self.arg).items():
+                self.print_log(f'  {key}: {value}')
+            
+            if hasattr(self.arg, 'weights') and self.arg.weights:
+                self.print_log(f"Using weights: {self.arg.weights}")
+            
+            self.test_subject = self.arg.subjects
+            
+            if not self.load_data():
+                self.print_log("Failed to load test data")
+                return
+            
+            self.load_loss()
+            self.evaluate_test_set()
+            
+            self.print_log("Testing completed successfully")
+            
+        elif self.arg.phase == 'tflite':
+            self.print_log('Exporting TFLite model with parameters:')
+            for key, value in vars(self.arg).items():
+                self.print_log(f'  {key}: {value}')
+            
+            if not hasattr(self.arg, 'weights') or not self.arg.weights:
+                self.print_log("Must specify weights for TFLite export")
+                return
+            
+            try:
+                from utils.tflite_converter import convert_to_tflite
+                
+                acc_frames = self.arg.model_args.get('acc_frames', 128)
+                acc_coords = self.arg.model_args.get('acc_coords', 3)
+                
+                tflite_path = os.path.join(self.arg.work_dir, f"{self.arg.model_saved_name}.tflite")
+                
+                self.print_log(f"Exporting model with input shape: (1, {acc_frames}, {acc_coords})")
+                
+                success = convert_to_tflite(
+                    model=self.model,
+                    save_path=tflite_path,
+                    input_shape=(1, acc_frames, acc_coords),
+                    quantize=getattr(self.arg, 'quantize', False)
+                )
+                
+                if success:
+                    self.print_log(f"TFLite model exported successfully to {tflite_path}")
+                else:
+                    self.print_log("TFLite export failed")
+            
+            except Exception as e:
+                self.print_log(f"Error exporting TFLite model: {e}")
+                self.print_log(traceback.format_exc())

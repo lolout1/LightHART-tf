@@ -3,12 +3,13 @@ import numpy as np
 import logging
 
 class UTD_MM_TF(tf.keras.utils.Sequence):
-    def __init__(self, dataset, batch_size):
+    def __init__(self, dataset, batch_size, use_smv=False):
         self.batch_size = batch_size
         self.acc_data = dataset.get('accelerometer', None)
         self.gyro_data = dataset.get('gyroscope', None)
         self.skl_data = dataset.get('skeleton', None)
         self.labels = dataset.get('labels', None)
+        self.use_smv = use_smv
         
         if self.acc_data is None or len(self.acc_data) == 0:
             logging.warning("No accelerometer data in dataset")
@@ -51,16 +52,23 @@ class UTD_MM_TF(tf.keras.utils.Sequence):
             self.acc_data = tf.convert_to_tensor(self.acc_data, dtype=tf.float32)
             self.labels = tf.convert_to_tensor(self.labels, dtype=tf.int32)
             
-            mean = tf.reduce_mean(self.acc_data, axis=1, keepdims=True)
-            zero_mean = self.acc_data - mean
-            sum_squared = tf.reduce_sum(tf.square(zero_mean), axis=-1, keepdims=True)
-            self.smv = tf.sqrt(sum_squared)
+            if self.use_smv:
+                mean = tf.reduce_mean(self.acc_data, axis=1, keepdims=True)
+                zero_mean = self.acc_data - mean
+                sum_squared = tf.reduce_sum(tf.square(zero_mean), axis=-1, keepdims=True)
+                self.smv = tf.sqrt(sum_squared)
+            else:
+                # Create dummy SMV (won't be used)
+                self.smv = None
             
             if self.skl_data is not None and len(self.skl_data) > 0:
                 self.skl_data = tf.convert_to_tensor(self.skl_data, dtype=tf.float32)
         except Exception as e:
             logging.error(f"Error preparing data: {e}")
-            self.smv = tf.zeros((self.num_samples, self.acc_seq, 1), dtype=tf.float32)
+            if self.use_smv:
+                self.smv = tf.zeros((self.num_samples, self.acc_seq, 1), dtype=tf.float32)
+            else:
+                self.smv = None
     
     def cal_smv(self, sample):
         mean = tf.reduce_mean(sample, axis=-2, keepdims=True)
@@ -99,10 +107,13 @@ class UTD_MM_TF(tf.keras.utils.Sequence):
             
             indices = tf.range(start_idx, end_idx)
             batch_acc = tf.gather(self.acc_data, indices)
-            batch_smv = tf.gather(self.smv, indices)
             
             data = {}
-            data['accelerometer'] = tf.concat([batch_smv, batch_acc], axis=-1)
+            if self.use_smv:
+                batch_smv = tf.gather(self.smv, indices)
+                data['accelerometer'] = tf.concat([batch_smv, batch_acc], axis=-1)
+            else:
+                data['accelerometer'] = batch_acc
             
             if hasattr(self, 'skl_data') and self.skl_data is not None and len(self.skl_data) > 0:
                 if len(self.skl_data.shape) == 4:
@@ -117,7 +128,8 @@ class UTD_MM_TF(tf.keras.utils.Sequence):
         except Exception as e:
             logging.error(f"Error in batch generation {idx}: {e}")
             batch_size = min(self.batch_size, self.num_samples)
-            dummy_acc = tf.zeros((batch_size, self.acc_seq, 4), dtype=tf.float32)
+            channels = 4 if self.use_smv else 3
+            dummy_acc = tf.zeros((batch_size, self.acc_seq, channels), dtype=tf.float32)
             dummy_data = {'accelerometer': dummy_acc}
             dummy_labels = tf.zeros(batch_size, dtype=tf.int32)
             return dummy_data, dummy_labels, np.arange(batch_size)

@@ -659,15 +659,16 @@ def split_by_subjects_tf(builder: DatasetBuilder, subjects: List[int], fuse: boo
 # TensorFlow-specific dataset class for batching
 class UTD_MM_TF(tf.keras.utils.Sequence):
     '''TensorFlow data feeder compatible with PyTorch UTD_MM'''
-    def __init__(self, dataset: Dict[str, np.ndarray], batch_size: int):
+    def __init__(self, dataset, batch_size, use_smv=False):
         self.batch_size = batch_size
         self.dataset = dataset
-        
+        self.use_smv = use_smv
+
         # Extract data
         self.acc_data = dataset.get('accelerometer', None)
         self.skl_data = dataset.get('skeleton', None)
         self.labels = dataset.get('labels', None)
-        
+
         # Validate data
         if self.acc_data is None or len(self.acc_data) == 0:
             logging.warning("No accelerometer data in dataset")
@@ -675,71 +676,112 @@ class UTD_MM_TF(tf.keras.utils.Sequence):
             self.num_samples = 1
         else:
             self.num_samples = self.acc_data.shape[0]
-            
+
         if self.labels is None or len(self.labels) == 0:
             logging.warning("No labels found, using zeros")
             self.labels = np.zeros(self.num_samples, dtype=np.int32)
-        
+
         # Process and prepare data
         self._prepare_data()
-    
+        
+        # Store indices for more reliable batch generation
+        self.indices = np.arange(self.num_samples)
+
     def _prepare_data(self):
         '''Prepare data for TensorFlow - compatible with PyTorch'''
         try:
             # Convert to TensorFlow tensors
             self.acc_data = tf.convert_to_tensor(self.acc_data, dtype=tf.float32)
             self.labels = tf.convert_to_tensor(self.labels, dtype=tf.int32)
-            
-            # Calculate signal magnitude vector (SMV)
-            mean = tf.reduce_mean(self.acc_data, axis=1, keepdims=True)
-            zero_mean = self.acc_data - mean
-            sum_squared = tf.reduce_sum(tf.square(zero_mean), axis=-1, keepdims=True)
-            self.smv = tf.sqrt(sum_squared)
-            
-            # Concatenate SMV with accelerometer data
-            self.acc_data_with_smv = tf.concat([self.smv, self.acc_data], axis=-1)
-            
+
+            # Calculate signal magnitude vector (SMV) if requested
+            if self.use_smv:
+                mean = tf.reduce_mean(self.acc_data, axis=1, keepdims=True)
+                zero_mean = self.acc_data - mean
+                sum_squared = tf.reduce_sum(tf.square(zero_mean), axis=-1, keepdims=True)
+                self.smv = tf.sqrt(sum_squared)
+
             # Convert skeleton data if available
             if self.skl_data is not None and len(self.skl_data) > 0:
                 self.skl_data = tf.convert_to_tensor(self.skl_data, dtype=tf.float32)
+                
+            # Log shapes for debugging
+            logging.info(f"Prepared accelerometer data shape: {self.acc_data.shape}")
+            if hasattr(self, 'smv'):
+                logging.info(f"Prepared SMV data shape: {self.smv.shape}")
+            if hasattr(self, 'skl_data'):
+                logging.info(f"Prepared skeleton data shape: {self.skl_data.shape}")
+                
         except Exception as e:
             logging.error(f"Error preparing data: {e}")
+            logging.error(traceback.format_exc())
             # Create fallback tensors
-            shape = self.acc_data.shape if hasattr(self, 'acc_data') else (self.num_samples, 64, 3)
-            self.acc_data = tf.zeros(shape, dtype=tf.float32)
-            self.smv = tf.zeros((*shape[:-1], 1), dtype=tf.float32)
-            self.acc_data_with_smv = tf.zeros((*shape[:-1], shape[-1]+1), dtype=tf.float32)
-    
+            self.acc_seq = self.acc_data.shape[1] if hasattr(self, 'acc_data') and len(self.acc_data.shape) > 1 else 64
+            if self.use_smv:
+                self.smv = tf.zeros((self.num_samples, self.acc_seq, 1), dtype=tf.float32)
+
     def __len__(self):
         '''Number of batches - compatible with PyTorch'''
         return (self.num_samples + self.batch_size - 1) // self.batch_size
-    
+
     def __getitem__(self, idx):
         '''Get a batch - compatible with PyTorch'''
-        start_idx = idx * self.batch_size
-        if start_idx >= self.num_samples:
-            start_idx = 0  # Wrap around to the beginning
-        end_idx = min(start_idx + self.batch_size, self.num_samples)
-        
-        # Create batch data
-        batch_data = {}
-        
-        # Add accelerometer with SMV
-        # Ensure valid range (fix for the tf.range error)
-        if start_idx >= end_idx:
-            start_idx = 0
-            end_idx = min(self.batch_size, self.num_samples)
-            
-        indices = tf.range(start_idx, end_idx)
-        
-        batch_data['accelerometer'] = tf.gather(self.acc_data_with_smv, indices)
-        
-        # Add skeleton if available
-        if hasattr(self, 'skl_data') and self.skl_data is not None:
-            batch_data['skeleton'] = tf.gather(self.skl_data, tf.range(start_idx, end_idx))
-        
-        # Get labels and indices
-        batch_labels = tf.gather(self.labels, tf.range(start_idx, end_idx))
-        batch_indices = tf.range(start_idx, end_idx).numpy()
-        
-        return batch_data, batch_labels, batch_indices
+        try:
+            start_idx = idx * self.batch_size
+            end_idx = min(start_idx + self.batch_size, self.num_samples)
+
+            # Ensure valid range (fix for the tf.range error)
+            if start_idx >= self.num_samples:
+                start_idx = 0
+                end_idx = min(self.batch_size, self.num_samples)
+
+            # Use stored indices for batch generation
+            batch_indices = self.indices[start_idx:end_idx]
+            tf_indices = tf.convert_to_tensor(batch_indices)
+
+            # Create batch data
+            batch_data = {}
+
+            # Add accelerometer data (with or without SMV)
+            batch_acc = tf.gather(self.acc_data, tf_indices)
+            if self.use_smv:
+                batch_smv = tf.gather(self.smv, tf_indices)
+                batch_data['accelerometer'] = tf.concat([batch_smv, batch_acc], axis=-1)
+            else:
+                batch_data['accelerometer'] = batch_acc
+
+            # Add skeleton if available
+            if hasattr(self, 'skl_data') and self.skl_data is not None and len(self.skl_data) > 0:
+                batch_data['skeleton'] = tf.gather(self.skl_data, tf_indices)
+
+            # Get labels
+            batch_labels = tf.gather(self.labels, tf_indices)
+
+            # For debugging the first batch of the first epoch
+            if idx == 0:
+                for key, value in batch_data.items():
+                    logging.info(f"First batch {key} shape: {value.shape}")
+                logging.info(f"First batch labels shape: {batch_labels.shape}")
+
+            return batch_data, batch_labels, batch_indices
+
+        except Exception as e:
+            logging.error(f"Error in batch generation {idx}: {e}")
+            logging.error(traceback.format_exc())
+            # Return dummy data in case of error
+            batch_size = min(self.batch_size, self.num_samples)
+            acc_seq = getattr(self, 'acc_seq', 64)
+            channels = 4 if self.use_smv else 3
+
+            dummy_acc = tf.zeros((batch_size, acc_seq, channels), dtype=tf.float32)
+            dummy_data = {'accelerometer': dummy_acc}
+            dummy_labels = tf.zeros(batch_size, dtype=tf.int32)
+            dummy_indices = np.arange(batch_size)
+
+            return dummy_data, dummy_labels, dummy_indices
+
+    def on_epoch_end(self):
+        '''Called at the end of each epoch - allows shuffling'''
+        # Optionally shuffle indices for next epoch
+        # np.random.shuffle(self.indices)
+        pass

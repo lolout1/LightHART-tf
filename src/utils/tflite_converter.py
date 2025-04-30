@@ -1,96 +1,98 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
+# utils/tflite_converter.py
 import os
 import logging
 import tensorflow as tf
 import numpy as np
+import traceback
 
-def convert_to_tflite_model(model, save_path, input_shape=(1, 64, 3)):
-    """Create a TFLite-compatible model and convert it"""
+def convert_to_tflite(model, save_path, input_shape=(1, 128, 3), quantize=False):
+    """Convert model to TFLite format with raw accelerometer input."""
     try:
-        # Ensure directory exists
+        # Ensure the directory exists
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         
-        # Extract dimensions
-        batch_size, sequence_length, num_features = input_shape
+        # Add .tflite extension if not present
+        if not save_path.endswith('.tflite'):
+            save_path += '.tflite'
         
-        # Create standalone model for TFLite
-        inputs = tf.keras.Input(shape=(sequence_length, num_features), name='input')
+        # Check if model has built-in export method
+        if hasattr(model, 'export_to_tflite'):
+            logging.info("Using model's built-in TFLite export method")
+            return model.export_to_tflite(save_path)
         
-        # Calculate SMV
-        mean = tf.reduce_mean(inputs, axis=1, keepdims=True)
-        zero_mean = inputs - mean
-        sum_squared = tf.reduce_sum(tf.square(zero_mean), axis=-1, keepdims=True)
-        smv = tf.sqrt(sum_squared)
-        processed = tf.concat([smv, inputs], axis=-1)
+        logging.info("Using standard TFLite conversion approach")
         
-        # Create model inputs dict
-        model_inputs = {'accelerometer': processed}
+        # Create a wrapper model for TFLite export
+        class TFLiteModel(tf.keras.Model):
+            def __init__(self, orig_model):
+                super().__init__()
+                self.orig_model = orig_model
+            
+            def call(self, inputs):
+                # Wrap in dictionary for original model
+                inputs_dict = {'accelerometer': inputs}
+                # Get output from original model
+                return self.orig_model(inputs_dict, training=False)
         
-        # Forward pass
-        outputs = model(model_inputs)
-        if isinstance(outputs, tuple):
-            outputs = outputs[0]
+        # Create wrapper model
+        tflite_model = TFLiteModel(model)
         
-        # Create new model
-        tflite_model = tf.keras.Model(inputs=inputs, outputs=outputs)
+        # Initialize with sample input
+        sample_input = tf.zeros(input_shape, dtype=tf.float32)
+        tflite_model(sample_input)
         
-        # Convert to TFLite
-        converter = tf.lite.TFLiteConverter.from_keras_model(tflite_model)
+        # Create concrete function for TFLite conversion
+        @tf.function(input_signature=[
+            tf.TensorSpec(shape=[1, input_shape[1], input_shape[2]], dtype=tf.float32)
+        ])
+        def serving_function(inputs):
+            return tflite_model(inputs)
         
-        # Set optimization and options
-        converter.optimizations = [tf.lite.Optimize.DEFAULT]
-        converter.target_spec.supported_ops = [
-            tf.lite.OpsSet.TFLITE_BUILTINS,
-        ]
+        # Convert using concrete function
+        converter = tf.lite.TFLiteConverter.from_concrete_functions(
+            [serving_function.get_concrete_function()]
+        )
         
-        # Convert model
+        # Set optimization options
+        if quantize:
+            converter.optimizations = [tf.lite.Optimize.DEFAULT]
+        
+        # Configure supported operations
+        converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS]
+        
+        # Convert to TFLite format
+        logging.info("Converting model to TFLite...")
         tflite_buffer = converter.convert()
         
-        # Save model
+        # Save the converted model
         with open(save_path, 'wb') as f:
             f.write(tflite_buffer)
         
-        return True
+        logging.info(f"TFLite model saved to {save_path}")
         
-    except Exception as e:
-        logging.error(f"TFLite conversion error: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
-
-def test_tflite_model(tflite_path, test_input=None):
-    """Test a TFLite model with sample input"""
-    try:
-        # Create interpreter
-        interpreter = tf.lite.Interpreter(model_path=tflite_path)
+        # Test the TFLite model
+        interpreter = tf.lite.Interpreter(model_content=tflite_buffer)
         interpreter.allocate_tensors()
         
         # Get input and output details
         input_details = interpreter.get_input_details()
         output_details = interpreter.get_output_details()
         
-        # Create test input if not provided
-        if test_input is None:
-            input_shape = input_details[0]['shape']
-            test_input = np.random.random(input_shape).astype(np.float32)
-        elif len(test_input.shape) < len(input_details[0]['shape']):
-            # Add batch dimension if needed
-            test_input = np.expand_dims(test_input, axis=0)
+        logging.info(f"Input details: {input_details}")
+        logging.info(f"Output details: {output_details}")
         
-        # Make sure input is float32
-        test_input = test_input.astype(np.float32)
+        # Create sample input
+        test_input = np.zeros(input_shape, dtype=np.float32)
         
-        # Set input tensor
+        # Test inference
         interpreter.set_tensor(input_details[0]['index'], test_input)
-        
-        # Run inference
         interpreter.invoke()
-        
-        # Get output
         output = interpreter.get_tensor(output_details[0]['index'])
         
-        return output
+        logging.info(f"TFLite test successful - output shape: {output.shape}")
+        
+        return True
     except Exception as e:
-        logging.error(f"Error testing TFLite model: {e}")
-        return None
+        logging.error(f"TFLite conversion failed: {e}")
+        traceback.print_exc()
+        return False

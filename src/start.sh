@@ -1,19 +1,16 @@
 #!/bin/bash
 # start.sh - Robust execution script for LightHART-TF training
-#
-# This script handles the complete execution pipeline for training fall detection
-# models with the LightHART-TF framework. It includes error handling, dependency
-# checking, environment setup, and reporting.
+# Optimized for transformer_optimized.py with raw accelerometer data
 
 # Enable strict error handling
 set -euo pipefail
 
 # ===== CONFIGURATION =====
-# User configurable variables
 CONFIG_FILE="config/smartfallmm/optimized.yaml"
 GPU_ID="0"
 MAX_MEMORY="90"  # Maximum GPU memory percentage to use (0-100)
 NUM_THREADS=8    # CPU threads for operations
+USE_SMV=false    # Disable SMV calculation for raw accelerometer data
 
 # ===== DIRECTORIES =====
 # Create timestamp for this run
@@ -30,13 +27,6 @@ mkdir -p "${work_dir}"
 mkdir -p "${results_dir}"
 mkdir -p "${viz_dir}"
 mkdir -p "${model_dir}"
-
-# Ensure module directories exist
-mkdir -p utils/processor
-mkdir -p trainer
-mkdir -p models
-mkdir -p config/smartfallmm
-mkdir -p data/smartfallmm
 
 # ===== LOGGING =====
 # Set up logfile
@@ -128,13 +118,11 @@ check_required_files() {
     required_files=(
         "train.py"
         "trainer/base_trainer.py"
-        "trainer/training_loop.py"
-        "trainer/evaluation.py"
+        "models/transformer_optimized.py"
         "utils/model_utils.py"
         "utils/metrics.py"
-        "utils/visualization.py"
-        "utils/dataset_tf.py"
         "utils/tflite_converter.py"
+        "feeder/make_dataset_tf.py"
         "${CONFIG_FILE}"
     )
     
@@ -163,310 +151,67 @@ backup_code() {
     cp -r trainer "${code_backup}/"
     cp -r utils "${code_backup}/"
     cp -r models "${code_backup}/"
+    cp -r feeder "${code_backup}/"  
     cp "${CONFIG_FILE}" "${code_backup}/"
     cp "start.sh" "${code_backup}/"
     
     log "Code backup created at ${code_backup}"
 }
 
-# Create TFLite converter if missing
-ensure_tflite_converter() {
-    if [ ! -f "utils/tflite_converter.py" ]; then
-        log "Creating TFLite converter..."
-        cat > "utils/tflite_converter.py" << 'EOF'
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-"""
-TFLite Converter for LightHART-TF
-
-Handles converting TensorFlow models to TFLite format with proper preprocessing
-for accelerometer-only input, supporting inference on mobile and edge devices.
-"""
-import os
-import logging
-import shutil
-import traceback
-from typing import Tuple, Optional, Union
-import tensorflow as tf
-import numpy as np
-
-logger = logging.getLogger('lightheart-tf')
-
-def convert_to_tflite(
-    model: tf.keras.Model, 
-    save_path: str, 
-    input_shape: Tuple[int, int, int] = (1, 128, 3),
-    quantize: bool = False,
-    optimize: bool = True,
-    include_metadata: bool = True
-) -> bool:
-    """Convert model to TFLite format with accelerometer-only input.
-    
-    This function creates a TFLite model that only takes accelerometer data as input,
-    even if the original model was trained with both skeleton and accelerometer data.
-    It adds signal magnitude vector (SMV) calculation as a preprocessing step.
-    
-    Args:
-        model: TensorFlow model to convert
-        save_path: Path to save the TFLite model
-        input_shape: Input shape for accelerometer data (batch, frames, channels)
-        quantize: Whether to apply quantization to reduce model size
-        optimize: Whether to optimize model for inference
-        include_metadata: Whether to include metadata in the model
+# Update config file to disable SMV calculation
+update_config() {
+    if [ "$USE_SMV" = false ]; then
+        log "Updating config to use raw accelerometer data (without SMV)..."
         
-    Returns:
-        bool: Success status of the conversion
-    """
-    try:
-        # Ensure directory exists
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        # Create temp config
+        temp_config="${work_dir}/optimized_temp.yaml"
+        cp "${CONFIG_FILE}" "${temp_config}"
         
-        # Add .tflite extension if not present
-        if not save_path.endswith('.tflite'):
-            save_path += '.tflite'
+        # Add use_smv: false if not already present
+        if ! grep -q "use_smv:" "${temp_config}"; then
+            echo "use_smv: false" >> "${temp_config}"
+            log "Added use_smv: false to config"
+        else
+            # Update existing use_smv value
+            sed -i 's/use_smv: true/use_smv: false/g' "${temp_config}"
+            log "Updated use_smv to false in config"
+        fi
         
-        # Create specific preprocessing function for accelerometer data
-        @tf.function(input_signature=[
-            tf.TensorSpec(shape=input_shape, dtype=tf.float32, name='accelerometer')
-        ])
-        def serving_function(accelerometer):
-            # Calculate signal magnitude vector (SMV)
-            mean = tf.reduce_mean(accelerometer, axis=1, keepdims=True)
-            zero_mean = accelerometer - mean
-            sum_squared = tf.reduce_sum(tf.square(zero_mean), axis=-1, keepdims=True)
-            smv = tf.sqrt(sum_squared)
-            
-            # Concatenate SMV with original data
-            acc_with_smv = tf.concat([smv, accelerometer], axis=-1)
-            
-            # Create a dictionary for the model if it expects one
-            inputs = {'accelerometer': acc_with_smv}
-            
-            # Forward pass (handle both tuple and single output)
-            outputs = model(inputs, training=False)
-            
-            # Return only logits if model returns (logits, features)
-            if isinstance(outputs, tuple) and len(outputs) > 0:
-                return outputs[0]
-            return outputs
-        
-        # Create temporary SavedModel with the concrete function
-        saved_model_dir = os.path.join(os.path.dirname(save_path), "temp_saved_model")
-        if os.path.exists(saved_model_dir):
-            shutil.rmtree(saved_model_dir)
-            
-        logger.info(f"Creating SavedModel with signature at {saved_model_dir}")
-        
-        # Save model with signature
-        tf.saved_model.save(
-            model, 
-            saved_model_dir,
-            signatures={
-                'serving_default': serving_function
-            }
-        )
-        
-        # Create converter from saved model
-        logger.info("Initializing TFLite converter")
-        converter = tf.lite.TFLiteConverter.from_saved_model(
-            saved_model_dir,
-            signature_keys=['serving_default']
-        )
-        
-        # Set optimization options
-        if optimize:
-            logger.info("Applying default optimizations")
-            converter.optimizations = [tf.lite.Optimize.DEFAULT]
-        
-        # Apply quantization if requested
-        if quantize:
-            logger.info("Applying quantization")
-            if optimize:
-                # Already set optimizations above
-                pass
-            else:
-                converter.optimizations = [tf.lite.Optimize.DEFAULT]
-                
-            # Set additional quantization options
-            converter.target_spec.supported_types = [tf.float16]
-            
-            # Setup representative dataset for full integer quantization
-            def representative_dataset():
-                # Generate 100 random samples for calibration
-                for _ in range(100):
-                    sample = np.random.randn(*input_shape).astype(np.float32)
-                    yield [sample]
-            
-            converter.representative_dataset = representative_dataset
-        
-        # Configure TFLite options
-        converter.target_spec.supported_ops = [
-            tf.lite.OpsSet.TFLITE_BUILTINS,
-            tf.lite.OpsSet.SELECT_TF_OPS  # Include TF ops for better compatibility
-        ]
-        
-        # Enable custom ops if needed
-        converter.allow_custom_ops = True
-        
-        # Set experimental flags
-        converter.experimental_new_converter = True
-        
-        # Convert to TFLite format
-        logger.info("Converting model to TFLite...")
-        tflite_model = converter.convert()
-        
-        # Save the converted model
-        with open(save_path, 'wb') as f:
-            f.write(tflite_model)
-        
-        logger.info(f"TFLite model saved to {save_path}")
-        
-        # Add metadata if requested
-        if include_metadata:
-            try:
-                from tflite_support import metadata as tflite_metadata
-                from tflite_support import metadata_schema_py_generated as schema_fb
-                
-                # Create metadata
-                model_meta = schema_fb.ModelMetadataT()
-                model_meta.name = "LightHART_Fall_Detection"
-                model_meta.description = "Fall detection model for wearable devices"
-                model_meta.version = "1.0"
-                model_meta.author = "LightHART-TF"
-                
-                # Add input metadata
-                input_meta = schema_fb.TensorMetadataT()
-                input_meta.name = "accelerometer"
-                input_meta.description = "Raw accelerometer data (x,y,z)"
-                input_meta.content = schema_fb.ContentT()
-                input_meta.content.contentProperties = schema_fb.FeaturePropertiesT()
-                
-                # Add output metadata
-                output_meta = schema_fb.TensorMetadataT()
-                output_meta.name = "fall_probability"
-                output_meta.description = "Probability of fall (logits)"
-                output_meta.content = schema_fb.ContentT()
-                output_meta.content.contentProperties = schema_fb.FeaturePropertiesT()
-                
-                # Create metadata populator
-                populator = tflite_metadata.MetadataPopulator.with_model_file(save_path)
-                populator.load_metadata_buffer(tflite_metadata.Metadata.create_metadata_buffer(model_meta))
-                populator.populate()
-                
-                logger.info("Added metadata to TFLite model")
-            except ImportError:
-                logger.warning("tflite-support not installed, skipping metadata")
-            except Exception as e:
-                logger.warning(f"Error adding metadata: {e}")
-        
-        # Test the model with sample input
-        logger.info("Testing TFLite model inference...")
-        interpreter = tf.lite.Interpreter(model_path=save_path)
-        interpreter.allocate_tensors()
-        
-        # Get input and output details
-        input_details = interpreter.get_input_details()
-        output_details = interpreter.get_output_details()
-        
-        logger.info(f"Input details: {input_details}")
-        logger.info(f"Output details: {output_details}")
-        
-        # Create sample input
-        sample_input = np.random.randn(*input_shape).astype(np.float32)
-        
-        # Test inference
-        interpreter.set_tensor(input_details[0]['index'], sample_input)
-        interpreter.invoke()
-        output = interpreter.get_tensor(output_details[0]['index'])
-        
-        logger.info(f"TFLite test successful - output shape: {output.shape}")
-        
-        # Calculate model size
-        model_size_bytes = os.path.getsize(save_path)
-        model_size_mb = model_size_bytes / (1024 * 1024)
-        logger.info(f"TFLite model size: {model_size_mb:.2f} MB")
-        
-        # Clean up temporary SavedModel
-        if os.path.exists(saved_model_dir):
-            shutil.rmtree(saved_model_dir)
-            
-        return True
-    
-    except Exception as e:
-        logger.error(f"TFLite conversion failed: {e}")
-        traceback.print_exc()
-        
-        # Try to clean up temporary files
-        try:
-            if 'saved_model_dir' in locals() and os.path.exists(saved_model_dir):
-                shutil.rmtree(saved_model_dir)
-        except:
-            pass
-            
-        return False
-
-def load_tflite_model(model_path: str) -> Optional[tf.lite.Interpreter]:
-    """Load a TFLite model for inference."""
-    try:
-        interpreter = tf.lite.Interpreter(model_path=model_path)
-        interpreter.allocate_tensors()
-        return interpreter
-    except Exception as e:
-        logger.error(f"Error loading TFLite model: {e}")
-        return None
-
-def run_tflite_inference(
-    interpreter: tf.lite.Interpreter,
-    accelerometer_data: np.ndarray
-) -> Union[np.ndarray, None]:
-    """Run inference with a TFLite model."""
-    try:
-        # Get input details
-        input_details = interpreter.get_input_details()
-        output_details = interpreter.get_output_details()
-        
-        # Ensure input has batch dimension
-        if len(accelerometer_data.shape) == 2:
-            # Add batch dimension
-            accelerometer_data = np.expand_dims(accelerometer_data, axis=0)
-        
-        # Set input tensor
-        interpreter.set_tensor(input_details[0]['index'], accelerometer_data.astype(np.float32))
-        
-        # Run inference
-        interpreter.invoke()
-        
-        # Get output
-        output = interpreter.get_tensor(output_details[0]['index'])
-        
-        return output
-    except Exception as e:
-        logger.error(f"Error during TFLite inference: {e}")
-        return None
-EOF
+        # Save as the active config for this run
+        active_config="${work_dir}/optimized_active.yaml"
+        cp "${temp_config}" "${active_config}"
+        CONFIG_FILE="${active_config}"
+        log "Active config created at ${active_config}"
     fi
 }
 
-# Fix dataset loading for range error
-ensure_dataset_fix() {
-    dataset_file="utils/dataset_tf.py"
-    if [ -f "$dataset_file" ]; then
-        log "Checking for range error fix in dataset_tf.py..."
-        if ! grep -q "if start_idx >= end_idx:" "$dataset_file"; then
-            log "Adding range error fix to dataset_tf.py..."
-            # Create backup
-            cp "$dataset_file" "${dataset_file}.bak"
-            
-            # Insert fix using sed
-            sed -i '/__getitem__/,/return/ s/batch_data\['\''accelerometer'\''\] = tf.gather(self.acc_data_with_smv, tf.range(start_idx, end_idx))/# Ensure valid range (fix for the tf.range error)\n        if start_idx >= end_idx:\n            start_idx = 0\n            end_idx = min(self.batch_size, self.num_samples)\n            \n        indices = tf.range(start_idx, end_idx)\n        \n        batch_data['\''accelerometer'\''] = tf.gather(self.acc_data_with_smv, indices)/' "$dataset_file"
-            
-            log "Range error fix applied to dataset_tf.py"
-        else
-            log "Range error fix already present in dataset_tf.py"
-        fi
-    else
-        log_error "utils/dataset_tf.py not found. Cannot apply range error fix."
-    fi
+# Check model for compatibility with raw accelerometer data
+check_model_compatibility() {
+    log "Checking model compatibility for raw accelerometer data..."
+    
+    # Check if model is configured for raw accelerometer inputs
+    python -c "
+import sys
+import yaml
+
+try:
+    with open('${CONFIG_FILE}', 'r') as f:
+        config = yaml.safe_load(f)
+    
+    if 'model_args' in config and 'acc_coords' in config['model_args']:
+        acc_coords = config['model_args']['acc_coords']
+        if acc_coords == 3:
+            print('Model configured for raw accelerometer data (3 channels)')
+        else:
+            print(f'Warning: Model configured for {acc_coords} channels, not raw accelerometer')
+            sys.exit(1)
+    else:
+        print('Warning: Could not verify acc_coords in config file')
+        sys.exit(1)
+except Exception as e:
+    print(f'Error checking model compatibility: {e}')
+    sys.exit(1)
+" || log_error "Model may not be compatible with raw accelerometer data"
 }
 
 # Handle errors
@@ -490,9 +235,9 @@ handle_error() {
         log_error "Detected missing module. Check Python environment and dependencies."
     fi
     
-    if grep -q "Requires start <= limit when delta > 0" "${logfile}"; then
-        log_error "Detected tf.range error in dataset. Applying fix..."
-        ensure_dataset_fix
+    if grep -q "shape mismatch" "${logfile}" || grep -q "incompatible dimensions" "${logfile}"; then
+        log_error "Detected shape mismatch. Check data loading and model input compatibility."
+        log_error "Ensure UTD_MM_TF is not adding SMV when use_smv=false in the config."
     fi
     
     log_error "See ${logfile} for details."
@@ -515,15 +260,11 @@ handle_error() {
         echo "4. Tensor shape incompatibility:"
         grep -i "incompatible shapes" "${logfile}" || echo "None found"
         grep -i "dimension mismatch" "${logfile}" || echo "None found"
-        echo "5. Range errors:"
-        grep -i "Requires start <= limit when delta > 0" "${logfile}" || echo "None found"
+        echo "5. Data format issues:"
+        grep -i "SMV" "${logfile}" | grep -i "error" || echo "None found"
+        grep -i "accelerometer" "${logfile}" | grep -i "shape" || echo "None found"
         echo "6. Other TensorFlow errors:"
         grep -i "tensorflow" "${logfile}" | grep -i "error" || echo "None found"
-        echo "7. Attribute errors:"
-        grep -i "attributeerror" "${logfile}" || echo "None found"
-        echo "8. Python exceptions:"
-        grep -i "exception" "${logfile}" || echo "None found"
-        grep -i "traceback" -A 10 "${logfile}" || echo "None found"
     } > "${error_analysis_file}"
     
     log_error "Error analysis saved to: ${error_analysis_file}"
@@ -542,16 +283,15 @@ log "  Config file: ${CONFIG_FILE}"
 log "  Working directory: ${work_dir}"
 log "  Log file: ${logfile}"
 log "  GPU ID: ${GPU_ID}"
+log "  Using SMV: ${USE_SMV}"
 
 # System checks
 check_dependencies
 check_gpu
 check_required_files
 backup_code
-
-# Ensure critical files are present
-ensure_tflite_converter
-ensure_dataset_fix
+update_config
+check_model_compatibility
 
 # Run training
 log "Starting training process..."
@@ -583,19 +323,36 @@ from utils.tflite_converter import convert_to_tflite
 
 # Find best model
 model_dir = '${model_dir}'
-best_models = [f for f in os.listdir(model_dir) if os.path.isdir(os.path.join(model_dir, f))]
+best_models = [f for f in os.listdir(model_dir) if f.endswith('.keras') or os.path.isdir(os.path.join(model_dir, f))]
 
 if best_models:
-    best_model = os.path.join(model_dir, best_models[0])
-    print(f'Found best model: {best_model}')
+    best_model_path = None
+    for model_name in best_models:
+        model_path = os.path.join(model_dir, model_name)
+        if os.path.isdir(model_path):
+            best_model_path = model_path
+        elif model_name.endswith('.keras'):
+            best_model_path = model_path
+        if best_model_path:
+            break
     
-    # Load model
-    model = tf.keras.models.load_model(best_model)
-    
-    # Export to TFLite
-    tflite_path = os.path.join(model_dir, 'model.tflite')
-    success = convert_to_tflite(model, tflite_path)
-    print(f'TFLite export success: {success}')
+    if best_model_path:
+        print(f'Found best model: {best_model_path}')
+        
+        # Load model
+        model = tf.keras.models.load_model(best_model_path)
+        
+        # Export to TFLite
+        tflite_path = os.path.join(model_dir, 'model.tflite')
+        success = convert_to_tflite(
+            model=model, 
+            save_path=tflite_path,
+            input_shape=(1, 64, 3),  # Raw accelerometer data
+            quantize=False
+        )
+        print(f'TFLite export success: {success}')
+    else:
+        print('No suitable best model found for TFLite export')
 else:
     print('No best model found for TFLite export')
 " 2>&1 | tee -a "${logfile}"
@@ -620,8 +377,11 @@ results = []
 
 for file in result_files:
     with open(os.path.join(results_dir, file), 'r') as f:
-        result = json.load(f)
-        results.append(result)
+        try:
+            result = json.load(f)
+            results.append(result)
+        except json.JSONDecodeError:
+            print(f'Error parsing {file}')
 
 if results:
     # Create DataFrame
@@ -629,9 +389,12 @@ if results:
     df.to_csv(os.path.join(work_dir, 'results.csv'), index=False)
     
     # Calculate average results
-    avg_row = {col: df[col].mean() for col in df.columns if col != 'subject'}
-    avg_row['subject'] = 'Average'
-    df_with_avg = pd.concat([df, pd.DataFrame([avg_row])])
+    if 'subject' in df.columns:
+        avg_row = {col: df[col].mean() for col in df.columns if col != 'subject'}
+        avg_row['subject'] = 'Average'
+        df_with_avg = pd.concat([df, pd.DataFrame([avg_row])])
+    else:
+        df_with_avg = df
     
     # Create report
     with open(report_file, 'w') as f:
@@ -644,6 +407,8 @@ if results:
         f.write('h1,h2{color:#4CAF50}</style></head><body>')
         f.write(f'<h1>LightHART-TF Training Report</h1>')
         f.write(f'<p>Training completed at {pd.Timestamp.now()}</p>')
+        f.write(f'<h2>Configuration</h2>')
+        f.write(f'<p>Raw accelerometer data (no SMV)</p>')
         f.write(f'<h2>Results Summary</h2>')
         f.write(df_with_avg.to_html(index=False))
         f.write('<h2>Visualizations</h2>')
