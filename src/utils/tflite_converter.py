@@ -1,12 +1,23 @@
-# utils/tflite_converter.py
 import os
-import logging
 import tensorflow as tf
+import logging
 import numpy as np
-import traceback
 
 def convert_to_tflite(model, save_path, input_shape=(1, 128, 3), quantize=False):
-    """Convert model to TFLite format with raw accelerometer input."""
+    """Convert model to TFLite format with accelerometer-only input.
+    
+    This function creates a TFLite model that only takes accelerometer data as input,
+    even if the original model was trained with both skeleton and accelerometer data.
+    
+    Args:
+        model: TensorFlow model to convert
+        save_path: Path to save the TFLite model
+        input_shape: Input shape for accelerometer data (batch, frames, channels)
+        quantize: Whether to apply quantization
+        
+    Returns:
+        bool: Success status
+    """
     try:
         # Ensure the directory exists
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
@@ -15,84 +26,111 @@ def convert_to_tflite(model, save_path, input_shape=(1, 128, 3), quantize=False)
         if not save_path.endswith('.tflite'):
             save_path += '.tflite'
         
-        # Check if model has built-in export method
+        # Use the model's built-in export method if available
         if hasattr(model, 'export_to_tflite'):
             logging.info("Using model's built-in TFLite export method")
-            return model.export_to_tflite(save_path)
+            return model.export_to_tflite(save_path, input_shape=input_shape, quantize=quantize)
         
-        logging.info("Using standard TFLite conversion approach")
+        logging.info(f"Starting TFLite conversion with input shape {input_shape}")
         
-        # Create a wrapper model for TFLite export
-        class TFLiteModel(tf.keras.Model):
-            def __init__(self, orig_model):
+        # Create concrete function for accelerometer-only input
+        class WrapperModel(tf.keras.Model):
+            def __init__(self, parent_model):
                 super().__init__()
-                self.orig_model = orig_model
+                self.parent = parent_model
             
+            @tf.function
             def call(self, inputs):
-                # Wrap in dictionary for original model
+                # Wrap accelerometer data in dictionary for parent model
                 inputs_dict = {'accelerometer': inputs}
-                # Get output from original model
-                return self.orig_model(inputs_dict, training=False)
+                # Get output from parent model
+                return self.parent(inputs_dict, training=False)
         
-        # Create wrapper model
-        tflite_model = TFLiteModel(model)
+        # Create and initialize wrapper model
+        wrapper_model = WrapperModel(model)
+        dummy_input = tf.zeros(input_shape, dtype=tf.float32)
+        _ = wrapper_model(dummy_input)  # Initialize variables
         
-        # Initialize with sample input
-        sample_input = tf.zeros(input_shape, dtype=tf.float32)
-        tflite_model(sample_input)
-        
-        # Create concrete function for TFLite conversion
-        @tf.function(input_signature=[
-            tf.TensorSpec(shape=[1, input_shape[1], input_shape[2]], dtype=tf.float32)
-        ])
-        def serving_function(inputs):
-            return tflite_model(inputs)
-        
-        # Convert using concrete function
-        converter = tf.lite.TFLiteConverter.from_concrete_functions(
-            [serving_function.get_concrete_function()]
+        # Create concrete function for TF 2.x compatibility
+        concrete_func = wrapper_model.call.get_concrete_function(
+            tf.TensorSpec(shape=input_shape, dtype=tf.float32, name='accelerometer_input')
         )
+        
+        # Create temporary saved model 
+        temp_saved_model_dir = os.path.join(os.path.dirname(save_path), "temp_savedmodel")
+        if os.path.exists(temp_saved_model_dir):
+            import shutil
+            shutil.rmtree(temp_saved_model_dir)
+        
+        # Save model with concrete function
+        tf.saved_model.save(
+            wrapper_model,
+            temp_saved_model_dir,
+            signatures=concrete_func
+        )
+        
+        # Create converter from saved model
+        converter = tf.lite.TFLiteConverter.from_saved_model(temp_saved_model_dir)
         
         # Set optimization options
         if quantize:
             converter.optimizations = [tf.lite.Optimize.DEFAULT]
         
-        # Configure supported operations
-        converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS]
+        # Configure TFLite conversion options for TF 2.19 compatibility
+        converter.target_spec.supported_ops = [
+            tf.lite.OpsSet.TFLITE_BUILTINS,
+            tf.lite.OpsSet.SELECT_TF_OPS  # Include TF ops for better compatibility
+        ]
         
-        # Convert to TFLite format
+        # Convert the model
         logging.info("Converting model to TFLite...")
-        tflite_buffer = converter.convert()
+        tflite_model = converter.convert()
         
         # Save the converted model
         with open(save_path, 'wb') as f:
-            f.write(tflite_buffer)
+            f.write(tflite_model)
         
         logging.info(f"TFLite model saved to {save_path}")
         
-        # Test the TFLite model
-        interpreter = tf.lite.Interpreter(model_content=tflite_buffer)
+        # Validate the TFLite model
+        interpreter = tf.lite.Interpreter(model_content=tflite_model)
         interpreter.allocate_tensors()
         
         # Get input and output details
         input_details = interpreter.get_input_details()
         output_details = interpreter.get_output_details()
         
-        logging.info(f"Input details: {input_details}")
-        logging.info(f"Output details: {output_details}")
+        logging.info(f"TFLite input details: {input_details}")
+        logging.info(f"TFLite output details: {output_details}")
         
         # Create sample input
-        test_input = np.zeros(input_shape, dtype=np.float32)
+        sample_input = np.random.randn(*input_shape).astype(np.float32)
         
         # Test inference
-        interpreter.set_tensor(input_details[0]['index'], test_input)
+        interpreter.set_tensor(input_details[0]['index'], sample_input)
         interpreter.invoke()
         output = interpreter.get_tensor(output_details[0]['index'])
         
         logging.info(f"TFLite test successful - output shape: {output.shape}")
         
+        # Clean up temporary SavedModel
+        import shutil
+        if os.path.exists(temp_saved_model_dir):
+            shutil.rmtree(temp_saved_model_dir)
+            
         return True
     except Exception as e:
         logging.error(f"TFLite conversion failed: {e}")
+        import traceback
         traceback.print_exc()
+        
+        # Clean up temporary model if exists
+        try:
+            import shutil
+            temp_saved_model_dir = os.path.join(os.path.dirname(save_path), "temp_savedmodel")
+            if os.path.exists(temp_saved_model_dir):
+                shutil.rmtree(temp_saved_model_dir)
+        except:
+            pass
+            
         return False

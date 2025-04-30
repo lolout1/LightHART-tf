@@ -13,6 +13,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from sklearn.metrics import confusion_matrix, f1_score, accuracy_score, precision_score, recall_score, roc_auc_score
+import shutil
 
 logger = logging.getLogger('lightheart-tf')
 
@@ -24,29 +25,54 @@ class EarlyStopping:
         self.best_loss = None
         self.early_stop = False
         self.wait = 0
+        self.stopped_epoch = 0
+        self.history = []
     
     def __call__(self, val_loss):
-        if self.best_loss is None or val_loss < self.best_loss - self.min_delta:
-            self.best_loss = val_loss
-            self.counter = 0
-            self.wait = 0
+        try:
+            if isinstance(val_loss, tf.Tensor):
+                val_loss = float(val_loss.numpy())
+            else:
+                val_loss = float(val_loss)
+                
+            self.history.append(val_loss)
+            
+            if self.best_loss is None:
+                self.best_loss = val_loss
+                return False
+                
+            if val_loss < self.best_loss - self.min_delta:
+                self.best_loss = val_loss
+                self.counter = 0
+                self.wait = 0
+                return False
+            else:
+                self.counter += 1
+                self.wait += 1
+                
+                if self.counter >= self.patience:
+                    self.early_stop = True
+                    self.stopped_epoch = len(self.history)
+                    return True
+                
+                return False
+                
+        except Exception as e:
+            logging.error(f"Error in EarlyStopping: {e}")
             return False
-        self.counter += 1
-        self.wait += 1
-        if self.counter >= self.patience:
-            self.early_stop = True
-            return True
-        return False
     
     def reset(self):
         self.counter = 0
         self.wait = 0
         self.best_loss = None
         self.early_stop = False
+        self.history = []
+        self.stopped_epoch = 0
 
 class BaseTrainer:
     def __init__(self, arg):
         self.arg = arg
+        
         self.train_loss_summary = []
         self.val_loss_summary = []
         self.best_loss = float('inf')
@@ -92,7 +118,7 @@ class BaseTrainer:
     
     def import_class(self, import_str):
         if import_str is None:
-            raise ValueError("Model path cannot be None")
+            raise ValueError("Import path cannot be None")
             
         mod_str, _sep, class_str = import_str.rpartition('.')
         
@@ -130,20 +156,16 @@ class BaseTrainer:
                 self.print_log(f"Created model: {self.arg.model}")
                 
                 try:
-                    if 'accelerometer' in self.arg.dataset_args['modalities']:
-                        acc_frames = self.arg.model_args.get('acc_frames', 128)
-                        acc_coords = self.arg.model_args.get('acc_coords', 3)
-                        
-                        dummy_input = {
-                            'accelerometer': tf.zeros((2, acc_frames, acc_coords), dtype=tf.float32)
-                        }
-                        
-                        if 'skeleton' in self.arg.dataset_args['modalities']:
-                            dummy_input['skeleton'] = tf.zeros((2, acc_frames, 32, 3), dtype=tf.float32)
-                        
-                        _ = model(dummy_input, training=False)
-                        
-                        self.print_log("Model built successfully")
+                    acc_frames = self.arg.model_args.get('acc_frames', 128)
+                    acc_coords = 3
+                    
+                    dummy_input = {
+                        'accelerometer': tf.zeros((2, acc_frames, acc_coords), dtype=tf.float32)
+                    }
+                    
+                    _ = model(dummy_input, training=False)
+                    
+                    self.print_log("Model built successfully")
                 except Exception as e:
                     self.print_log(f"Warning: Could not pre-build model: {e}")
                     self.print_log(traceback.format_exc())
@@ -163,12 +185,8 @@ class BaseTrainer:
                         model = model_class(**self.arg.model_args)
                         
                         acc_frames = self.arg.model_args.get('acc_frames', 128)
-                        acc_coords = self.arg.model_args.get('acc_coords', 3)
+                        acc_coords = 3
                         dummy_input = {'accelerometer': tf.zeros((2, acc_frames, acc_coords), dtype=tf.float32)}
-                        
-                        if 'skeleton' in self.arg.dataset_args.get('modalities', []):
-                            dummy_input['skeleton'] = tf.zeros((2, acc_frames, 32, 3), dtype=tf.float32)
-                        
                         _ = model(dummy_input, training=False)
                         
                         model.load_weights(self.arg.weights)
@@ -244,10 +262,29 @@ class BaseTrainer:
                 self.pos_weights = tf.constant(1.0)
             
             def weighted_bce(y_true, y_pred):
-                y_true = tf.cast(y_true, tf.float32)
-                bce = tf.nn.sigmoid_cross_entropy_with_logits(labels=y_true, logits=y_pred)
-                weights = y_true * (self.pos_weights - 1.0) + 1.0
-                return tf.reduce_mean(weights * bce)
+                try:
+                    y_true = tf.cast(y_true, tf.float32)
+                    
+                    if len(y_pred.shape) > 1 and y_pred.shape[-1] == 1:
+                        if len(y_true.shape) == 1:
+                            y_true = tf.expand_dims(y_true, -1)
+                    elif len(y_pred.shape) == 1 and len(y_true.shape) > 1:
+                        y_pred = tf.expand_dims(y_pred, -1)
+                    
+                    if y_true.shape != y_pred.shape:
+                        batch_size = tf.shape(y_true)[0]
+                        y_true = tf.reshape(y_true, [batch_size, 1])
+                        y_pred = tf.reshape(y_pred, [batch_size, 1])
+                    
+                    bce = tf.nn.sigmoid_cross_entropy_with_logits(labels=y_true, logits=y_pred)
+                    weights = y_true * (self.pos_weights - 1.0) + 1.0
+                    return tf.reduce_mean(weights * bce)
+                    
+                except Exception as e:
+                    logging.error(f"Error in loss calculation: {e}")
+                    logging.error(f"y_true shape: {y_true.shape}, y_pred shape: {y_pred.shape}")
+                    
+                    return tf.constant(0.1, dtype=tf.float32)
             
             self.criterion = weighted_bce
             self.print_log(f"Using BCE loss with pos_weight={self.pos_weights.numpy():.4f}")
@@ -264,7 +301,6 @@ class BaseTrainer:
             feeder_class_path = getattr(self.arg, 'feeder', 'utils.dataset_tf.UTD_MM_TF')
             Feeder = self.import_class(feeder_class_path)
             
-            # Get use_smv flag from config or default to False
             use_smv = getattr(self.arg, 'use_smv', False)
             self.print_log(f"Data loader configuration: use_smv={use_smv}")
             
@@ -281,8 +317,7 @@ class BaseTrainer:
                 if any(len(x) == 0 for x in self.norm_train.values()):
                     self.print_log("Error: Training data is empty")
                     return False
-                    
-                # Try with use_smv parameter first, fall back to without it
+                
                 try:
                     self.data_loader['train'] = Feeder(
                         dataset=self.norm_train,
@@ -299,7 +334,6 @@ class BaseTrainer:
                     else:
                         raise
                 
-                # Check sample batch
                 try:
                     sample_batch = next(iter(self.data_loader['train']))
                     self.print_log(f"Train data sample shapes: {[(k, v.shape) for k, v in sample_batch[0].items()]}")
@@ -330,7 +364,6 @@ class BaseTrainer:
                             k: v[:-val_size].copy() for k, v in self.norm_train.items()
                         }
                     
-                    # Try with use_smv parameter first, fall back to without it
                     try:
                         self.data_loader['val'] = Feeder(
                             dataset=self.norm_val,
@@ -359,7 +392,6 @@ class BaseTrainer:
                         self.print_log("Warning: Test data is empty")
                         return False
                     
-                    # Try with use_smv parameter first, fall back to without it    
                     try:
                         self.data_loader['test'] = Feeder(
                             dataset=self.norm_test,
@@ -378,8 +410,8 @@ class BaseTrainer:
                     subject_id = self.test_subject[0] if self.test_subject else 'unknown'
                     try:
                         self.distribution_viz(
-                            self.norm_test['labels'], 
-                            self.arg.work_dir, 
+                            self.norm_test['labels'],
+                            self.arg.work_dir,
                             f'test_{subject_id}'
                         )
                     except Exception as e:
@@ -387,6 +419,7 @@ class BaseTrainer:
                 
                 self.print_log("Data loading complete")
                 return True
+                
             elif self.arg.phase == 'test':
                 if not self.test_subject:
                     self.print_log("No test subjects specified")
@@ -399,7 +432,6 @@ class BaseTrainer:
                     self.print_log("Error: Test data is empty")
                     return False
                 
-                # Try with use_smv parameter first, fall back to without it
                 try:
                     self.data_loader['test'] = Feeder(
                         dataset=self.norm_test,
@@ -417,7 +449,7 @@ class BaseTrainer:
                 
                 self.print_log("Test data loading complete")
                 return True
-                
+        
         except Exception as e:
             self.print_log(f"Error loading data: {e}")
             self.print_log(traceback.format_exc())
@@ -447,6 +479,7 @@ class BaseTrainer:
             
         except Exception as e:
             self.print_log(f"Error visualizing distribution: {e}")
+            self.print_log(traceback.format_exc())
     
     def calculate_metrics(self, targets, predictions):
         try:
@@ -454,7 +487,7 @@ class BaseTrainer:
                 targets = targets.numpy()
             if isinstance(predictions, tf.Tensor):
                 predictions = predictions.numpy()
-                
+            
             targets = np.array(targets).flatten()
             predictions = np.array(predictions).flatten()
             
@@ -489,7 +522,7 @@ class BaseTrainer:
                 f1 = f1_score(targets, predictions, zero_division=0) * 100
                 try:
                     auc = roc_auc_score(targets, predictions) * 100
-                except Exception:
+                except:
                     auc = 50.0
             
             return accuracy, f1, recall, precision, auc
@@ -503,88 +536,101 @@ class BaseTrainer:
             self.print_log(f"Starting epoch {epoch+1} training")
             start_time = time.time()
             
-            # Count actual samples in loader
-            loader = self.data_loader['train']
-            num_samples = 0
-            batch_indices = []
-            for _, _, indices in loader:
-                batch_indices.append(indices)
-                num_samples += len(indices)
-            
-            # Calculate actual number of batches
-            batch_size = self.arg.batch_size
-            total_batches = len(batch_indices)
-            
-            # Reset data loader by recreating it
             loader = self.data_loader['train']
             
-            # Training variables
+            total_batches = len(loader)
+            num_samples = total_batches * self.arg.batch_size
+            
+            self.print_log(f"Epoch {epoch+1}/{self.arg.num_epoch} - {total_batches} batches (~{num_samples} samples)")
+            
             train_loss = 0.0
             all_labels = []
             all_preds = []
             steps = 0
             
-            self.print_log(f"Epoch {epoch+1}/{self.arg.num_epoch} - {total_batches} batches ({num_samples} samples)")
+            max_batch_time = 300
+            start_batch_time = time.time()
             
-            # Training loop
-            for batch_idx, (inputs, targets, _) in enumerate(loader):
-                # Log batch progress
-                if batch_idx % 10 == 0 or batch_idx + 1 == total_batches:
+            for batch_idx in range(total_batches):
+                batch_duration = time.time() - start_batch_time
+                if batch_duration > max_batch_time:
+                    self.print_log(f"WARNING: Batch {batch_idx} taking too long ({batch_duration:.1f}s), skipping")
+                    start_batch_time = time.time()
+                    continue
+                
+                if batch_idx % 5 == 0 or batch_idx + 1 == total_batches:
                     self.print_log(f"Training epoch {epoch+1}: batch {batch_idx+1}/{total_batches}")
                 
-                # For first batch, debug data shapes
-                if batch_idx == 0:
-                    for key, value in inputs.items():
-                        self.print_log(f"Input {key} shape: {value.shape}")
-                
-                # Ensure targets are float32
-                targets = tf.cast(targets, tf.float32)
-                
                 try:
-                    # Forward and backward pass with gradient tape
+                    inputs, targets, batch_indices = loader[batch_idx]
+                    
+                    if batch_idx == 0:
+                        self.print_log(f"First batch indices shape: {batch_indices.shape}")
+                        for key, value in inputs.items():
+                            self.print_log(f"First batch {key} shape: {value.shape}")
+                        self.print_log(f"First batch labels shape: {targets.shape}")
+                        self.print_log(f"First batch indices shape: {batch_indices.shape}")
+                        for key, value in inputs.items():
+                            self.print_log(f"Input '{key}' shape: {value.shape}")
+                    
+                    targets = tf.cast(targets, tf.float32)
+                    
+                    if isinstance(inputs, dict) and 'accelerometer' in inputs:
+                        acc_data = inputs['accelerometer']
+                    else:
+                        self.print_log(f"Error: No accelerometer data in batch {batch_idx}")
+                        continue
+                    
                     with tf.GradientTape() as tape:
                         outputs = self.model(inputs, training=True)
                         
-                        # Handle different output formats
                         if isinstance(outputs, tuple) and len(outputs) > 0:
                             logits = outputs[0]
                         else:
                             logits = outputs
                         
-                        # Calculate loss based on output shape
-                        if len(logits.shape) > 1 and logits.shape[-1] > 1:
+                        if len(logits.shape) > 1 and logits.shape[-1] > 0:
+                            if len(targets.shape) == 1:
+                                targets = tf.reshape(targets, [-1, 1])
                             loss = self.criterion(targets, logits)
                         else:
-                            loss = self.criterion(targets, tf.squeeze(logits))
+                            batch_size = tf.shape(acc_data)[0]
+                            targets_reshaped = tf.reshape(targets, [batch_size, 1])
+                            logits_reshaped = tf.reshape(logits, [batch_size, 1])
+                            loss = self.criterion(targets_reshaped, logits_reshaped)
                     
-                    # Calculate gradients
                     gradients = tape.gradient(loss, self.model.trainable_variables)
                     
-                    # Apply gradients
+                    has_nan = False
+                    for grad in gradients:
+                        if grad is not None and tf.reduce_any(tf.math.is_nan(grad)):
+                            has_nan = True
+                            break
+                            
+                    if has_nan:
+                        self.print_log(f"WARNING: NaN gradients detected in batch {batch_idx}")
+                        continue
+                        
                     self.optimizer.apply_gradients(zip(gradients, self.model.trainable_variables))
                     
-                    # Get predictions
                     if len(logits.shape) > 1 and logits.shape[-1] > 1:
                         predictions = tf.argmax(logits, axis=-1)
                     else:
                         predictions = tf.cast(tf.sigmoid(logits) > 0.5, tf.int32)
                     
-                    # Update statistics
                     train_loss += loss.numpy()
                     all_labels.extend(targets.numpy())
                     all_preds.extend(predictions.numpy())
                     steps += 1
                     
+                    start_batch_time = time.time()
+                    
                 except Exception as e:
                     self.print_log(f"Error in batch {batch_idx}: {e}")
                     self.print_log(traceback.format_exc())
+                    start_batch_time = time.time()
                     continue
-                
-                # Don't continue after we've seen all samples
-                if batch_idx + 1 >= total_batches:
-                    break
             
-            # Calculate final metrics if we've completed any steps
             if steps > 0:
                 train_loss /= steps
                 accuracy, f1, recall, precision, auc_score = self.calculate_metrics(all_labels, all_preds)
@@ -592,7 +638,6 @@ class BaseTrainer:
                 self.train_loss_summary.append(float(train_loss))
                 
                 epoch_time = time.time() - start_time
-                
                 self.print_log(
                     f"Epoch {epoch+1} results: "
                     f"Train Loss={train_loss:.4f}, "
@@ -604,24 +649,22 @@ class BaseTrainer:
                     f"({epoch_time:.2f}s)"
                 )
                 
-                # Run validation
                 self.print_log(f"Running validation for epoch {epoch+1}")
                 val_loss = self.eval(epoch, loader_name='val')
                 
                 self.val_loss_summary.append(float(val_loss))
                 
-                # Check early stopping
                 if self.early_stop(val_loss):
-                    self.print_log(f"Early stopping at epoch {epoch+1}")
+                    self.print_log(f"Early stopping triggered at epoch {epoch+1}")
                     return True
                 
                 return False
             else:
-                self.print_log(f"No steps completed in epoch {epoch+1}")
+                self.print_log(f"Warning: No steps completed in epoch {epoch+1}")
                 return False
                 
         except Exception as e:
-            self.print_log(f"Error in epoch {epoch+1}: {e}")
+            self.print_log(f"Critical error in epoch {epoch+1}: {e}")
             self.print_log(traceback.format_exc())
             return False
     
@@ -629,86 +672,85 @@ class BaseTrainer:
         try:
             start_time = time.time()
             
-            # Get the requested data loader
             loader = self.data_loader.get(loader_name)
             if loader is None:
                 self.print_log(f"No data loader for {loader_name}")
                 return float('inf')
             
-            # Count samples
-            num_samples = 0
-            batch_indices = []
-            for _, _, indices in loader:
-                batch_indices.append(indices)
-                num_samples += len(indices)
+            total_batches = len(loader)
+            num_samples = total_batches * (
+                self.arg.val_batch_size if loader_name == 'val' else self.arg.test_batch_size
+            )
             
-            # Calculate actual number of batches
-            batch_size = self.arg.val_batch_size if loader_name == 'val' else self.arg.test_batch_size
-            total_batches = len(batch_indices)
+            self.print_log(f"Evaluating {loader_name} (epoch {epoch+1}) - {total_batches} batches (~{num_samples} samples)")
             
-            # Reset data loader
-            loader = self.data_loader[loader_name]
-            
-            # Evaluation variables
             eval_loss = 0.0
             all_labels = []
             all_preds = []
+            all_logits = []
             steps = 0
             
-            self.print_log(f"Evaluating {loader_name} (epoch {epoch+1}) - {total_batches} batches ({num_samples} samples)")
+            max_batch_time = 300
+            start_batch_time = time.time()
             
-            # Evaluation loop
-            for batch_idx, (inputs, targets, _) in enumerate(loader):
-                # Log progress
+            for batch_idx in range(total_batches):
+                batch_duration = time.time() - start_batch_time
+                if batch_duration > max_batch_time:
+                    self.print_log(f"WARNING: Evaluation batch {batch_idx} taking too long ({batch_duration:.1f}s), skipping")
+                    start_batch_time = time.time()
+                    continue
+                
                 if batch_idx % 5 == 0 or batch_idx + 1 == total_batches:
                     self.print_log(f"Eval {loader_name} (epoch {epoch+1}): batch {batch_idx+1}/{total_batches}")
                 
-                # Debug shapes on first batch
-                if batch_idx == 0:
-                    for key, value in inputs.items():
-                        self.print_log(f"Eval input {key} shape: {value.shape}")
-                
-                # Ensure targets are float32
-                targets = tf.cast(targets, tf.float32)
-                
                 try:
-                    # Forward pass for evaluation (no gradients)
+                    inputs, targets, _ = loader[batch_idx]
+                    
+                    if batch_idx == 0:
+                        for key, value in inputs.items():
+                            self.print_log(f"First batch {key} shape: {value.shape}")
+                        self.print_log(f"First batch labels shape: {targets.shape}")
+                    
+                    targets = tf.cast(targets, tf.float32)
+                    
                     outputs = self.model(inputs, training=False)
                     
-                    # Handle different output formats
                     if isinstance(outputs, tuple) and len(outputs) > 0:
                         logits = outputs[0]
                     else:
                         logits = outputs
                     
-                    # Calculate loss based on output shape
-                    if len(logits.shape) > 1 and logits.shape[-1] > 1:
+                    batch_logits = logits.numpy()
+                    all_logits.append(batch_logits)
+                    
+                    if len(logits.shape) > 1 and logits.shape[-1] > 0:
+                        if len(targets.shape) == 1:
+                            targets = tf.reshape(targets, [-1, 1])
                         loss = self.criterion(targets, logits)
                     else:
-                        loss = self.criterion(targets, tf.squeeze(logits))
+                        batch_size = tf.shape(inputs['accelerometer'])[0]
+                        targets_reshaped = tf.reshape(targets, [batch_size, 1])
+                        logits_reshaped = tf.reshape(logits, [batch_size, 1])
+                        loss = self.criterion(targets_reshaped, logits_reshaped)
                     
-                    # Get predictions
                     if len(logits.shape) > 1 and logits.shape[-1] > 1:
                         predictions = tf.argmax(logits, axis=-1)
                     else:
                         predictions = tf.cast(tf.sigmoid(logits) > 0.5, tf.int32)
                     
-                    # Update statistics
                     eval_loss += loss.numpy()
                     all_labels.extend(targets.numpy())
                     all_preds.extend(predictions.numpy())
                     steps += 1
                     
+                    start_batch_time = time.time()
+                    
                 except Exception as e:
-                    self.print_log(f"Error in eval batch {batch_idx}: {e}")
+                    self.print_log(f"Error in evaluation batch {batch_idx}: {e}")
                     self.print_log(traceback.format_exc())
+                    start_batch_time = time.time()
                     continue
-                
-                # Don't continue after we've seen all samples
-                if batch_idx + 1 >= total_batches:
-                    break
             
-            # Calculate final metrics if we've completed any steps
             if steps > 0:
                 eval_loss /= steps
                 accuracy, f1, recall, precision, auc_score = self.calculate_metrics(all_labels, all_preds)
@@ -723,11 +765,9 @@ class BaseTrainer:
                     f"AUC={auc_score:.2f}%"
                 )
                 
-                # Log evaluation time
                 epoch_time = time.time() - start_time
                 self.print_log(f"{loader_name.capitalize()} time: {epoch_time:.2f}s")
                 
-                # Handle validation results (best model saving)
                 if loader_name == 'val':
                     is_best = False
                     
@@ -739,21 +779,17 @@ class BaseTrainer:
                     if is_best:
                         self.save_model(epoch)
                 
-                # Handle test results
                 elif loader_name.startswith('test'):
-                    # Save metrics
                     self.test_accuracy = accuracy
                     self.test_f1 = f1
                     self.test_recall = recall
                     self.test_precision = precision
                     self.test_auc = auc_score
                     
-                    # Create confusion matrix
                     subject_id = self.test_subject[0] if self.test_subject else None
                     if subject_id:
                         self.cm_viz(all_preds, all_labels, subject_id)
                     
-                    # Save results to file
                     results = {
                         "subject": self.test_subject[0] if self.test_subject else "unknown",
                         "accuracy": float(accuracy),
@@ -761,7 +797,8 @@ class BaseTrainer:
                         "precision": float(precision),
                         "recall": float(recall),
                         "auc": float(auc_score),
-                        "loss": float(eval_loss)
+                        "loss": float(eval_loss),
+                        "logits_sample": [float(x) for x in all_logits[0].flatten()[:5]] if len(all_logits) > 0 else []
                     }
                     
                     results_file = os.path.join(
@@ -772,8 +809,7 @@ class BaseTrainer:
                     
                     with open(results_file, 'w') as f:
                         json.dump(results, f, indent=2)
-                        
-                    # Save detailed predictions if requested
+                    
                     if result_file:
                         with open(result_file, 'w') as f:
                             for pred, true in zip(all_preds, all_labels):
@@ -795,7 +831,7 @@ class BaseTrainer:
                 y_pred = y_pred.numpy()
             if isinstance(y_true, tf.Tensor):
                 y_true = y_true.numpy()
-                
+            
             y_pred = np.array(y_pred).flatten()
             y_true = np.array(y_true).flatten()
             
@@ -830,13 +866,14 @@ class BaseTrainer:
             
         except Exception as e:
             self.print_log(f"Error visualizing confusion matrix: {e}")
+            self.print_log(traceback.format_exc())
     
     def loss_viz(self, train_loss, val_loss, subject_id=None):
         try:
             if not train_loss or not val_loss:
                 self.print_log("No loss data to visualize")
                 return
-                
+            
             epochs = range(1, len(train_loss) + 1)
             
             plt.figure(figsize=(10, 6))
@@ -862,6 +899,7 @@ class BaseTrainer:
             
         except Exception as e:
             self.print_log(f"Error visualizing loss: {e}")
+            self.print_log(traceback.format_exc())
     
     def save_model(self, epoch):
         try:
@@ -870,36 +908,46 @@ class BaseTrainer:
             else:
                 base_filename = f"{self.model_path}_epoch{epoch}"
             
-            # Save weights
             weights_path = f"{base_filename}.weights.h5"
             self.model.save_weights(weights_path)
             self.print_log(f"Saved model weights to {weights_path}")
             
-            # Try to save full model
             try:
                 model_path = f"{base_filename}.keras"
                 self.model.save(model_path)
                 self.print_log(f"Saved full model to {model_path}")
             except Exception as e:
                 self.print_log(f"Warning: Could not save full model: {e}")
+                self.print_log(traceback.format_exc())
             
-            # Try to export TFLite model
             try:
-                from utils.tflite_converter import convert_to_tflite
-                
-                acc_frames = self.arg.model_args.get('acc_frames', 128)
-                acc_coords = self.arg.model_args.get('acc_coords', 3)
-                
-                tflite_path = f"{base_filename}.tflite"
-                success = convert_to_tflite(
-                    model=self.model,
-                    save_path=tflite_path,
-                    input_shape=(1, acc_frames, acc_coords),
-                    quantize=getattr(self.arg, 'quantize', False)
-                )
+                if hasattr(self.model, 'export_to_tflite'):
+                    self.print_log("Using model's built-in TFLite export method")
+                    tflite_path = f"{base_filename}.tflite"
+                    success = self.model.export_to_tflite(tflite_path)
+                else:
+                    from utils.tflite_converter import convert_to_tflite
+                    
+                    acc_frames = self.arg.model_args.get('acc_frames', 128)
+                    
+                    tflite_path = f"{base_filename}.tflite"
+                    success = convert_to_tflite(
+                        model=self.model,
+                        save_path=tflite_path,
+                        input_shape=(1, acc_frames, 3),
+                        quantize=getattr(self.arg, 'quantize', False)
+                    )
                 
                 if success:
                     self.print_log(f"Exported TFLite model to {tflite_path}")
+                    
+                    # Verify TFLite model (if possible)
+                    try:
+                        # Get first batch from test loader for verification
+                        if 'test' in self.data_loader:
+                            self.verify_tflite_model(tflite_path)
+                    except Exception as verify_error:
+                        self.print_log(f"Note: TFLite verification skipped: {verify_error}")
                 else:
                     self.print_log("Warning: TFLite export failed")
             except Exception as e:
@@ -912,10 +960,196 @@ class BaseTrainer:
             self.print_log(traceback.format_exc())
             return False
     
+    def verify_tflite_model(self, tflite_path, test_data=None):
+        """Verify TFLite model against regular TensorFlow model."""
+        try:
+            self.print_log("Verifying TFLite model...")
+            
+            # Get or create test data
+            if test_data is None:
+                # Get first batch from test loader
+                if 'test' in self.data_loader:
+                    inputs, targets, _ = self.data_loader['test'][0]
+                    
+                    # Extract just one sample for comparison (batch_size=1)
+                    if 'accelerometer' in inputs:
+                        acc_data = inputs['accelerometer'][0:1]  # Take first sample
+                        test_data = acc_data.numpy()
+                    else:
+                        self.print_log("No accelerometer data in test batch")
+                        return {'verified': False}
+                else:
+                    self.print_log("No test data loader available")
+                    return {'verified': False}
+            
+            # Ensure test_data is a numpy array with expected shape
+            if isinstance(test_data, tf.Tensor):
+                test_data = test_data.numpy()
+                
+            # Get output from regular model
+            regular_input = {'accelerometer': tf.convert_to_tensor(test_data, dtype=tf.float32)}
+            regular_output = self.model(regular_input, training=False).numpy()
+            
+            self.print_log(f"Direct model output shape: {regular_output.shape}")
+            self.print_log(f"Direct model output sample: {regular_output.flatten()[:5]}")
+            
+            # Save verification status to a file
+            verification_note = os.path.join(os.path.dirname(tflite_path), "tflite_verification_log.txt")
+            with open(verification_note, 'w') as f:
+                f.write(f"TFLite model created successfully\n")
+                f.write(f"Regular model output shape: {regular_output.shape}\n")
+                f.write(f"Regular model output sample: {regular_output.flatten()[:5]}\n")
+                
+            self.print_log(f"Verification info saved to {verification_note}")
+            
+            return {'verified': True, 'regular_output': regular_output}
+            
+        except Exception as e:
+            self.print_log(f"Warning: Could not verify TFLite model: {e}")
+            self.print_log(traceback.format_exc())
+            
+            # Save error to file
+            verification_error = os.path.join(os.path.dirname(tflite_path), "tflite_verification_error.txt")
+            with open(verification_error, 'w') as f:
+                f.write(f"TFLite verification error: {e}\n")
+                f.write(traceback.format_exc())
+                
+            return {'verified': False, 'error': str(e)}
+    
+    def compare_regular_and_tflite_inference(self, subject_id=None):
+        """Compare regular and TFLite model inference on the same test set."""
+        try:
+            if not self.test_subject:
+                self.print_log("No test subject specified for comparison")
+                return False
+                
+            subject_id = self.test_subject[0] if self.test_subject else "unknown"
+            self.print_log(f"Comparing regular model vs TFLite model for subject {subject_id}")
+            
+            # Check for regular model weights
+            weights_path = f"{self.model_path}_{subject_id}.weights.h5"
+            tflite_path = f"{self.model_path}_{subject_id}.tflite"
+            
+            if not os.path.exists(weights_path):
+                self.print_log(f"Model weights not found at {weights_path}")
+                return False
+                
+            if not os.path.exists(tflite_path):
+                self.print_log(f"TFLite model not found at {tflite_path}")
+                return False
+                
+            # Load best weights for regular model
+            self.model.load_weights(weights_path)
+            self.print_log(f"Loaded best weights from {weights_path}")
+            
+            # Get test data
+            loader = self.data_loader.get('test')
+            if loader is None:
+                self.print_log("No test data loader available")
+                return False
+                
+            # Run inference with regular model
+            regular_preds = []
+            regular_logits = []
+            all_labels = []
+            
+            # Iterate through test data
+            self.print_log("Running inference with regular model...")
+            for inputs, targets, _ in loader:
+                # Forward pass
+                outputs = self.model(inputs, training=False)
+                
+                # Handle different output formats
+                if isinstance(outputs, tuple) and len(outputs) > 0:
+                    logits = outputs[0]
+                else:
+                    logits = outputs
+                    
+                # Store logits
+                regular_logits.extend(logits.numpy())
+                
+                # Get predictions
+                if len(logits.shape) > 1 and logits.shape[-1] > 1:
+                    predictions = tf.argmax(logits, axis=-1)
+                else:
+                    predictions = tf.cast(tf.sigmoid(logits) > 0.5, tf.int32)
+                    
+                # Store predictions and labels
+                regular_preds.extend(predictions.numpy())
+                all_labels.extend(targets.numpy())
+            
+            # Calculate metrics for regular model
+            accuracy, f1, recall, precision, auc_score = self.calculate_metrics(all_labels, regular_preds)
+            
+            self.print_log(
+                f"Regular model metrics: "
+                f"Acc={accuracy:.2f}%, "
+                f"F1={f1:.2f}%, "
+                f"Prec={precision:.2f}%, "
+                f"Rec={recall:.2f}%, "
+                f"AUC={auc_score:.2f}%"
+            )
+            
+            # Sample of regular model logits
+            if len(regular_logits) > 0:
+                self.print_log(f"Regular model logits sample: {regular_logits[0].flatten()[:5]}")
+            
+            # Save comparison results even if TFLite inference fails
+            comparison_file = os.path.join(
+                self.arg.work_dir,
+                'results',
+                f'model_evaluation_{subject_id}.json'
+            )
+            
+            comparison_results = {
+                "subject": subject_id,
+                "regular_model": {
+                    "accuracy": float(accuracy),
+                    "f1_score": float(f1),
+                    "precision": float(precision),
+                    "recall": float(recall),
+                    "auc": float(auc_score),
+                    "logits_sample": [float(x) for x in regular_logits[0].flatten()[:5]] if len(regular_logits) > 0 else []
+                }
+            }
+            
+            # Verify a single sample with TFLite if possible
+            test_batch = loader[0]
+            inputs = test_batch[0]
+            
+            if 'accelerometer' in inputs:
+                single_sample = inputs['accelerometer'][0:1].numpy()
+                verification_results = self.verify_tflite_model(tflite_path, single_sample)
+                
+                if verification_results.get('verified', False):
+                    self.print_log("TFLite model verified with single sample")
+                    comparison_results["tflite_verified"] = True
+                else:
+                    self.print_log("TFLite verification incomplete")
+                    comparison_results["tflite_verified"] = False
+                    
+                    if 'error' in verification_results:
+                        comparison_results["tflite_error"] = verification_results['error']
+            else:
+                self.print_log("No accelerometer data available for verification")
+                comparison_results["tflite_verified"] = False
+            
+            # Save comparison results
+            with open(comparison_file, 'w') as f:
+                json.dump(comparison_results, f, indent=2)
+                
+            self.print_log(f"Comparison results saved to {comparison_file}")
+                
+            return True
+        except Exception as e:
+            self.print_log(f"Error comparing models: {e}")
+            self.print_log(traceback.format_exc())
+            return False
+    
     def add_avg_df(self, results):
         if not results:
             return results
-            
+        
         avg_result = {'test_subject': 'Average'}
         
         for column in results[0].keys():
@@ -931,94 +1165,88 @@ class BaseTrainer:
             model_training = self.model.trainable
             self.model.trainable = False
             
-            # Get test data loader
             loader = self.data_loader.get('test')
             if loader is None:
                 self.print_log("No test data loader available")
                 return None
             
-            # Count samples
-            num_samples = 0
-            batch_indices = []
-            for _, _, indices in loader:
-                batch_indices.append(indices)
-                num_samples += len(indices)
-            
-            # Calculate actual number of batches
-            batch_size = self.arg.test_batch_size
-            total_batches = len(batch_indices)
-            
-            # Reset data loader
-            loader = self.data_loader['test']
+            total_batches = len(loader)
+            num_samples = total_batches * self.arg.test_batch_size
             
             subject_id = self.test_subject[0] if self.test_subject else "unknown"
-            self.print_log(f"Testing subject {subject_id} - {total_batches} batches ({num_samples} samples)")
+            self.print_log(f"Testing subject {subject_id} - {total_batches} batches (~{num_samples} samples)")
             
-            # Test variables
             test_loss = 0.0
             all_labels = []
             all_preds = []
+            all_logits = []
             steps = 0
             
-            # Test loop
-            for batch_idx, (inputs, targets, _) in enumerate(loader):
-                # Log progress
+            max_batch_time = 300
+            start_batch_time = time.time()
+            
+            for batch_idx in range(total_batches):
+                batch_duration = time.time() - start_batch_time
+                if batch_duration > max_batch_time:
+                    self.print_log(f"WARNING: Test batch {batch_idx} taking too long ({batch_duration:.1f}s), skipping")
+                    start_batch_time = time.time()
+                    continue
+                    
                 if batch_idx % 5 == 0 or batch_idx + 1 == total_batches:
                     self.print_log(f"Test batch {batch_idx+1}/{total_batches}")
                 
-                # Ensure targets are float32
-                targets = tf.cast(targets, tf.float32)
-                
                 try:
-                    # Forward pass
+                    inputs, targets, _ = loader[batch_idx]
+                    
+                    targets = tf.cast(targets, tf.float32)
+                    
                     outputs = self.model(inputs, training=False)
                     
-                    # Handle different output formats
                     if isinstance(outputs, tuple) and len(outputs) > 0:
                         logits = outputs[0]
                     else:
                         logits = outputs
+                        
+                    all_logits.append(logits.numpy())
                     
-                    # Calculate loss based on output shape
-                    if len(logits.shape) > 1 and logits.shape[-1] > 1:
+                    if len(logits.shape) > 1 and logits.shape[-1] > 0:
+                        if len(targets.shape) == 1:
+                            targets = tf.reshape(targets, [-1, 1])
                         loss = self.criterion(targets, logits)
                     else:
-                        loss = self.criterion(targets, tf.squeeze(logits))
+                        batch_size = tf.shape(inputs['accelerometer'])[0]
+                        targets_reshaped = tf.reshape(targets, [batch_size, 1])
+                        logits_reshaped = tf.reshape(logits, [batch_size, 1])
+                        loss = self.criterion(targets_reshaped, logits_reshaped)
                     
-                    # Get predictions
                     if len(logits.shape) > 1 and logits.shape[-1] > 1:
                         predictions = tf.argmax(logits, axis=-1)
                     else:
                         predictions = tf.cast(tf.sigmoid(logits) > 0.5, tf.int32)
                     
-                    # Update statistics
                     test_loss += loss.numpy()
                     all_labels.extend(targets.numpy())
                     all_preds.extend(predictions.numpy())
                     steps += 1
                     
+                    start_batch_time = time.time()
+                    
                 except Exception as e:
                     self.print_log(f"Error in test batch {batch_idx}: {e}")
                     self.print_log(traceback.format_exc())
+                    start_batch_time = time.time()
                     continue
-                
-                # Don't continue after we've seen all samples
-                if batch_idx + 1 >= total_batches:
-                    break
             
             if steps > 0:
-                # Calculate metrics
                 test_loss /= steps
                 accuracy, f1, recall, precision, auc_score = self.calculate_metrics(all_labels, all_preds)
                 
-                # Store metrics
                 self.test_accuracy = accuracy
                 self.test_f1 = f1
                 self.test_recall = recall
                 self.test_precision = precision
                 self.test_auc = auc_score
                 
-                # Log results
                 self.print_log(
                     f"Test results for Subject {subject_id}: "
                     f"Loss={test_loss:.4f}, "
@@ -1029,10 +1257,11 @@ class BaseTrainer:
                     f"AUC={auc_score:.2f}%"
                 )
                 
-                # Create confusion matrix
                 self.cm_viz(all_preds, all_labels, subject_id)
                 
-                # Save results
+                if len(all_logits) > 0:
+                    self.print_log(f"Model logits sample: {all_logits[0].flatten()[:5]}")
+                
                 results = {
                     "subject": subject_id,
                     "accuracy": float(accuracy),
@@ -1040,7 +1269,8 @@ class BaseTrainer:
                     "precision": float(precision),
                     "recall": float(recall),
                     "auc": float(auc_score),
-                    "loss": float(test_loss)
+                    "loss": float(test_loss),
+                    "logits_sample": [float(x) for x in all_logits[0].flatten()[:5]] if len(all_logits) > 0 else []
                 }
                 
                 results_file = os.path.join(
@@ -1052,184 +1282,250 @@ class BaseTrainer:
                 with open(results_file, 'w') as f:
                     json.dump(results, f, indent=2)
                 
+                self.compare_regular_and_tflite_inference(subject_id)
+                
+                self.model.trainable = model_training
+                
                 return results
             else:
-                self.print_log(f"No valid test steps for subject {subject_id}")
+                self.print_log(f"No valid test steps completed for subject {subject_id}")
+                
+                self.model.trainable = model_training
+                
                 return None
                 
         except Exception as e:
             self.print_log(f"Error in test evaluation: {e}")
             self.print_log(traceback.format_exc())
-            return None
             
-        finally:
-            # Restore model training state
-            self.model.trainable = model_training
+            if 'model_training' in locals():
+                self.model.trainable = model_training
+            
+            return None
     
     def start(self):
-        if self.arg.phase == 'train':
-            self.print_log('Parameters:')
-            for key, value in vars(self.arg).items():
-                self.print_log(f'  {key}: {value}')
-            
-            results = []
-            
-            val_subjects = [38, 46]
-            
-            for test_subject in self.arg.subjects:
-                if test_subject in val_subjects:
-                    continue
+        max_total_time = 24 * 3600
+        total_start_time = time.time()
+        
+        try:
+            if self.arg.phase == 'train':
+                self.print_log('Starting training with parameters:')
+                for key, value in vars(self.arg).items():
+                    self.print_log(f'  {key}: {value}')
                 
-                self.train_loss_summary = []
-                self.val_loss_summary = []
-                self.best_loss = float('inf')
+                results = []
                 
-                self.test_subject = [test_subject]
-                self.val_subject = val_subjects
-                self.train_subjects = [s for s in self.arg.subjects 
-                                      if s != test_subject and s not in val_subjects]
+                val_subjects = [38, 46]
                 
-                self.print_log(f"\n=== Cross-validation fold: Testing on subject {test_subject} ===")
-                self.print_log(f"Train: {len(self.train_subjects)} subjects")
-                self.print_log(f"Val: {len(self.val_subject)} subjects")
-                self.print_log(f"Test: Subject {test_subject}")
-                
-                # Create a fresh model for each fold
-                self.model = self.load_model()
-                
-                # Load data for this fold
-                if not self.load_data():
-                    self.print_log(f"Skipping subject {test_subject} due to data issues")
-                    continue
-                
-                # Initialize optimizer and loss
-                if not self.load_optimizer() or not self.load_loss():
-                    self.print_log(f"Skipping subject {test_subject} due to optimizer/loss issues")
-                    continue
-                
-                # Reset early stopping
-                self.early_stop = EarlyStopping(patience=15, min_delta=.001)
-                
-                # Training loop
-                early_stop = False
-                self.print_log(f"Starting training for subject {test_subject}")
-                
-                for epoch in range(self.arg.start_epoch, self.arg.num_epoch):
-                    early_stop = self.train(epoch)
+                for test_subject in self.arg.subjects:
+                    if test_subject in val_subjects:
+                        continue
                     
-                    if early_stop:
-                        self.print_log(f"Early stopping at epoch {epoch+1}")
-                        break
+                    try:
+                        if time.time() - total_start_time > max_total_time:
+                            self.print_log("Maximum total training time exceeded, stopping")
+                            break
+                        
+                        self.train_loss_summary = []
+                        self.val_loss_summary = []
+                        self.best_loss = float('inf')
+                        
+                        self.test_subject = [test_subject]
+                        self.val_subject = val_subjects
+                        self.train_subjects = [s for s in self.arg.subjects 
+                                            if s != test_subject and s not in val_subjects]
+                        
+                        self.print_log(f"\n=== Cross-validation fold: Testing on subject {test_subject} ===")
+                        self.print_log(f"Train: {len(self.train_subjects)} subjects: {self.train_subjects}")
+                        self.print_log(f"Val: {len(self.val_subject)} subjects: {self.val_subject}")
+                        self.print_log(f"Test: Subject {test_subject}")
+                        
+                        try:
+                            self.model = self.load_model()
+                        except Exception as model_error:
+                            self.print_log(f"Failed to load model for subject {test_subject}: {model_error}")
+                            self.print_log(traceback.format_exc())
+                            continue
+                        
+                        try:
+                            if not self.load_data():
+                                self.print_log(f"Skipping subject {test_subject} due to data loading issues")
+                                continue
+                        except Exception as data_error:
+                            self.print_log(f"Failed to load data for subject {test_subject}: {data_error}")
+                            self.print_log(traceback.format_exc())
+                            continue
+                        
+                        try:
+                            if not self.load_optimizer() or not self.load_loss():
+                                self.print_log(f"Skipping subject {test_subject} due to optimizer/loss issues")
+                                continue
+                        except Exception as opt_error:
+                            self.print_log(f"Failed to initialize optimizer/loss: {opt_error}")
+                            self.print_log(traceback.format_exc())
+                            continue
+                        
+                        self.early_stop = EarlyStopping(patience=15, min_delta=.001)
+                        
+                        subject_start_time = time.time()
+                        max_subject_time = 8 * 3600
+                        
+                        early_stop = False
+                        self.print_log(f"Starting training for subject {test_subject}")
+                        
+                        for epoch in range(self.arg.start_epoch, self.arg.num_epoch):
+                            if time.time() - subject_start_time > max_subject_time:
+                                self.print_log(f"Maximum time per subject exceeded for subject {test_subject}")
+                                break
+                            
+                            try:
+                                early_stop = self.train(epoch)
+                                
+                                if early_stop:
+                                    self.print_log(f"Early stopping at epoch {epoch+1}")
+                                    break
+                            except Exception as epoch_error:
+                                self.print_log(f"Error in epoch {epoch+1}: {epoch_error}")
+                                self.print_log(traceback.format_exc())
+                                
+                                if epoch == 0:
+                                    self.print_log(f"First epoch failed, skipping subject {test_subject}")
+                                    break
+                                continue
+                        
+                        best_weights = f"{self.model_path}_{test_subject}.weights.h5"
+                        if os.path.exists(best_weights):
+                            try:
+                                self.model.load_weights(best_weights)
+                                self.print_log(f"Loaded best weights from {best_weights}")
+                            except Exception as weight_error:
+                                self.print_log(f"Error loading best weights: {weight_error}")
+                                self.print_log(traceback.format_exc())
+                        
+                        self.print_log(f"=== Final evaluation on subject {test_subject} ===")
+                        result = self.evaluate_test_set()
+                        
+                        self.print_log(f"=== Comparing regular model and TFLite model for subject {test_subject} ===")
+                        self.compare_regular_and_tflite_inference(test_subject)
+                        
+                        if len(self.train_loss_summary) > 0 and len(self.val_loss_summary) > 0:
+                            self.loss_viz(self.train_loss_summary, self.val_loss_summary, subject_id=test_subject)
+                        
+                        if result:
+                            subject_result = {
+                                'test_subject': str(test_subject),
+                                'accuracy': round(self.test_accuracy, 2),
+                                'f1_score': round(self.test_f1, 2),
+                                'precision': round(self.test_precision, 2),
+                                'recall': round(self.test_recall, 2),
+                                'auc': round(self.test_auc, 2)
+                            }
+                            
+                            results.append(subject_result)
+                        
+                        tf.keras.backend.clear_session()
+                        
+                    except Exception as subject_error:
+                        self.print_log(f"Fatal error processing subject {test_subject}: {subject_error}")
+                        self.print_log(traceback.format_exc())
+                        tf.keras.backend.clear_session()
+                        continue
                 
-                # Load best weights for final evaluation
-                best_weights = f"{self.model_path}_{test_subject}.weights.h5"
-                if os.path.exists(best_weights):
-                    self.model.load_weights(best_weights)
-                    self.print_log(f"Loaded best weights from {best_weights}")
+                if results:
+                    try:
+                        results = self.add_avg_df(results)
+                        
+                        results_df = pd.DataFrame(results)
+                        results_df.to_csv(os.path.join(self.arg.work_dir, 'scores.csv'), index=False)
+                        
+                        with open(os.path.join(self.arg.work_dir, 'scores.json'), 'w') as f:
+                            json.dump(results, f, indent=2)
+                        
+                        self.print_log("\n=== Final Results ===")
+                        for result in results:
+                            subject = result['test_subject']
+                            accuracy = result['accuracy']
+                            f1 = result['f1_score']
+                            precision = result['precision']
+                            recall = result['recall']
+                            auc = result.get('auc', 'N/A')
+                            
+                            self.print_log(
+                                f"Subject {subject}: "
+                                f"Acc={accuracy:.2f}%, "
+                                f"F1={f1:.2f}%, "
+                                f"Prec={precision:.2f}%, "
+                                f"Rec={recall:.2f}%, "
+                                f"AUC={auc}"
+                            )
+                    except Exception as report_error:
+                        self.print_log(f"Error generating final report: {report_error}")
+                        self.print_log(traceback.format_exc())
                 
-                # Final evaluation
-                self.print_log(f"=== Final evaluation on subject {test_subject} ===")
+                self.print_log("Training completed successfully")
+                
+            elif self.arg.phase == 'test':
+                self.print_log('Testing with parameters:')
+                for key, value in vars(self.arg).items():
+                    self.print_log(f'  {key}: {value}')
+                
+                if hasattr(self.arg, 'weights') and self.arg.weights:
+                    self.print_log(f"Using weights: {self.arg.weights}")
+                
+                self.test_subject = self.arg.subjects
+                
+                if not self.load_data():
+                    self.print_log("Failed to load test data")
+                    return
+                
+                self.load_loss()
                 result = self.evaluate_test_set()
                 
-                # Create loss visualization
-                self.loss_viz(self.train_loss_summary, self.val_loss_summary, subject_id=test_subject)
-                
-                # Add results to summary
                 if result:
-                    subject_result = {
-                        'test_subject': str(test_subject),
-                        'accuracy': round(self.test_accuracy, 2),
-                        'f1_score': round(self.test_f1, 2),
-                        'precision': round(self.test_precision, 2),
-                        'recall': round(self.test_recall, 2),
-                        'auc': round(self.test_auc, 2)
-                    }
-                    
-                    results.append(subject_result)
+                    self.print_log("Testing completed successfully")
+                else:
+                    self.print_log("Testing failed")
                 
-                # Clear TensorFlow session to avoid memory issues
-                tf.keras.backend.clear_session()
-            
-            # Generate final report
-            if results:
-                results = self.add_avg_df(results)
+            elif self.arg.phase == 'tflite':
+                self.print_log('Exporting TFLite model with parameters:')
+                for key, value in vars(self.arg).items():
+                    self.print_log(f'  {key}: {value}')
                 
-                results_df = pd.DataFrame(results)
-                results_df.to_csv(os.path.join(self.arg.work_dir, 'scores.csv'), index=False)
+                if not hasattr(self.arg, 'weights') or not self.arg.weights:
+                    self.print_log("Must specify weights for TFLite export")
+                    return
                 
-                with open(os.path.join(self.arg.work_dir, 'scores.json'), 'w') as f:
-                    json.dump(results, f, indent=2)
-                
-                self.print_log("\n=== Final Results ===")
-                for result in results:
-                    subject = result['test_subject']
-                    accuracy = result['accuracy']
-                    f1 = result['f1_score']
-                    precision = result['precision']
-                    recall = result['recall']
-                    auc = result.get('auc', 'N/A')
-                    
-                    self.print_log(
-                        f"Subject {subject}: "
-                        f"Acc={accuracy:.2f}%, "
-                        f"F1={f1:.2f}%, "
-                        f"Prec={precision:.2f}%, "
-                        f"Rec={recall:.2f}%, "
-                        f"AUC={auc}"
-                    )
-            
-            self.print_log("Training completed successfully")
-            
-        elif self.arg.phase == 'test':
-            self.print_log('Testing with parameters:')
-            for key, value in vars(self.arg).items():
-                self.print_log(f'  {key}: {value}')
-            
-            if hasattr(self.arg, 'weights') and self.arg.weights:
-                self.print_log(f"Using weights: {self.arg.weights}")
-            
-            self.test_subject = self.arg.subjects
-            
-            if not self.load_data():
-                self.print_log("Failed to load test data")
-                return
-            
-            self.load_loss()
-            self.evaluate_test_set()
-            
-            self.print_log("Testing completed successfully")
-            
-        elif self.arg.phase == 'tflite':
-            self.print_log('Exporting TFLite model with parameters:')
-            for key, value in vars(self.arg).items():
-                self.print_log(f'  {key}: {value}')
-            
-            if not hasattr(self.arg, 'weights') or not self.arg.weights:
-                self.print_log("Must specify weights for TFLite export")
-                return
-            
-            try:
-                from utils.tflite_converter import convert_to_tflite
-                
-                acc_frames = self.arg.model_args.get('acc_frames', 128)
-                acc_coords = self.arg.model_args.get('acc_coords', 3)
-                
-                tflite_path = os.path.join(self.arg.work_dir, f"{self.arg.model_saved_name}.tflite")
-                
-                self.print_log(f"Exporting model with input shape: (1, {acc_frames}, {acc_coords})")
-                
-                success = convert_to_tflite(
-                    model=self.model,
-                    save_path=tflite_path,
-                    input_shape=(1, acc_frames, acc_coords),
-                    quantize=getattr(self.arg, 'quantize', False)
-                )
+                if hasattr(self.model, 'export_to_tflite'):
+                    self.print_log("Using model's built-in TFLite export method")
+                    tflite_path = os.path.join(self.arg.work_dir, f"{self.arg.model_saved_name}.tflite")
+                    success = self.model.export_to_tflite(tflite_path)
+                else:
+                    try:
+                        from utils.tflite_converter import convert_to_tflite
+                        
+                        acc_frames = self.arg.model_args.get('acc_frames', 128)
+                        
+                        tflite_path = os.path.join(self.arg.work_dir, f"{self.arg.model_saved_name}.tflite")
+                        
+                        self.print_log(f"Exporting model with input shape: (1, {acc_frames}, 3)")
+                        
+                        success = convert_to_tflite(
+                            model=self.model,
+                            save_path=tflite_path,
+                            input_shape=(1, acc_frames, 3),
+                            quantize=getattr(self.arg, 'quantize', False)
+                        )
+                        
+                    except Exception as e:
+                        self.print_log(f"Error exporting TFLite model: {e}")
+                        self.print_log(traceback.format_exc())
+                        success = False
                 
                 if success:
                     self.print_log(f"TFLite model exported successfully to {tflite_path}")
                 else:
                     self.print_log("TFLite export failed")
             
-            except Exception as e:
-                self.print_log(f"Error exporting TFLite model: {e}")
-                self.print_log(traceback.format_exc())
+        except Exception as e:
+            self.print_log(f"Fatal error in training process: {e}")
+            self.print_log(traceback.format_exc())
