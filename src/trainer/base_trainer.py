@@ -13,7 +13,6 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from sklearn.metrics import confusion_matrix, f1_score, accuracy_score, precision_score, recall_score, roc_auc_score
-import shutil
 
 logger = logging.getLogger('lightheart-tf')
 
@@ -34,13 +33,10 @@ class EarlyStopping:
                 val_loss = float(val_loss.numpy())
             else:
                 val_loss = float(val_loss)
-                
             self.history.append(val_loss)
-            
             if self.best_loss is None:
                 self.best_loss = val_loss
                 return False
-                
             if val_loss < self.best_loss - self.min_delta:
                 self.best_loss = val_loss
                 self.counter = 0
@@ -49,14 +45,11 @@ class EarlyStopping:
             else:
                 self.counter += 1
                 self.wait += 1
-                
                 if self.counter >= self.patience:
                     self.early_stop = True
                     self.stopped_epoch = len(self.history)
                     return True
-                
                 return False
-                
         except Exception as e:
             logging.error(f"Error in EarlyStopping: {e}")
             return False
@@ -72,35 +65,34 @@ class EarlyStopping:
 class BaseTrainer:
     def __init__(self, arg):
         self.arg = arg
-        
         self.train_loss_summary = []
         self.val_loss_summary = []
         self.best_loss = float('inf')
         self.best_f1 = 0.0
-        self.test_accuracy = 0 
+        self.test_accuracy = 0
         self.test_f1 = 0
         self.test_precision = 0
-        self.test_recall = 0 
+        self.test_recall = 0
         self.test_auc = 0
-        
         self.train_subjects = []
         self.val_subject = None
         self.test_subject = None
-        
         self.optimizer = None
         self.norm_train = None
         self.norm_val = None
         self.norm_test = None
         self.data_loader = {}
         self.pos_weights = None
-        
         self.early_stop = EarlyStopping(patience=15, min_delta=.001)
         
-        self.setup_directories()
-        self.print_log("Checking Python dependencies...")
-        self.model = self.load_model()
-        self.print_log("Model loaded successfully.")
+        # Define cross-validation structure
+        self.val_subjects_fixed = [38, 46]  # Always in validation
+        self.train_subjects_fixed = [45, 36, 29]  # Always in training (no fall data)
+        self.test_eligible_subjects = [32, 39, 30, 31, 33, 34, 35, 37, 43, 44]  # Can be used for testing
         
+        self.setup_directories()
+        self.print_log("Loading model...")
+        self.model = self.load_model()
         num_params = self.count_parameters(self.model)
         self.print_log(f"Model: {self.arg.model}")
         self.print_log(f"Parameters: {num_params:,}")
@@ -111,19 +103,12 @@ class BaseTrainer:
         os.makedirs(os.path.join(self.arg.work_dir, 'models'), exist_ok=True)
         os.makedirs(os.path.join(self.arg.work_dir, 'visualizations'), exist_ok=True)
         os.makedirs(os.path.join(self.arg.work_dir, 'results'), exist_ok=True)
-        
-        self.model_path = os.path.join(
-            self.arg.work_dir, 
-            'models', 
-            self.arg.model_saved_name
-        )
+        self.model_path = os.path.join(self.arg.work_dir, 'models', self.arg.model_saved_name)
     
     def import_class(self, import_str):
         if import_str is None:
             raise ValueError("Import path cannot be None")
-            
         mod_str, _sep, class_str = import_str.rpartition('.')
-        
         for prefix in ['', 'src.']:
             try:
                 import importlib
@@ -131,12 +116,10 @@ class BaseTrainer:
                 return getattr(module, class_str)
             except (ImportError, AttributeError):
                 continue
-                
         raise ImportError(f"Cannot import {class_str} from {mod_str}")
     
     def print_log(self, message):
         logger.info(message)
-        
         if hasattr(self.arg, 'print_log') and self.arg.print_log:
             with open(os.path.join(self.arg.work_dir, 'log.txt'), 'a') as f:
                 print(message, file=f)
@@ -152,26 +135,17 @@ class BaseTrainer:
             if self.arg.phase == 'train':
                 if self.arg.model is None:
                     raise ValueError("Model class path is required")
-                    
                 model_class = self.import_class(self.arg.model)
                 model = model_class(**self.arg.model_args)
                 self.print_log(f"Created model: {self.arg.model}")
-                
                 try:
                     acc_frames = self.arg.model_args.get('acc_frames', 128)
                     acc_coords = 3
-                    
-                    dummy_input = {
-                        'accelerometer': tf.zeros((2, acc_frames, acc_coords), dtype=tf.float32)
-                    }
-                    
+                    dummy_input = {'accelerometer': tf.zeros((2, acc_frames, acc_coords), dtype=tf.float32)}
                     _ = model(dummy_input, training=False)
-                    
                     self.print_log("Model built successfully")
                 except Exception as e:
                     self.print_log(f"Warning: Could not pre-build model: {e}")
-                    self.print_log(traceback.format_exc())
-                
                 return model
             else:
                 if hasattr(self.arg, 'weights') and self.arg.weights:
@@ -182,80 +156,60 @@ class BaseTrainer:
                     except Exception:
                         if self.arg.model is None:
                             raise ValueError("Model class path is required when weights cannot be directly loaded")
-                            
                         model_class = self.import_class(self.arg.model)
                         model = model_class(**self.arg.model_args)
-                        
                         acc_frames = self.arg.model_args.get('acc_frames', 128)
                         acc_coords = 3
                         dummy_input = {'accelerometer': tf.zeros((2, acc_frames, acc_coords), dtype=tf.float32)}
                         _ = model(dummy_input, training=False)
-                        
                         model.load_weights(self.arg.weights)
                         self.print_log(f"Loaded weights from {self.arg.weights}")
                         return model
                 else:
                     if self.arg.model is None:
                         raise ValueError("Model class path is required")
-                        
                     model_class = self.import_class(self.arg.model)
                     model = model_class(**self.arg.model_args)
                     self.print_log(f"Created model: {self.arg.model}")
                     return model
         except Exception as e:
             self.print_log(f"Error loading model: {e}")
-            self.print_log(traceback.format_exc())
             raise
     
     def calculate_class_weights(self, labels):
         from collections import Counter
-        
         counter = Counter(labels)
-        
         if 1 in counter and 0 in counter:
             pos_weight = counter[0] / counter[1]
         else:
             pos_weight = 1.0
-            
         self.print_log(f"Class balance - Negative: {counter.get(0, 0)}, Positive: {counter.get(1, 0)}")
         self.print_log(f"Positive class weight: {pos_weight:.4f}")
-        
         return tf.constant(pos_weight, dtype=tf.float32)
     
     def load_optimizer(self):
         try:
             if not hasattr(self.arg, 'optimizer'):
                 self.arg.optimizer = 'adam'
-                
             if not hasattr(self.arg, 'base_lr'):
                 self.arg.base_lr = 0.001
-                
             if not hasattr(self.arg, 'weight_decay'):
                 self.arg.weight_decay = 0.0004
             
             if self.arg.optimizer.lower() == "adam":
-                self.optimizer = tf.keras.optimizers.Adam(
-                    learning_rate=self.arg.base_lr
-                )
+                self.optimizer = tf.keras.optimizers.Adam(learning_rate=self.arg.base_lr)
             elif self.arg.optimizer.lower() == "adamw":
-                self.optimizer = tf.keras.optimizers.AdamW(
-                    learning_rate=self.arg.base_lr,
-                    weight_decay=self.arg.weight_decay
-                )
+                self.optimizer = tf.keras.optimizers.AdamW(learning_rate=self.arg.base_lr, weight_decay=self.arg.weight_decay)
             elif self.arg.optimizer.lower() == "sgd":
-                self.optimizer = tf.keras.optimizers.SGD(
-                    learning_rate=self.arg.base_lr,
-                    momentum=0.9
-                )
+                self.optimizer = tf.keras.optimizers.SGD(learning_rate=self.arg.base_lr, momentum=0.9)
             else:
                 self.print_log(f"Unknown optimizer: {self.arg.optimizer}, using Adam")
                 self.optimizer = tf.keras.optimizers.Adam(learning_rate=self.arg.base_lr)
-                
+            
             self.print_log(f"Optimizer: {self.optimizer.__class__.__name__}, LR={self.arg.base_lr}")
             return True
         except Exception as e:
             self.print_log(f"Error loading optimizer: {e}")
-            self.print_log(traceback.format_exc())
             return False
     
     def load_loss(self):
@@ -266,7 +220,6 @@ class BaseTrainer:
             def weighted_bce(y_true, y_pred):
                 try:
                     y_true = tf.cast(y_true, tf.float32)
-                    
                     if len(y_pred.shape) > 1 and y_pred.shape[-1] == 1:
                         if len(y_true.shape) == 1:
                             y_true = tf.expand_dims(y_true, -1)
@@ -281,11 +234,9 @@ class BaseTrainer:
                     bce = tf.nn.sigmoid_cross_entropy_with_logits(labels=y_true, logits=y_pred)
                     weights = y_true * (self.pos_weights - 1.0) + 1.0
                     return tf.reduce_mean(weights * bce)
-                    
                 except Exception as e:
                     logging.error(f"Error in loss calculation: {e}")
                     logging.error(f"y_true shape: {y_true.shape}, y_pred shape: {y_pred.shape}")
-                    
                     return tf.constant(0.1, dtype=tf.float32)
             
             self.criterion = weighted_bce
@@ -293,46 +244,34 @@ class BaseTrainer:
             return True
         except Exception as e:
             self.print_log(f"Error loading loss function: {e}")
-            self.print_log(traceback.format_exc())
             return False
     
     def load_data(self):
         try:
             from utils.dataset_tf import prepare_smartfallmm_tf, split_by_subjects_tf
-            
             feeder_class_path = getattr(self.arg, 'feeder', 'utils.dataset_tf.UTD_MM_TF')
             Feeder = self.import_class(feeder_class_path)
-            
             use_smv = getattr(self.arg, 'use_smv', False)
             self.print_log(f"Data loader configuration: use_smv={use_smv}")
             
             if self.arg.phase == 'train':
                 builder = prepare_smartfallmm_tf(self.arg)
-                
                 if not self.train_subjects:
                     self.print_log("No training subjects specified")
                     return False
                 
                 self.print_log(f"Processing training data for subjects: {self.train_subjects}")
                 self.norm_train = split_by_subjects_tf(builder, self.train_subjects, False)
-                
                 if any(len(x) == 0 for x in self.norm_train.values()):
                     self.print_log("Error: Training data is empty")
                     return False
                 
                 try:
-                    self.data_loader['train'] = Feeder(
-                        dataset=self.norm_train,
-                        batch_size=self.arg.batch_size,
-                        use_smv=use_smv
-                    )
+                    self.data_loader['train'] = Feeder(dataset=self.norm_train, batch_size=self.arg.batch_size, use_smv=use_smv)
                 except TypeError as e:
                     if "unexpected keyword argument 'use_smv'" in str(e):
                         self.print_log("Data loader doesn't support use_smv parameter, using default")
-                        self.data_loader['train'] = Feeder(
-                            dataset=self.norm_train,
-                            batch_size=self.arg.batch_size
-                        )
+                        self.data_loader['train'] = Feeder(dataset=self.norm_train, batch_size=self.arg.batch_size)
                     else:
                         raise
                 
@@ -344,7 +283,6 @@ class BaseTrainer:
                     self.print_log(f"Warning: Could not check train data shapes: {e}")
                 
                 self.pos_weights = self.calculate_class_weights(self.norm_train['labels'])
-                
                 try:
                     self.distribution_viz(self.norm_train['labels'], self.arg.work_dir, 'train')
                 except Exception as e:
@@ -353,31 +291,18 @@ class BaseTrainer:
                 if self.val_subject:
                     self.print_log(f"Processing validation data for subjects: {self.val_subject}")
                     self.norm_val = split_by_subjects_tf(builder, self.val_subject, False)
-                    
                     if any(len(x) == 0 for x in self.norm_val.values()):
                         self.print_log("Warning: Validation data is empty, using subset of training data")
                         train_size = len(self.norm_train['labels'])
                         val_size = min(train_size // 5, 100)
-                        
-                        self.norm_val = {
-                            k: v[-val_size:].copy() for k, v in self.norm_train.items()
-                        }
-                        self.norm_train = {
-                            k: v[:-val_size].copy() for k, v in self.norm_train.items()
-                        }
+                        self.norm_val = {k: v[-val_size:].copy() for k, v in self.norm_train.items()}
+                        self.norm_train = {k: v[:-val_size].copy() for k, v in self.norm_train.items()}
                     
                     try:
-                        self.data_loader['val'] = Feeder(
-                            dataset=self.norm_val,
-                            batch_size=self.arg.val_batch_size,
-                            use_smv=use_smv
-                        )
+                        self.data_loader['val'] = Feeder(dataset=self.norm_val, batch_size=self.arg.val_batch_size, use_smv=use_smv)
                     except TypeError as e:
                         if "unexpected keyword argument 'use_smv'" in str(e):
-                            self.data_loader['val'] = Feeder(
-                                dataset=self.norm_val,
-                                batch_size=self.arg.val_batch_size
-                            )
+                            self.data_loader['val'] = Feeder(dataset=self.norm_val, batch_size=self.arg.val_batch_size)
                         else:
                             raise
                     
@@ -389,33 +314,21 @@ class BaseTrainer:
                 if self.test_subject:
                     self.print_log(f"Processing test data for subjects: {self.test_subject}")
                     self.norm_test = split_by_subjects_tf(builder, self.test_subject, False)
-                    
                     if any(len(x) == 0 for x in self.norm_test.values()):
                         self.print_log("Warning: Test data is empty")
                         return False
                     
                     try:
-                        self.data_loader['test'] = Feeder(
-                            dataset=self.norm_test,
-                            batch_size=self.arg.test_batch_size,
-                            use_smv=use_smv
-                        )
+                        self.data_loader['test'] = Feeder(dataset=self.norm_test, batch_size=self.arg.test_batch_size, use_smv=use_smv)
                     except TypeError as e:
                         if "unexpected keyword argument 'use_smv'" in str(e):
-                            self.data_loader['test'] = Feeder(
-                                dataset=self.norm_test,
-                                batch_size=self.arg.test_batch_size
-                            )
+                            self.data_loader['test'] = Feeder(dataset=self.norm_test, batch_size=self.arg.test_batch_size)
                         else:
                             raise
                     
                     subject_id = self.test_subject[0] if self.test_subject else 'unknown'
                     try:
-                        self.distribution_viz(
-                            self.norm_test['labels'],
-                            self.arg.work_dir,
-                            f'test_{subject_id}'
-                        )
+                        self.distribution_viz(self.norm_test['labels'], self.arg.work_dir, f'test_{subject_id}')
                     except Exception as e:
                         self.print_log(f"Error visualizing distribution: {e}")
                 
@@ -429,23 +342,15 @@ class BaseTrainer:
                 
                 builder = prepare_smartfallmm_tf(self.arg)
                 self.norm_test = split_by_subjects_tf(builder, self.test_subject, False)
-                
                 if any(len(x) == 0 for x in self.norm_test.values()):
                     self.print_log("Error: Test data is empty")
                     return False
                 
                 try:
-                    self.data_loader['test'] = Feeder(
-                        dataset=self.norm_test,
-                        batch_size=self.arg.test_batch_size,
-                        use_smv=use_smv
-                    )
+                    self.data_loader['test'] = Feeder(dataset=self.norm_test, batch_size=self.arg.test_batch_size, use_smv=use_smv)
                 except TypeError as e:
                     if "unexpected keyword argument 'use_smv'" in str(e):
-                        self.data_loader['test'] = Feeder(
-                            dataset=self.norm_test,
-                            batch_size=self.arg.test_batch_size
-                        )
+                        self.data_loader['test'] = Feeder(dataset=self.norm_test, batch_size=self.arg.test_batch_size)
                     else:
                         raise
                 
@@ -454,84 +359,73 @@ class BaseTrainer:
         
         except Exception as e:
             self.print_log(f"Error loading data: {e}")
-            self.print_log(traceback.format_exc())
             return False
     
     def distribution_viz(self, labels, work_dir, mode):
         try:
             values, count = np.unique(labels, return_counts=True)
-            
             plt.figure(figsize=(8, 6))
             plt.bar(values, count, color=['blue', 'red'])
             plt.xlabel('Labels')
             plt.ylabel('Count')
             plt.title(f'{mode.capitalize()} Label Distribution')
             plt.xticks(values)
-            
             for i, v in enumerate(count):
                 plt.text(values[i], v + 0.1, str(v), ha='center')
-            
             viz_dir = os.path.join(work_dir, 'visualizations')
             os.makedirs(viz_dir, exist_ok=True)
             plt.savefig(os.path.join(viz_dir, f'{mode}_distribution.png'))
             plt.close()
-            
             dist_str = ", ".join([f"Label {int(v)}: {c}" for v, c in zip(values, count)])
             self.print_log(f"{mode} distribution: {dist_str}")
-            
         except Exception as e:
             self.print_log(f"Error visualizing distribution: {e}")
-            self.print_log(traceback.format_exc())
     
-    def calculate_metrics(self, targets, predictions):
+    def calculate_metrics(self, targets, predictions, probabilities=None):
         try:
             if isinstance(targets, tf.Tensor):
                 targets = targets.numpy()
             if isinstance(predictions, tf.Tensor):
                 predictions = predictions.numpy()
+            if probabilities is not None and isinstance(probabilities, tf.Tensor):
+                probabilities = probabilities.numpy()
             
             targets = np.array(targets).flatten()
             predictions = np.array(predictions).flatten()
             
+            # Ensure arrays have same length
+            if len(targets) != len(predictions):
+                self.print_log(f"Warning: targets ({len(targets)}) and predictions ({len(predictions)}) have different lengths")
+                min_len = min(len(targets), len(predictions))
+                targets = targets[:min_len]
+                predictions = predictions[:min_len]
+                if probabilities is not None:
+                    probabilities = probabilities[:min_len]
+            
             accuracy = accuracy_score(targets, predictions) * 100
+            precision = precision_score(targets, predictions, zero_division=0) * 100
+            recall = recall_score(targets, predictions, zero_division=0) * 100
+            f1 = f1_score(targets, predictions, zero_division=0) * 100
             
-            unique_targets = np.unique(targets)
-            unique_preds = np.unique(predictions)
-            
-            if len(unique_targets) <= 1 or len(unique_preds) <= 1:
-                if len(unique_targets) == 1 and len(unique_preds) == 1 and unique_targets[0] == unique_preds[0]:
-                    if unique_targets[0] == 1:
-                        precision = 100.0
-                        recall = 100.0
-                        f1 = 100.0
-                    else:
-                        precision = 0.0
-                        recall = 0.0
-                        f1 = 0.0
-                    auc = 50.0
-                else:
-                    tp = np.sum((predictions == 1) & (targets == 1))
-                    fp = np.sum((predictions == 1) & (targets == 0))
-                    fn = np.sum((predictions == 0) & (targets == 1))
-                    
-                    precision = 100.0 * tp / (tp + fp) if (tp + fp) > 0 else 0.0
-                    recall = 100.0 * tp / (tp + fn) if (tp + fn) > 0 else 0.0
-                    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
-                    auc = 50.0
-            else:
-                precision = precision_score(targets, predictions, zero_division=0) * 100
-                recall = recall_score(targets, predictions, zero_division=0) * 100
-                f1 = f1_score(targets, predictions, zero_division=0) * 100
+            if probabilities is not None:
+                probabilities = np.array(probabilities).flatten()
                 try:
-                    auc = roc_auc_score(targets, predictions) * 100
-                except:
-                    auc = 50.0
+                    unique_targets = np.unique(targets)
+                    if len(unique_targets) > 1:
+                        auc = roc_auc_score(targets, probabilities) * 100
+                    else:
+                        self.print_log(f"Only one class present in targets: {unique_targets}. AUC is undefined.")
+                        auc = None
+                except Exception as e:
+                    self.print_log(f"AUC calculation error: {e}")
+                    auc = None
+            else:
+                auc = None
             
             return accuracy, f1, recall, precision, auc
         except Exception as e:
             self.print_log(f"Error calculating metrics: {e}")
-            self.print_log(traceback.format_exc())
-            return 0.0, 0.0, 0.0, 0.0, 0.0
+            return 0.0, 0.0, 0.0, 0.0, None
     
     def train(self, epoch):
         try:
@@ -539,7 +433,6 @@ class BaseTrainer:
             start_time = time.time()
             
             loader = self.data_loader['train']
-            
             total_batches = len(loader)
             num_samples = total_batches * self.arg.batch_size
             
@@ -548,6 +441,7 @@ class BaseTrainer:
             train_loss = 0.0
             all_labels = []
             all_preds = []
+            all_probs = []
             steps = 0
             
             for batch_idx in range(total_batches):
@@ -558,13 +452,10 @@ class BaseTrainer:
                     inputs, targets, batch_indices = loader[batch_idx]
                     
                     if batch_idx == 0:
-                        self.print_log(f"First batch indices shape: {batch_indices.shape}")
                         for key, value in inputs.items():
                             self.print_log(f"First batch {key} shape: {value.shape}")
                         self.print_log(f"First batch labels shape: {targets.shape}")
                         self.print_log(f"First batch indices shape: {batch_indices.shape}")
-                        for key, value in inputs.items():
-                            self.print_log(f"Input '{key}' shape: {value.shape}")
                     
                     targets = tf.cast(targets, tf.float32)
                     
@@ -599,35 +490,52 @@ class BaseTrainer:
                         if grad is not None and tf.reduce_any(tf.math.is_nan(grad)):
                             has_nan = True
                             break
-                            
+                    
                     if has_nan:
                         self.print_log(f"WARNING: NaN gradients detected in batch {batch_idx}")
                         continue
-                        
+                    
                     self.optimizer.apply_gradients(zip(gradients, self.model.trainable_variables))
                     
                     if len(logits.shape) > 1 and logits.shape[-1] > 1:
                         predictions = tf.argmax(logits, axis=-1)
+                        probabilities = tf.nn.softmax(logits)[:, 1]
                     else:
-                        predictions = tf.cast(tf.sigmoid(logits) > 0.5, tf.int32)
+                        logits_squeezed = tf.squeeze(logits)
+                        probabilities = tf.sigmoid(logits_squeezed)
+                        predictions = tf.cast(probabilities > 0.5, tf.int32)
+                    
+                    # Ensure outputs are arrays
+                    targets_np = targets.numpy()
+                    predictions_np = predictions.numpy()
+                    probabilities_np = probabilities.numpy()
+                    
+                    # Handle scalar cases
+                    if not isinstance(targets_np, np.ndarray):
+                        targets_np = np.array([targets_np])
+                    if not isinstance(predictions_np, np.ndarray):
+                        predictions_np = np.array([predictions_np])
+                    if not isinstance(probabilities_np, np.ndarray):
+                        probabilities_np = np.array([probabilities_np])
                     
                     train_loss += loss.numpy()
-                    all_labels.extend(targets.numpy())
-                    all_preds.extend(predictions.numpy())
+                    all_labels.extend(targets_np.flatten())
+                    all_preds.extend(predictions_np.flatten())
+                    all_probs.extend(probabilities_np.flatten())
                     steps += 1
                     
                 except Exception as e:
                     self.print_log(f"Error in batch {batch_idx}: {e}")
-                    self.print_log(traceback.format_exc())
                     continue
             
             if steps > 0:
                 train_loss /= steps
-                accuracy, f1, recall, precision, auc_score = self.calculate_metrics(all_labels, all_preds)
+                accuracy, f1, recall, precision, auc_score = self.calculate_metrics(all_labels, all_preds, all_probs)
                 
                 self.train_loss_summary.append(float(train_loss))
                 
                 epoch_time = time.time() - start_time
+                auc_str = f"{auc_score:.2f}%" if auc_score is not None else "N/A"
                 self.print_log(
                     f"Epoch {epoch+1} results: "
                     f"Train Loss={train_loss:.4f}, "
@@ -635,7 +543,7 @@ class BaseTrainer:
                     f"F1={f1:.2f}%, "
                     f"Prec={precision:.2f}%, "
                     f"Rec={recall:.2f}%, "
-                    f"AUC={auc_score:.2f}% "
+                    f"AUC={auc_str} "
                     f"({epoch_time:.2f}s)"
                 )
                 
@@ -655,7 +563,6 @@ class BaseTrainer:
                 
         except Exception as e:
             self.print_log(f"Critical error in epoch {epoch+1}: {e}")
-            self.print_log(traceback.format_exc())
             return False
     
     def eval(self, epoch, loader_name='val', result_file=None):
@@ -677,6 +584,7 @@ class BaseTrainer:
             eval_loss = 0.0
             all_labels = []
             all_preds = []
+            all_probs = []
             all_logits = []
             steps = 0
             
@@ -700,7 +608,7 @@ class BaseTrainer:
                         logits = outputs[0]
                     else:
                         logits = outputs
-                        
+                    
                     batch_logits = logits.numpy()
                     all_logits.append(batch_logits)
                     
@@ -716,23 +624,41 @@ class BaseTrainer:
                     
                     if len(logits.shape) > 1 and logits.shape[-1] > 1:
                         predictions = tf.argmax(logits, axis=-1)
+                        probabilities = tf.nn.softmax(logits)[:, 1]
                     else:
-                        predictions = tf.cast(tf.sigmoid(logits) > 0.5, tf.int32)
+                        logits_squeezed = tf.squeeze(logits)
+                        probabilities = tf.sigmoid(logits_squeezed)
+                        predictions = tf.cast(probabilities > 0.5, tf.int32)
+                    
+                    # Ensure outputs are arrays
+                    targets_np = targets.numpy()
+                    predictions_np = predictions.numpy()
+                    probabilities_np = probabilities.numpy()
+                    
+                    # Handle scalar cases
+                    if not isinstance(targets_np, np.ndarray):
+                        targets_np = np.array([targets_np])
+                    if not isinstance(predictions_np, np.ndarray):
+                        predictions_np = np.array([predictions_np])
+                    if not isinstance(probabilities_np, np.ndarray):
+                        probabilities_np = np.array([probabilities_np])
                     
                     eval_loss += loss.numpy()
-                    all_labels.extend(targets.numpy())
-                    all_preds.extend(predictions.numpy())
+                    all_labels.extend(targets_np.flatten())
+                    all_preds.extend(predictions_np.flatten())
+                    all_probs.extend(probabilities_np.flatten())
                     steps += 1
                     
                 except Exception as e:
                     self.print_log(f"Error in evaluation batch {batch_idx}: {e}")
-                    self.print_log(traceback.format_exc())
+                    self.print_log(f"Error details: {traceback.format_exc()}")
                     continue
             
             if steps > 0:
                 eval_loss /= steps
-                accuracy, f1, recall, precision, auc_score = self.calculate_metrics(all_labels, all_preds)
+                accuracy, f1, recall, precision, auc_score = self.calculate_metrics(all_labels, all_preds, all_probs)
                 
+                auc_str = f"{auc_score:.2f}%" if auc_score is not None else "N/A"
                 self.print_log(
                     f"{loader_name.capitalize()}: "
                     f"Loss={eval_loss:.4f}, "
@@ -740,7 +666,7 @@ class BaseTrainer:
                     f"F1={f1:.2f}%, "
                     f"Prec={precision:.2f}%, "
                     f"Rec={recall:.2f}%, "
-                    f"AUC={auc_score:.2f}%"
+                    f"AUC={auc_str}"
                 )
                 
                 epoch_time = time.time() - start_time
@@ -774,7 +700,7 @@ class BaseTrainer:
                         "f1_score": float(f1),
                         "precision": float(precision),
                         "recall": float(recall),
-                        "auc": float(auc_score),
+                        "auc": float(auc_score) if auc_score is not None else None,
                         "loss": float(eval_loss),
                         "logits_sample": [float(x) for x in all_logits[0].flatten()[:5]] if len(all_logits) > 0 else []
                     }
@@ -800,7 +726,7 @@ class BaseTrainer:
                 
         except Exception as e:
             self.print_log(f"Error in evaluation: {e}")
-            self.print_log(traceback.format_exc())
+            self.print_log(f"Error details: {traceback.format_exc()}")
             return float('inf')
     
     def cm_viz(self, y_pred, y_true, subject_id=None):
@@ -812,6 +738,13 @@ class BaseTrainer:
             
             y_pred = np.array(y_pred).flatten()
             y_true = np.array(y_true).flatten()
+            
+            # Ensure same length
+            if len(y_pred) != len(y_true):
+                self.print_log(f"Warning: y_pred ({len(y_pred)}) and y_true ({len(y_true)}) have different lengths")
+                min_len = min(len(y_pred), len(y_true))
+                y_pred = y_pred[:min_len]
+                y_true = y_true[:min_len]
             
             cm = confusion_matrix(y_true, y_pred)
             
@@ -844,7 +777,7 @@ class BaseTrainer:
             
         except Exception as e:
             self.print_log(f"Error visualizing confusion matrix: {e}")
-            self.print_log(traceback.format_exc())
+            self.print_log(f"Error details: {traceback.format_exc()}")
     
     def loss_viz(self, train_loss, val_loss, subject_id=None):
         try:
@@ -877,7 +810,6 @@ class BaseTrainer:
             
         except Exception as e:
             self.print_log(f"Error visualizing loss: {e}")
-            self.print_log(traceback.format_exc())
     
     def save_model(self, epoch):
         try:
@@ -896,12 +828,10 @@ class BaseTrainer:
                 self.print_log(f"Saved full model to {model_path}")
             except Exception as e:
                 self.print_log(f"Warning: Could not save full model: {e}")
-                self.print_log(traceback.format_exc())
             
             return True
         except Exception as e:
             self.print_log(f"Error saving model: {e}")
-            self.print_log(traceback.format_exc())
             return False
     
     def evaluate_test_set(self, epoch=0):
@@ -923,6 +853,7 @@ class BaseTrainer:
             test_loss = 0.0
             all_labels = []
             all_preds = []
+            all_probs = []
             all_logits = []
             steps = 0
             
@@ -941,7 +872,7 @@ class BaseTrainer:
                         logits = outputs[0]
                     else:
                         logits = outputs
-                        
+                    
                     all_logits.append(logits.numpy())
                     
                     if len(logits.shape) > 1 and logits.shape[-1] > 0:
@@ -956,22 +887,39 @@ class BaseTrainer:
                     
                     if len(logits.shape) > 1 and logits.shape[-1] > 1:
                         predictions = tf.argmax(logits, axis=-1)
+                        probabilities = tf.nn.softmax(logits)[:, 1]
                     else:
-                        predictions = tf.cast(tf.sigmoid(logits) > 0.5, tf.int32)
+                        logits_squeezed = tf.squeeze(logits)
+                        probabilities = tf.sigmoid(logits_squeezed)
+                        predictions = tf.cast(probabilities > 0.5, tf.int32)
+                    
+                    # Ensure outputs are arrays
+                    targets_np = targets.numpy()
+                    predictions_np = predictions.numpy()
+                    probabilities_np = probabilities.numpy()
+                    
+                    # Handle scalar cases
+                    if not isinstance(targets_np, np.ndarray):
+                        targets_np = np.array([targets_np])
+                    if not isinstance(predictions_np, np.ndarray):
+                        predictions_np = np.array([predictions_np])
+                    if not isinstance(probabilities_np, np.ndarray):
+                        probabilities_np = np.array([probabilities_np])
                     
                     test_loss += loss.numpy()
-                    all_labels.extend(targets.numpy())
-                    all_preds.extend(predictions.numpy())
+                    all_labels.extend(targets_np.flatten())
+                    all_preds.extend(predictions_np.flatten())
+                    all_probs.extend(probabilities_np.flatten())
                     steps += 1
                     
                 except Exception as e:
                     self.print_log(f"Error in test batch {batch_idx}: {e}")
-                    self.print_log(traceback.format_exc())
+                    self.print_log(f"Error details: {traceback.format_exc()}")
                     continue
             
             if steps > 0:
                 test_loss /= steps
-                accuracy, f1, recall, precision, auc_score = self.calculate_metrics(all_labels, all_preds)
+                accuracy, f1, recall, precision, auc_score = self.calculate_metrics(all_labels, all_preds, all_probs)
                 
                 self.test_accuracy = accuracy
                 self.test_f1 = f1
@@ -979,6 +927,7 @@ class BaseTrainer:
                 self.test_precision = precision
                 self.test_auc = auc_score
                 
+                auc_str = f"{auc_score:.2f}%" if auc_score is not None else "N/A"
                 self.print_log(
                     f"Test results for Subject {subject_id}: "
                     f"Loss={test_loss:.4f}, "
@@ -986,7 +935,7 @@ class BaseTrainer:
                     f"F1={f1:.2f}%, "
                     f"Prec={precision:.2f}%, "
                     f"Rec={recall:.2f}%, "
-                    f"AUC={auc_score:.2f}%"
+                    f"AUC={auc_str}"
                 )
                 
                 self.cm_viz(all_preds, all_labels, subject_id)
@@ -1000,7 +949,7 @@ class BaseTrainer:
                     "f1_score": float(f1),
                     "precision": float(precision),
                     "recall": float(recall),
-                    "auc": float(auc_score),
+                    "auc": float(auc_score) if auc_score is not None else None,
                     "loss": float(test_loss),
                     "logits_sample": [float(x) for x in all_logits[0].flatten()[:5]] if len(all_logits) > 0 else []
                 }
@@ -1019,19 +968,37 @@ class BaseTrainer:
                 return results
             else:
                 self.print_log(f"No valid test steps completed for subject {subject_id}")
-                
                 self.model.trainable = model_training
-                
                 return None
                 
         except Exception as e:
             self.print_log(f"Error in test evaluation: {e}")
-            self.print_log(traceback.format_exc())
-            
+            self.print_log(f"Error details: {traceback.format_exc()}")
             if 'model_training' in locals():
                 self.model.trainable = model_training
-            
             return None
+    
+    def add_avg_df(self, results):
+        if not results:
+            return results
+        
+        metrics = ['accuracy', 'f1_score', 'precision', 'recall', 'auc']
+        avg_results = {key: [] for key in metrics}
+        
+        for result in results:
+            for metric in metrics:
+                if metric in result and result[metric] is not None:
+                    avg_results[metric].append(result[metric])
+        
+        avg_result = {'test_subject': 'Average'}
+        for metric in metrics:
+            if avg_results[metric]:
+                avg_result[metric] = round(sum(avg_results[metric]) / len(avg_results[metric]), 2)
+            else:
+                avg_result[metric] = None
+        
+        results.append(avg_result)
+        return results
     
     def start(self):
         max_total_time = 24 * 3600
@@ -1045,62 +1012,70 @@ class BaseTrainer:
                 
                 results = []
                 
-                val_subjects = [38, 46]
-                
-                for test_subject in self.arg.subjects:
-                    if test_subject in val_subjects:
-                        continue
-                    
+                # Use only eligible subjects for testing (no 33 since it's all negatives)
+                for test_subject in self.test_eligible_subjects:
                     try:
                         if time.time() - total_start_time > max_total_time:
                             self.print_log("Maximum total training time exceeded, stopping")
                             break
                         
+                        # Reset training state
                         self.train_loss_summary = []
                         self.val_loss_summary = []
                         self.best_loss = float('inf')
+                        self.data_loader = {}
                         
+                        # Set up subjects for this fold
                         self.test_subject = [test_subject]
-                        self.val_subject = val_subjects
-                        self.train_subjects = [s for s in self.arg.subjects 
-                                            if s != test_subject and s not in val_subjects]
+                        self.val_subject = self.val_subjects_fixed  # Always [38, 46]
+                        
+                        # Training subjects: all eligible except current test + fixed training subjects
+                        self.train_subjects = [s for s in self.test_eligible_subjects if s != test_subject]
+                        self.train_subjects.extend(self.train_subjects_fixed)  # Add [45, 36, 29]
                         
                         self.print_log(f"\n=== Cross-validation fold: Testing on subject {test_subject} ===")
                         self.print_log(f"Train: {len(self.train_subjects)} subjects: {self.train_subjects}")
                         self.print_log(f"Val: {len(self.val_subject)} subjects: {self.val_subject}")
                         self.print_log(f"Test: Subject {test_subject}")
                         
+                        # Validate subject assignments
+                        all_subjects = set(self.train_subjects + self.val_subject + self.test_subject)
+                        expected_subjects = set(self.test_eligible_subjects + self.train_subjects_fixed + self.val_subjects_fixed)
+                        if all_subjects != expected_subjects:
+                            self.print_log(f"WARNING: Subject assignment mismatch!")
+                            self.print_log(f"Expected: {expected_subjects}")
+                            self.print_log(f"Got: {all_subjects}")
+                        
                         try:
+                            tf.keras.backend.clear_session()
                             self.model = self.load_model()
+                            self.print_log(f"Model loaded successfully for subject {test_subject}")
                         except Exception as model_error:
                             self.print_log(f"Failed to load model for subject {test_subject}: {model_error}")
-                            self.print_log(traceback.format_exc())
                             continue
                         
                         try:
                             if not self.load_data():
                                 self.print_log(f"Skipping subject {test_subject} due to data loading issues")
                                 continue
+                            self.print_log(f"Data loaded successfully for subject {test_subject}")
                         except Exception as data_error:
                             self.print_log(f"Failed to load data for subject {test_subject}: {data_error}")
-                            self.print_log(traceback.format_exc())
                             continue
                         
                         try:
                             if not self.load_optimizer() or not self.load_loss():
                                 self.print_log(f"Skipping subject {test_subject} due to optimizer/loss issues")
                                 continue
+                            self.print_log(f"Optimizer and loss initialized for subject {test_subject}")
                         except Exception as opt_error:
                             self.print_log(f"Failed to initialize optimizer/loss: {opt_error}")
-                            self.print_log(traceback.format_exc())
                             continue
                         
-                        self.early_stop = EarlyStopping(patience=15, min_delta=.001)
+                        self.early_stop.reset()
                         
                         subject_start_time = time.time()
                         max_subject_time = 8 * 3600
-                        
-                        early_stop = False
                         self.print_log(f"Starting training for subject {test_subject}")
                         
                         for epoch in range(self.arg.start_epoch, self.arg.num_epoch):
@@ -1110,14 +1085,11 @@ class BaseTrainer:
                             
                             try:
                                 early_stop = self.train(epoch)
-                                
                                 if early_stop:
                                     self.print_log(f"Early stopping at epoch {epoch+1}")
                                     break
                             except Exception as epoch_error:
                                 self.print_log(f"Error in epoch {epoch+1}: {epoch_error}")
-                                self.print_log(traceback.format_exc())
-                                
                                 if epoch == 0:
                                     self.print_log(f"First epoch failed, skipping subject {test_subject}")
                                     break
@@ -1130,7 +1102,6 @@ class BaseTrainer:
                                 self.print_log(f"Loaded best weights from {best_weights}")
                             except Exception as weight_error:
                                 self.print_log(f"Error loading best weights: {weight_error}")
-                                self.print_log(traceback.format_exc())
                         
                         self.print_log(f"=== Final evaluation on subject {test_subject} ===")
                         result = self.evaluate_test_set()
@@ -1145,16 +1116,16 @@ class BaseTrainer:
                                 'f1_score': round(self.test_f1, 2),
                                 'precision': round(self.test_precision, 2),
                                 'recall': round(self.test_recall, 2),
-                                'auc': round(self.test_auc, 2)
+                                'auc': round(self.test_auc, 2) if self.test_auc is not None else None
                             }
-                            
                             results.append(subject_result)
+                            self.print_log(f"Completed fold for subject {test_subject}")
                         
+                        self.data_loader = {}
                         tf.keras.backend.clear_session()
                         
                     except Exception as subject_error:
                         self.print_log(f"Fatal error processing subject {test_subject}: {subject_error}")
-                        self.print_log(traceback.format_exc())
                         tf.keras.backend.clear_session()
                         continue
                 
@@ -1177,17 +1148,17 @@ class BaseTrainer:
                             recall = result['recall']
                             auc = result.get('auc', 'N/A')
                             
+                            auc_str = f"{auc:.2f}%" if auc is not None else "N/A"
                             self.print_log(
                                 f"Subject {subject}: "
                                 f"Acc={accuracy:.2f}%, "
                                 f"F1={f1:.2f}%, "
                                 f"Prec={precision:.2f}%, "
                                 f"Rec={recall:.2f}%, "
-                                f"AUC={auc}"
+                                f"AUC={auc_str}"
                             )
                     except Exception as report_error:
                         self.print_log(f"Error generating final report: {report_error}")
-                        self.print_log(traceback.format_exc())
                 
                 self.print_log("Training completed successfully")
                 
@@ -1215,4 +1186,3 @@ class BaseTrainer:
             
         except Exception as e:
             self.print_log(f"Fatal error in training process: {e}")
-            self.print_log(traceback.format_exc())

@@ -179,3 +179,61 @@ class TFLiteTransformerBlock(tf.keras.layers.Layer):
         return mlp_output + output1
 
 
+class MobileNetBlock(tf.keras.layers.Layer):
+    """Optional MobileNet-style block for more efficient feature extraction"""
+    def __init__(self, filters, strides=1, expansion_factor=4, name="mobile_block"):
+        super().__init__(name=name)
+        self.filters = filters
+        self.strides = strides
+        self.expansion_factor = expansion_factor
+        
+        # Expansion
+        self.expand = layers.Conv2D(
+            filters=filters * expansion_factor,
+            kernel_size=1,
+            padding='same',
+            use_bias=False,
+            name=f"{name}_expand"
+        )
+        self.expand_bn = layers.BatchNormalization(name=f"{name}_expand_bn")
+        self.expand_act = layers.ReLU(6., name=f"{name}_expand_relu")
+        
+        # Depthwise
+        self.depthwise = layers.DepthwiseConv2D(
+            kernel_size=3,
+            strides=strides,
+            padding='same',
+            use_bias=False,
+            name=f"{name}_depthwise"
+        )
+        self.depthwise_bn = layers.BatchNormalization(name=f"{name}_depthwise_bn")
+        self.depthwise_act = layers.ReLU(6., name=f"{name}_depthwise_relu")
+        
+        # Projection
+        self.project = layers.Conv2D(
+            filters=filters,
+            kernel_size=1,
+            padding='same',
+            use_bias=False,
+            name=f"{name}_project"
+        )
+        self.project_bn = layers.BatchNormalization(name=f"{name}_project_bn")
+        
+        # Skip connection if input and output have same shape
+        self.use_residual = strides == 1
+        
+    def call(self, inputs, training=False):
+        x = self.expand(inputs)
+        x = self.expand_bn(x, training=training)
+        x = self.expand_act(x)
+        
+        x = self.depthwise(x)
+        x = self.depthwise_bn(x, training=training)
+        x = self.depthwise_act(x)
+        
+        x = self.project(x)
+        x = self.project_bn(x, training=training)
+        
+        if self.use_residual and inputs.shape[-1] == self.filters:
+            return x + inputs
+        return x

@@ -1,11 +1,11 @@
-model: src.models.transformer_optimized.TransModel
+model: src.models.transformer_mobilenet.TransModel
 dataset: smartfallmm
 
 # Subjects for fall detection
 subjects: [32, 39, 30, 31, 33, 34, 35, 37, 43, 44, 45, 36, 29]
 
 model_args:
-  acc_frames: 64 
+  acc_frames: 128 
   num_classes: 1
   num_heads: 4
   acc_coords: 3  # Original accelerometer channels (SMV is added internally)
@@ -16,12 +16,12 @@ model_args:
 
 dataset_args: 
   mode: 'sliding_window'
-  max_length: 64
+  max_length: 128
   task: 'fd'
   modalities: ['accelerometer', 'skeleton']  # Keep both for DTW alignment
   age_group: ['young']
   sensors: ['watch']
-  use_dtw: true
+  use_dtw: false
 feeder: utils.dataset_tf.UTD_MM_TF
 batch_size: 16
 test_batch_size: 16

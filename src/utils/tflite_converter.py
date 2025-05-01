@@ -3,7 +3,7 @@ import tensorflow as tf
 import logging
 import numpy as np
 
-def convert_to_tflite(model, save_path, input_shape=(1, 128, 3), quantize=False):
+def convert_to_tflite(model, save_path, input_shape=(1, 64, 3), quantize=False):
     """Convert model to TFLite format with accelerometer-only input.
     
     This function creates a TFLite model that only takes accelerometer data as input,

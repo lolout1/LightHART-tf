@@ -286,7 +286,7 @@ log "  GPU ID: ${GPU_ID}"
 log "  Using SMV: ${USE_SMV}"
 
 # System checks
-check_dependencies
+#check_dependencies
 check_gpu
 check_required_files
 backup_code
