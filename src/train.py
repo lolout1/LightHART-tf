@@ -73,6 +73,7 @@ def log_best_results(results_dir, model_metrics, timestamp=None):
 def get_args():
     parser = argparse.ArgumentParser(description='Fall Detection Training')
     parser.add_argument('--config', default='./config/smartfallmm/optimized.yaml', help='Path to configuration file')
+    parser.add_argument('--num-worker', type=int, default=0, help='Number of worker processes for data loading')
     parser.add_argument('--work-dir', type=str, default='./experiments', help='Working directory for outputs')
     parser.add_argument('--model-saved-name', type=str, default='model', help='Base name for saving model')
     parser.add_argument('--device', default='0', help='GPU device ID')
