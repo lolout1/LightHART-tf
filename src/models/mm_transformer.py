@@ -1,4 +1,4 @@
-# src/models/mm_transformer.py
+# models/mm_transformer.py
 import tensorflow as tf
 from tensorflow.keras import layers, Model
 import logging
@@ -22,6 +22,8 @@ class MMTransformer(tf.keras.Model):
         self.mlp_ratio = mlp_ratio
         self.num_classes = num_classes
         self.drop_rate = drop_rate
+        self.attn_drop_rate = attn_drop_rate
+        self.drop_path_rate = drop_path_rate
         
         # Build model components
         self._build_layers()
@@ -81,8 +83,8 @@ class MMTransformer(tf.keras.Model):
                     num_heads=self.num_heads,
                     mlp_ratio=self.mlp_ratio,
                     drop_rate=self.drop_rate,
-                    attn_drop_rate=attn_drop_rate,
-                    drop_path_rate=drop_path_rate * i / max(1, self.tdepth-1),
+                    attn_drop_rate=self.attn_drop_rate,
+                    drop_path_rate=self.drop_path_rate * i / max(1, self.tdepth-1),
                     name=f"temporal_block_{i}"
                 )
             )
@@ -93,8 +95,8 @@ class MMTransformer(tf.keras.Model):
             num_heads=self.num_heads,
             mlp_ratio=self.mlp_ratio,
             drop_rate=self.drop_rate,
-            attn_drop_rate=attn_drop_rate,
-            drop_path_rate=drop_path_rate,
+            attn_drop_rate=self.attn_drop_rate,
+            drop_path_rate=self.drop_path_rate,
             name="joint_block"
         )
         

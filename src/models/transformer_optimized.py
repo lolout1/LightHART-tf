@@ -1,11 +1,13 @@
+# models/transformer_optimized.py
 import tensorflow as tf
 from tensorflow.keras import layers, Model
 import logging
+import numpy as np
 
 class TransModel(tf.keras.Model):
     def __init__(
         self,
-        acc_frames=64,
+        acc_frames=128,
         num_classes=1,
         num_heads=4,
         acc_coords=3,

@@ -1,9 +1,10 @@
+# utils/tflite_converter.py
 import os
 import tensorflow as tf
 import logging
 import numpy as np
 
-def convert_to_tflite(model, save_path, input_shape=(1, 64, 3), quantize=False):
+def convert_to_tflite(model, save_path, input_shape=(1, 128, 3), quantize=False):
     """Convert model to TFLite format with accelerometer-only input.
     
     This function creates a TFLite model that only takes accelerometer data as input,
@@ -29,7 +30,7 @@ def convert_to_tflite(model, save_path, input_shape=(1, 64, 3), quantize=False):
         # Use the model's built-in export method if available
         if hasattr(model, 'export_to_tflite'):
             logging.info("Using model's built-in TFLite export method")
-            return model.export_to_tflite(save_path, 64, False)
+            return model.export_to_tflite(save_path, input_shape[1], quantize)
         
         logging.info(f"Starting TFLite conversion with input shape {input_shape}")
         
@@ -41,10 +42,26 @@ def convert_to_tflite(model, save_path, input_shape=(1, 64, 3), quantize=False):
             
             @tf.function
             def call(self, inputs):
+                # Calculate signal magnitude vector (SMV)
+                mean = tf.reduce_mean(inputs, axis=1, keepdims=True)
+                zero_mean = inputs - mean
+                sum_squared = tf.reduce_sum(tf.square(zero_mean), axis=-1, keepdims=True)
+                smv = tf.sqrt(sum_squared)
+                
+                # Concatenate SMV with original data
+                acc_with_smv = tf.concat([smv, inputs], axis=-1)
+                
                 # Wrap accelerometer data in dictionary for parent model
-                inputs_dict = {'accelerometer': inputs}
+                inputs_dict = {'accelerometer': acc_with_smv}
+                
                 # Get output from parent model
-                return self.parent(inputs_dict, training=False)
+                outputs = self.parent(inputs_dict, training=False)
+                
+                # Return only logits if model returns (logits, features)
+                if isinstance(outputs, tuple) and len(outputs) > 0:
+                    return outputs[0]
+                
+                return outputs
         
         # Create and initialize wrapper model
         wrapper_model = WrapperModel(model)
@@ -76,7 +93,7 @@ def convert_to_tflite(model, save_path, input_shape=(1, 64, 3), quantize=False):
         if quantize:
             converter.optimizations = [tf.lite.Optimize.DEFAULT]
         
-        # Configure TFLite conversion options for TF 2.19 compatibility
+        # Configure TFLite conversion options for compatibility
         converter.target_spec.supported_ops = [
             tf.lite.OpsSet.TFLITE_BUILTINS,
             tf.lite.OpsSet.SELECT_TF_OPS  # Include TF ops for better compatibility
