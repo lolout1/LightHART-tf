@@ -1,37 +1,37 @@
-model: src.models.transformer_optimized.TransModel
+model: models.transformer_optimized.TransModel
 dataset: smartfallmm
 
 # Subjects for fall detection
 subjects: [32, 39, 30, 31, 33, 34, 35, 37, 43, 44, 45, 36, 29]
 
 model_args:
+  acc_frames: 64
   num_classes: 1
   num_heads: 4
+  acc_coords: 3
   embed_dim: 32
   num_layers: 2
-  dim_feedforward: 64
   dropout: 0.5
   activation: 'relu'
-  norm_first: true
 
-dataset_args: 
+dataset_args:
   mode: 'sliding_window'
-  max_length: 64 
+  max_length: 64
   task: 'fd'
   modalities: ['accelerometer','skeleton']
   age_group: ['young']
   sensors: ['watch']
   use_dtw: true
-  verbose: true  # Enable detailed logging
+  verbose: true
 
 batch_size: 16
 test_batch_size: 16
 val_batch_size: 16
 num_epoch: 80
+num_worker: 40
 
 optimizer: adamw
 base_lr: 0.001
 weight_decay: 0.0004
 
 phase: 'train'
-num_worker: 8

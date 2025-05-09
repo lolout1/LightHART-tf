@@ -1,8 +1,6 @@
-import os
 import tensorflow as tf
 from tensorflow.keras import layers, Model
 import logging
-import numpy as np
 
 class TransModel(tf.keras.Model):
     def __init__(
@@ -15,6 +13,9 @@ class TransModel(tf.keras.Model):
         num_layers=2,
         dropout=0.5,
         activation='relu',
+        # Handle params from PyTorch model that we'll ignore
+        dim_feedforward=None,
+        norm_first=None,
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -29,12 +30,12 @@ class TransModel(tf.keras.Model):
         self.activation = activation
         self.head_dim = embed_dim // num_heads
         
-        # Input processing layers (TFLite-friendly)
+        # Input processing layers
         self.conv_projection = layers.Conv2D(
             filters=self.embed_dim,
             kernel_size=(8, 1),
             padding='same',
-            use_bias=True,  # Enable bias for better folding
+            use_bias=True,
             name="conv_projection"
         )
         self.input_norm = layers.LayerNormalization(epsilon=1e-6, name="input_norm")
@@ -57,11 +58,20 @@ class TransModel(tf.keras.Model):
         self.global_avg_pool = layers.GlobalAveragePooling1D(name="global_pool")
         self.classifier = layers.Dense(self.num_classes, name="output_dense")
         
-        # Initialize with dummy input for variable creation
+        # Initialize with dummy input
         dummy_input = tf.zeros((1, acc_frames, acc_coords), dtype=tf.float32)
         self(dummy_input, training=False)
         
         logging.info(f"TFLite-optimized TransModel initialized: frames={acc_frames}, embed_dim={embed_dim}")
+
+    def build(self, input_shape):
+        # If input is a dictionary, extract the accelerometer data shape
+        if isinstance(input_shape, dict) and 'accelerometer' in input_shape:
+            input_shape = input_shape['accelerometer']
+        
+        # Call build on each layer with appropriate shapes
+        self.built = True
+        return super().build(input_shape)
 
     def call(self, inputs, training=False):
         # Handle different input types
@@ -84,17 +94,18 @@ class TransModel(tf.keras.Model):
         
         # Output processing
         x = self.final_norm(x)                              # [batch, frames, embed_dim]
+        features = x                                        # Save features for distillation
         x = self.global_avg_pool(x)                         # [batch, embed_dim]
         x = self.classifier(x)                              # [batch, num_classes]
         
         # Ensure consistent output shape for binary classification
         if self.num_classes == 1:
-            return tf.reshape(x, [-1, 1])
-        return x
+            return tf.reshape(x, [-1, 1]), features
+        return x, features
 
 
 class TFLiteTransformerBlock(tf.keras.layers.Layer):
-    """TFLite-optimized transformer block with manually implemented attention"""
+    """TFLite-optimized transformer block"""
     def __init__(self, dim, num_heads, mlp_dim, dropout=0.1, activation='relu', layer_idx=0):
         super().__init__()
         self.dim = dim
@@ -177,5 +188,3 @@ class TFLiteTransformerBlock(tf.keras.layers.Layer):
         
         # Second residual connection
         return mlp_output + output1
-
-

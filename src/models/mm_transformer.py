@@ -1,47 +1,18 @@
+# src/models/mm_transformer.py
 import tensorflow as tf
-from tensorflow.keras import layers
+from tensorflow.keras import layers, Model
 import logging
 import numpy as np
-
-class TransformerBlock(tf.keras.layers.Layer):
-    def __init__(self, dim, num_heads, mlp_ratio=4, drop_rate=0.0, attn_drop_rate=0.0, drop_path_rate=0.0, **kwargs):
-        super().__init__(**kwargs)
-        self.norm1 = layers.LayerNormalization(epsilon=1e-6)
-        self.norm2 = layers.LayerNormalization(epsilon=1e-6)
-        self.mha = layers.MultiHeadAttention(num_heads=num_heads, key_dim=dim // num_heads, dropout=attn_drop_rate)
-        mlp_hidden_dim = int(dim * mlp_ratio)
-        self.mlp = tf.keras.Sequential([
-            layers.Dense(mlp_hidden_dim, activation='relu'),
-            layers.Dropout(drop_rate),
-            layers.Dense(dim),
-            layers.Dropout(drop_rate)
-        ])
-        self.drop_path_rate = drop_path_rate
-    
-    def call(self, x, training=False):
-        x_norm = self.norm1(x)
-        attn_output = self.mha(x_norm, x_norm, x_norm, training=training)
-        if training and self.drop_path_rate > 0:
-            attn_output = tf.nn.dropout(attn_output, self.drop_path_rate)
-        x = x + attn_output
-        x_norm = self.norm2(x)
-        mlp_output = self.mlp(x_norm, training=training)
-        if training and self.drop_path_rate > 0:
-            mlp_output = tf.nn.dropout(mlp_output, self.drop_path_rate)
-        x = x + mlp_output
-        return x
 
 class MMTransformer(tf.keras.Model):
     def __init__(self, mocap_frames=128, acc_frames=128, num_joints=32, in_chans=3, num_patch=4, acc_coords=3, 
                  spatial_embed=16, sdepth=4, adepth=4, tdepth=2, num_heads=2, mlp_ratio=2, qkv_bias=True, 
-                 qk_scale=None, op_type='pool', embed_type='lin', drop_rate=0.2, attn_drop_rate=0.2, 
-                 drop_path_rate=0.2, num_classes=1, **kwargs):
+                 drop_rate=0.2, attn_drop_rate=0.2, drop_path_rate=0.2, num_classes=1, **kwargs):
         super().__init__(**kwargs)
         self.mocap_frames = mocap_frames
         self.acc_frames = acc_frames
         self.num_joints = num_joints
         self.in_chans = in_chans
-        self.num_patch = num_patch
         self.acc_coords = acc_coords
         self.spatial_embed = spatial_embed
         self.sdepth = sdepth
@@ -49,156 +20,147 @@ class MMTransformer(tf.keras.Model):
         self.tdepth = tdepth
         self.num_heads = num_heads
         self.mlp_ratio = mlp_ratio
-        self.qkv_bias = qkv_bias
-        self.qk_scale = qk_scale
-        self.op_type = op_type
-        self.embed_type = embed_type
-        self.drop_rate = drop_rate
-        self.attn_drop_rate = attn_drop_rate
-        self.drop_path_rate = drop_path_rate
         self.num_classes = num_classes
+        self.drop_rate = drop_rate
         
-        # Learnable tokens and weights
-        self.temp_token = self.add_weight(shape=(1, 1, spatial_embed), initializer="zeros", trainable=True, name="temp_token")
-        self.Temporal_pos_embed = self.add_weight(shape=(1, 1, spatial_embed), initializer="zeros", trainable=True, name="temporal_pos_embed")
+        # Build model components
+        self._build_layers()
         
-        # Spatial encoder
-        self.Spatial_encoder = tf.keras.Sequential([
-            layers.Conv1D(spatial_embed, 3, padding='same'),
-            layers.BatchNormalization(),
-            layers.ReLU(),
-            layers.Conv1D(spatial_embed, 3, padding='same'),
-            layers.BatchNormalization(),
-            layers.ReLU(),
-            layers.Conv1D(spatial_embed, 3, padding='same'),
-            layers.BatchNormalization(),
-            layers.ReLU()
-        ], name="spatial_encoder")
+        # Initialize with dummy inputs to create variables
+        self._initialize_variables()
         
-        # Transform layer
-        self.transform = layers.Dense(spatial_embed, activation='relu')
+    def _build_layers(self):
+        """Create all model layers"""
+        # Tokens and positional embeddings
+        self.temp_token = self.add_weight(
+            name="temp_token", 
+            shape=(1, 1, self.spatial_embed),
+            initializer="zeros", 
+            trainable=True
+        )
         
-        # Spatial convolutional layers
+        self.temporal_pos_embed = self.add_weight(
+            name="temporal_pos_embed",
+            shape=(1, 1, self.spatial_embed),
+            initializer="zeros",
+            trainable=True
+        )
+        
+        # Spatial convolutional layers for skeleton processing
         self.spatial_conv = tf.keras.Sequential([
-            layers.Conv2D(in_chans, (1, 9), padding='same'),
+            layers.Conv2D(filters=self.in_chans, kernel_size=(1, 9), padding='same'),
             layers.BatchNormalization(),
             layers.ReLU(),
-            layers.Conv2D(1, (1, 9), padding='same'),
+            layers.Conv2D(filters=1, kernel_size=(1, 9), padding='same'),
             layers.BatchNormalization(),
             layers.ReLU()
         ], name="spatial_conv")
         
-        # Transformer blocks
-        self.Temporal_blocks = []
-        for i in range(tdepth):
-            self.Temporal_blocks.append(TransformerBlock(
-                dim=spatial_embed,
-                num_heads=num_heads,
-                mlp_ratio=mlp_ratio,
-                drop_rate=drop_rate,
-                attn_drop_rate=attn_drop_rate,
-                drop_path_rate=drop_path_rate * i / max(1, tdepth-1)
-            ))
+        # Spatial encoder for skeleton features
+        self.spatial_encoder = tf.keras.Sequential([
+            layers.Conv1D(filters=self.spatial_embed, kernel_size=3, padding='same'),
+            layers.BatchNormalization(),
+            layers.ReLU(),
+            layers.Conv1D(filters=self.spatial_embed, kernel_size=3, padding='same'),
+            layers.BatchNormalization(),
+            layers.ReLU(),
+            layers.Conv1D(filters=self.spatial_embed, kernel_size=3, padding='same'),
+            layers.BatchNormalization(),
+            layers.ReLU()
+        ], name="spatial_encoder")
+        
+        # Feature transformation layer
+        self.transform = layers.Dense(self.spatial_embed, activation='relu', name="transform")
+        
+        # Temporal transformer blocks
+        self.temporal_blocks = []
+        for i in range(self.tdepth):
+            self.temporal_blocks.append(
+                TransformerBlock(
+                    dim=self.spatial_embed,
+                    num_heads=self.num_heads,
+                    mlp_ratio=self.mlp_ratio,
+                    drop_rate=self.drop_rate,
+                    attn_drop_rate=attn_drop_rate,
+                    drop_path_rate=drop_path_rate * i / max(1, self.tdepth-1),
+                    name=f"temporal_block_{i}"
+                )
+            )
         
         # Joint relation block
         self.joint_block = TransformerBlock(
-            dim=spatial_embed,
-            num_heads=num_heads,
-            mlp_ratio=mlp_ratio,
-            drop_rate=drop_rate,
+            dim=self.spatial_embed,
+            num_heads=self.num_heads,
+            mlp_ratio=self.mlp_ratio,
+            drop_rate=self.drop_rate,
             attn_drop_rate=attn_drop_rate,
-            drop_path_rate=drop_path_rate
+            drop_path_rate=drop_path_rate,
+            name="joint_block"
         )
         
-        # Layer normalization
-        self.Temporal_norm = layers.LayerNormalization(epsilon=1e-6)
+        # Normalization layers
+        self.temporal_norm = layers.LayerNormalization(epsilon=1e-6, name="temporal_norm")
         
         # Classification head
         self.class_head = tf.keras.Sequential([
             layers.LayerNormalization(epsilon=1e-6),
-            layers.Dense(num_classes)
-        ])
-        
-        # Build model with dummy inputs
-        self._build_model()
+            layers.Dense(self.num_classes)
+        ], name="class_head")
     
-    def _build_model(self):
-        """Pre-build model with dummy inputs for both accelerometer and skeleton data"""
+    def _initialize_variables(self):
+        """Initialize all variables with dummy inputs"""
         try:
+            # Create dummy inputs
             dummy_acc = tf.zeros((2, self.acc_frames, self.acc_coords), dtype=tf.float32)
             dummy_skl = tf.zeros((2, self.mocap_frames, self.num_joints, self.in_chans), dtype=tf.float32)
-            dummy_inputs = {'accelerometer': dummy_acc, 'skeleton': dummy_skl}
-            _ = self(dummy_inputs, training=False)
-            logging.info("Model graph pre-built successfully")
+            
+            # Forward pass to build variables
+            _ = self({"accelerometer": dummy_acc, "skeleton": dummy_skl}, training=False)
+            logging.info("MMTransformer variables initialized successfully")
         except Exception as e:
-            logging.warning(f"Pre-build failed (this is expected during initialization): {str(e)[:100]}...")
+            logging.warning(f"Variable initialization failed (this is expected during initialization): {e}")
     
-    def Temp_forward_features(self, x, training=False):
-        batch_size = tf.shape(x)[0]
-        
-        # Ensure x is properly shaped [batch, seq_len, features]
-        if len(tf.shape(x)) == 3 and tf.shape(x)[2] == self.spatial_embed:
-            # Correct shape
-            pass
-        elif len(tf.shape(x)) == 3 and tf.shape(x)[1] == self.spatial_embed:
-            # Needs transpose
-            x = tf.transpose(x, [0, 2, 1])
-        
-        # Create class token for each batch item
-        class_token = tf.repeat(self.temp_token, repeats=batch_size, axis=0)
-        
-        # Concatenate class token to sequence
-        x = tf.concat([x, class_token], axis=1)
-        
-        # Add positional embedding
-        x = x + self.Temporal_pos_embed
-        
-        # Process through transformer blocks
-        for blk in self.Temporal_blocks:
-            x = blk(x, training=training)
-        
-        # Apply normalization
-        x = self.Temporal_norm(x)
-        
-        # Extract features based on mode
-        if self.op_type == 'cls':
-            # Extract class token
-            return x[:, -1, :]
-        else:
-            # Take all tokens except class token for pooling
-            seq_len = tf.shape(x)[1] - 1
-            tokens = x[:, :seq_len, :]
-            # Global average pooling
-            return tf.reduce_mean(tokens, axis=1)
-    
-    def call(self, inputs, training=False):
-        # Handle both dictionary and tuple inputs
-        if isinstance(inputs, dict):
-            if 'accelerometer' in inputs and 'skeleton' in inputs:
-                acc_data = inputs['accelerometer']
-                skl_data = inputs['skeleton']
+    def build(self, input_shape):
+        """Explicitly build the model based on input shapes"""
+        # Handle dictionary input
+        if isinstance(input_shape, dict):
+            acc_shape = input_shape.get('accelerometer')
+            skl_shape = input_shape.get('skeleton')
+            
+            if acc_shape is not None and skl_shape is not None:
+                # Both modalities available
+                pass
+            elif acc_shape is not None:
+                # Only accelerometer available - create dummy skeleton
+                skl_shape = (acc_shape[0], self.mocap_frames, self.num_joints, self.in_chans)
+                logging.warning("Building with only accelerometer - using dummy skeleton shape")
+            elif skl_shape is not None:
+                # Only skeleton available - create dummy accelerometer
+                acc_shape = (skl_shape[0], self.acc_frames, self.acc_coords)
+                logging.warning("Building with only skeleton - using dummy accelerometer shape")
             else:
-                raise ValueError("Input dictionary must contain both 'accelerometer' and 'skeleton' keys")
-        elif isinstance(inputs, tuple) and len(inputs) == 2:
-            acc_data, skl_data = inputs
+                raise ValueError("Neither accelerometer nor skeleton shapes provided")
         else:
-            raise ValueError("Input must be a dictionary with 'accelerometer' and 'skeleton' keys or a tuple of (acc_data, skl_data)")
+            raise ValueError("Input shape must be a dictionary with modality keys")
         
-        # Get batch size
+        # Let each layer build itself with correct shapes
+        self.built = True
+    
+    def process_skeleton(self, skl_data, training=False):
+        """Process skeleton data through spatial network"""
         batch_size = tf.shape(skl_data)[0]
         
-        # Process skeleton data
-        # Convert to [batch, channels, frames, joints]
+        # Reshape to [batch, channels, frames, joints]
         x = tf.transpose(skl_data, [0, 3, 1, 2])
         
         # Apply spatial convolution
-        x = self.spatial_conv(x)
+        x = self.spatial_conv(x, training=training)
         
         # Reshape to [batch, frames, features]
-        x = tf.reshape(x, [batch_size, tf.shape(skl_data)[1], -1])
+        x = tf.reshape(x, [batch_size, self.mocap_frames, -1])
         
-        # Spatial encoding
-        x = self.Spatial_encoder(x)
+        # Apply spatial encoding
+        x = self.spatial_encoder(x, training=training)
         
         # Feature transformation
         x = self.transform(x)
@@ -206,20 +168,139 @@ class MMTransformer(tf.keras.Model):
         # Process through joint block
         x = self.joint_block(x, training=training)
         
-        # Save features for knowledge distillation
-        feature = x
-        feature = tf.transpose(feature, [0, 2, 1])
-        feature = tf.reduce_mean(feature, axis=2, keepdims=True)
-        feature = tf.reshape(feature, [batch_size, -1])
+        return x
+    
+    def temporal_forward(self, x, training=False):
+        """Process features through temporal network"""
+        batch_size = tf.shape(x)[0]
         
-        # Temporal features processing
-        cls_features = self.Temp_forward_features(x, training=training)
+        # Add class token
+        class_token = tf.repeat(self.temp_token, repeats=batch_size, axis=0)
+        x = tf.concat([x, class_token], axis=1)
         
-        # Classification
-        logits = self.class_head(cls_features)
+        # Add positional embedding
+        x = x + self.temporal_pos_embed
         
-        # Format output for binary classification
+        # Process through transformer blocks
+        for block in self.temporal_blocks:
+            x = block(x, training=training)
+        
+        # Apply normalization
+        x = self.temporal_norm(x)
+        
+        # Extract features from sequence
+        seq_len = tf.shape(x)[1] - 1
+        sequence = x[:, :seq_len, :]
+        
+        # Global average pooling for features
+        pooled = tf.reduce_mean(sequence, axis=1)
+        
+        return pooled
+    
+    def call(self, inputs, training=False):
+        """Forward pass handling different input types"""
+        # Handle different input types gracefully
+        if isinstance(inputs, dict):
+            acc_data = inputs.get('accelerometer')
+            skl_data = inputs.get('skeleton')
+            
+            if skl_data is None:
+                logging.warning("No skeleton data provided, outputs may be unreliable for teacher model")
+                # Create dummy skeleton data
+                batch_size = tf.shape(acc_data)[0]
+                skl_data = tf.zeros((batch_size, self.mocap_frames, self.num_joints, self.in_chans), dtype=tf.float32)
+            
+            if acc_data is None:
+                logging.warning("No accelerometer data provided, using only skeleton")
+                # Create dummy accelerometer data
+                batch_size = tf.shape(skl_data)[0]
+                acc_data = tf.zeros((batch_size, self.acc_frames, self.acc_coords), dtype=tf.float32)
+        elif isinstance(inputs, tuple) and len(inputs) == 2:
+            acc_data, skl_data = inputs
+        else:
+            raise ValueError("Input must be dictionary with modality keys or tuple (acc_data, skl_data)")
+        
+        # Process skeleton data
+        features = self.process_skeleton(skl_data, training=training)
+        
+        # Extract and save features for knowledge distillation
+        distill_features = tf.transpose(features, [0, 2, 1])
+        batch_size = tf.shape(distill_features)[0]
+        distill_features = tf.reduce_mean(distill_features, axis=2, keepdims=True)
+        distill_features = tf.reshape(distill_features, [batch_size, -1])
+        
+        # Process through temporal network
+        temporal_features = self.temporal_forward(features, training=training)
+        
+        # Final classification
+        logits = self.class_head(temporal_features, training=training)
+        
+        # Ensure consistent output shape for binary classification
         if self.num_classes == 1:
             logits = tf.reshape(logits, [-1, 1])
         
-        return logits, feature
+        return logits, distill_features
+
+
+class TransformerBlock(tf.keras.layers.Layer):
+    """Transformer block with multi-head attention and MLP"""
+    def __init__(self, dim, num_heads, mlp_ratio=4.0, drop_rate=0.0, 
+                 attn_drop_rate=0.0, drop_path_rate=0.0, **kwargs):
+        super().__init__(**kwargs)
+        self.dim = dim
+        self.num_heads = num_heads
+        self.mlp_dim = int(dim * mlp_ratio)
+        
+        # Normalization layers
+        self.norm1 = layers.LayerNormalization(epsilon=1e-6)
+        self.norm2 = layers.LayerNormalization(epsilon=1e-6)
+        
+        # Multi-head attention
+        self.attn = layers.MultiHeadAttention(
+            num_heads=num_heads,
+            key_dim=dim // num_heads,
+            dropout=attn_drop_rate
+        )
+        
+        # MLP block
+        self.mlp = tf.keras.Sequential([
+            layers.Dense(self.mlp_dim, activation='gelu'),
+            layers.Dropout(drop_rate),
+            layers.Dense(dim),
+            layers.Dropout(drop_rate)
+        ])
+        
+        self.drop_path_rate = drop_path_rate
+    
+    def build(self, input_shape):
+        """Build layer based on input shape"""
+        self.built = True
+    
+    def call(self, x, training=False):
+        # Normalization before attention
+        x_norm = self.norm1(x)
+        
+        # Multi-head attention
+        attn_output = self.attn(x_norm, x_norm, x_norm, training=training)
+        
+        # Apply dropout path if training
+        if training and self.drop_path_rate > 0:
+            attn_output = tf.nn.dropout(attn_output, rate=self.drop_path_rate)
+        
+        # First residual connection
+        x = x + attn_output
+        
+        # Normalization before MLP
+        x_norm = self.norm2(x)
+        
+        # MLP block
+        mlp_output = self.mlp(x_norm, training=training)
+        
+        # Apply dropout path if training
+        if training and self.drop_path_rate > 0:
+            mlp_output = tf.nn.dropout(mlp_output, rate=self.drop_path_rate)
+        
+        # Second residual connection
+        x = x + mlp_output
+        
+        return x
