@@ -1,4 +1,3 @@
-# utils/dataset_tf.py
 from typing import List, Dict, Tuple, Any
 import os
 import numpy as np
@@ -10,21 +9,17 @@ from scipy.signal import find_peaks, butter, filtfilt
 from sklearn.preprocessing import StandardScaler
 import matplotlib.pyplot as plt
 import logging
+import traceback
 
-# Constants matching PyTorch implementation
-SAMPLING_RATE = 30  # Hz (samples per second)
-TARGET_DURATION = 12  # Target seconds for all instances
-TARGET_SAMPLES = TARGET_DURATION * SAMPLING_RATE  # 12s * 200Hz = 2400 samples
+SAMPLING_RATE = 30
+TARGET_DURATION = 12
+TARGET_SAMPLES = TARGET_DURATION * SAMPLING_RATE
 TOLERANCE = 50 
 TEST_YOUNG = ["SA03", "SA10", "SA15", "SA20"]
 TEST_ELDERLY = ["SE02", "SE06", "SE10", "SE14"]
 TEST_SUBJECTS = TEST_YOUNG + TEST_ELDERLY
 
-# Helper functions for file loading - exact match to PyTorch
 def csvloader(file_path: str, **kwargs) -> np.ndarray:
-    '''
-    Loads csv data - exact match to PyTorch implementation
-    '''
     import pandas as pd
     try:
         file_data = pd.read_csv(file_path, index_col=False, header=0).dropna().bfill()
@@ -39,25 +34,15 @@ def csvloader(file_path: str, **kwargs) -> np.ndarray:
         return None
 
 def matloader(file_path: str, **kwargs) -> np.ndarray:
-    '''
-    Loads MatLab files - exact match to PyTorch implementation
-    '''
     from scipy.io import loadmat
     key = kwargs.get('key', None)
     assert key in ['d_iner', 'd_skel'], f'Unsupported {key} for matlab file'
     data = loadmat(file_path)[key]
     return data
 
-LOADER_MAP = {
-    'csv': csvloader, 
-    'mat': matloader
-}
+LOADER_MAP = {'csv': csvloader, 'mat': matloader}
 
-def avg_pool(sequence: np.ndarray, window_size: int = 5, stride: int = 1, 
-             max_length: int = 512, shape: int = None) -> np.ndarray:
-    '''
-    Executes average pooling to smoothen out the data - exact match to PyTorch implementation
-    '''
+def avg_pool(sequence: np.ndarray, window_size: int = 5, stride: int = 1, max_length: int = 512, shape: int = None) -> np.ndarray:
     shape = sequence.shape
     sequence = sequence.reshape(shape[0], -1)
     sequence = np.expand_dims(sequence, axis=0).transpose(0, 2, 1)
@@ -68,11 +53,7 @@ def avg_pool(sequence: np.ndarray, window_size: int = 5, stride: int = 1,
     sequence = sequence.reshape(-1, *shape[1:])
     return sequence
 
-def pad_sequence_numpy(sequence: np.ndarray, max_sequence_length: int, 
-                       input_shape: np.array) -> np.ndarray:
-    '''
-    Pools and pads the sequence to uniform length - exact match to PyTorch implementation
-    '''
+def pad_sequence_numpy(sequence: np.ndarray, max_sequence_length: int, input_shape: np.array) -> np.ndarray:
     shape = list(input_shape)
     shape[0] = max_sequence_length
     pooled_sequence = avg_pool(sequence=sequence, max_length=max_sequence_length, shape=input_shape)
@@ -80,191 +61,132 @@ def pad_sequence_numpy(sequence: np.ndarray, max_sequence_length: int,
     new_sequence[:len(pooled_sequence)] = pooled_sequence
     return new_sequence
 
-def sliding_window(data: Dict[str, np.ndarray], clearing_time_index: int, max_time: int, 
-                   sub_window_size: int, stride_size: int, label: int) -> Dict[str, np.ndarray]:
-    '''
-    Sliding Window - exact match to PyTorch implementation
-    '''
-    assert clearing_time_index >= sub_window_size - 1, "Clearing value needs to be greater or equal to (window size - 1)"
-    start = clearing_time_index - sub_window_size + 1 
+def quaternion_to_euler(q: np.ndarray) -> np.ndarray:
+    # Simple quaternion to euler conversion without requiring ahrs
+    x, y, z, w = q[1], q[2], q[3], q[0]
+    t0 = 2.0 * (w * x + y * z)
+    t1 = 1.0 - 2.0 * (x * x + y * y)
+    roll = np.arctan2(t0, t1)
+    
+    t2 = 2.0 * (w * y - z * x)
+    t2 = np.clip(t2, -1.0, 1.0)
+    pitch = np.arcsin(t2)
+    
+    t3 = 2.0 * (w * z + x * y)
+    t4 = 1.0 - 2.0 * (y * y + z * z)
+    yaw = np.arctan2(t3, t4)
+    
+    return np.array([roll, pitch, yaw]) * 180.0 / np.pi  # Convert to degrees
 
-    if max_time >= data['skeleton'].shape[0]-sub_window_size:
-        max_time = max_time - sub_window_size + 1
-
-    sub_windows = (
-        start + 
-        np.expand_dims(np.arange(sub_window_size), 0) + 
-        np.expand_dims(np.arange(max_time, step=stride_size), 0).T
-    )
-    
-    result = {}
-    for key in data.keys():
-        if key != 'labels':
-            result[key] = data[key][sub_windows]
-    
-    result['labels'] = np.repeat(label, len(result[list(result.keys())[0]]))
-    return result
-
-def selective_sliding_window(data: Dict[str, np.ndarray], length: int, window_size: int, 
-                            stride_size: int, height: float, distance: int, 
-                            label: int, fuse: bool) -> Dict[str, np.ndarray]:
-    '''
-    Selective sliding window - exact match to PyTorch implementation
-    '''
-    # Extract accelerometer data for peak detection
-    if 'accelerometer' in data:
-        acc_data = data['accelerometer']
-    else:
-        # Return empty result if no accelerometer data
-        return {k: np.array([]) for k in data.keys()}
-    
-    # Calculate signal magnitude
-    sqrt_sum = np.sqrt(np.sum(acc_data**2, axis=1))
-    
-    # Find peaks
-    peaks, _ = find_peaks(sqrt_sum, height=height, distance=distance)
-    
-    # Create sliding windows around peaks
-    windowed_data = defaultdict(list)
-    
-    for modality, modality_data in data.items():
-        if modality == 'labels':
-            continue
-            
-        windows = []
-        for peak in peaks:
-            start = max(0, peak - window_size//2)
-            end = min(len(modality_data), start + window_size)
-            
-            # Skip if window is too small
-            if end - start < window_size:
-                continue
-                
-            windows.append(modality_data[start:end])
-        
-        if windows:
-            windowed_data[modality] = np.stack(windows)
-    
-    # Fuse inertial data if requested
-    if fuse and set(("accelerometer", "gyroscope")).issubset(windowed_data):
-        windowed_data = fuse_inertial_data(windowed_data, window_size)
-    
-    # Add labels
-    if windowed_data:
-        sample_modality = next(iter(windowed_data.keys()))
-        windowed_data['labels'] = np.repeat(label, len(windowed_data[sample_modality]))
-    
-    return windowed_data
-
-def fuse_inertial_data(data: Dict[str, np.ndarray], window_size: int) -> Dict[str, np.ndarray]:
-    '''
-    Fusion of inertial data - exact match to PyTorch implementation
-    '''
-    from ahrs.filters import Madgwick
-    
-    q = np.array([1, 0, 0, 0], dtype=np.float64)
-    quaternions = []
+def simple_fuse_inertial_data(data: Dict[str, np.ndarray], window_size: int) -> Dict[str, np.ndarray]:
+    """Simplified fusion that doesn't require ahrs"""
     length = len(data['accelerometer'])
-    madgwick = Madgwick()
-    
-    for i in range(length): 
+    fused_data = []
+    for i in range(length):
         transformed_windows = []
-        for j in range(window_size): 
-            gyro_data = data['gyroscope'][i][j,:]
-            acc_data = data['accelerometer'][i][j,:]
-            q = madgwick.updateIMU(q, acc=acc_data, gyr=gyro_data)
-            euler_angels = quaternion_to_euler(q)
-            transformed_windows.append(euler_angels)
-        quaternions.append(np.array(transformed_windows))
-        
-    data['fused'] = np.array(quaternions)
+        for j in range(window_size):
+            # Just use normalized values of accelerometer as a simple orientation estimation
+            acc_sample = data['accelerometer'][i][j,:]
+            # Simple normalization to get direction
+            norm = np.linalg.norm(acc_sample)
+            if norm > 0:
+                acc_norm = acc_sample / norm
+            else:
+                acc_norm = np.zeros_like(acc_sample)
+            # Convert to pseudo euler angles
+            roll = np.arctan2(acc_norm[1], acc_norm[2]) * 180 / np.pi
+            pitch = np.arctan2(-acc_norm[0], np.sqrt(acc_norm[1]**2 + acc_norm[2]**2)) * 180 / np.pi
+            yaw = 0  # Can't determine yaw from accelerometer alone
+            transformed_windows.append(np.array([roll, pitch, yaw]))
+        fused_data.append(np.array(transformed_windows))
+    data['fused'] = np.array(fused_data)
     return data
 
-def quaternion_to_euler(q: np.ndarray) -> np.ndarray:
-    '''
-    Convert quaternion to Euler angles - exact match to PyTorch implementation
-    '''
-    from scipy.spatial.transform import Rotation
-    rot = Rotation.from_quat(q)
-    return rot.as_euler('xyz', degrees=True)
-
 def filter_data_by_ids(data: np.ndarray, ids: List[int]) -> np.ndarray:
-    '''
-    Index the different modalities with only selected ids - exact match to PyTorch
-    '''
     return data[ids, :]
 
 def filter_repeated_ids(path: List[Tuple[int, int]]) -> Tuple[set, set]:
-    '''
-    Filtering indices those match with multiple other indices - exact match to PyTorch
-    '''
     seen_first = set()
     seen_second = set()
-
-    for (first, second) in path: 
-        if first not in seen_first and second not in seen_second: 
+    for (first, second) in path:
+        if first not in seen_first and second not in seen_second:
             seen_first.add(first)
             seen_second.add(second)
-    
     return seen_first, seen_second
 
-def align_sequence(data: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]: 
-    '''
-    Matching the skeleton and phone data using dynamic time warping - exact match to PyTorch
-    '''
+def align_sequence(data: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
     joint_id = 9
     dynamic_keys = sorted([key for key in data.keys() if key != "skeleton"])
-    
-    # Handle different skeleton data shapes
+    if "skeleton" not in data or not dynamic_keys:
+        return data
     skeleton_data = data['skeleton']
-    if len(skeleton_data.shape) == 4:  # (batch, frames, joints, coords)
+    if len(skeleton_data.shape) == 4:
         skeleton_joint_data = skeleton_data[:, :, joint_id-1, :]
-    elif len(skeleton_data.shape) == 3:  # (frames, joints, coords)
+    elif len(skeleton_data.shape) == 3:
         skeleton_joint_data = skeleton_data[:, joint_id-1, :]
-    else:  # (frames, flattened_features)
+    else:
         skeleton_joint_data = skeleton_data[:, (joint_id-1)*3:joint_id*3]
-    
     inertial_data = data[dynamic_keys[0]]
-    
-    if len(dynamic_keys) > 1: 
+    if len(dynamic_keys) > 1:
         gyroscope_data = data[dynamic_keys[1]]
         min_len = min(inertial_data.shape[0], gyroscope_data.shape[0])
         inertial_data = inertial_data[:min_len, :]
         data[dynamic_keys[1]] = gyroscope_data[:min_len, :]
-
-    # Calculate Frobenius norm
     skeleton_frob_norm = np.linalg.norm(skeleton_joint_data, axis=1)
-    inertial_frob_norm = np.linalg.norm(inertial_data, axis=1)
-    
-    # DTW alignment
-    distance, path = fastdtw(inertial_frob_norm[:, np.newaxis], 
-                             skeleton_frob_norm[:, np.newaxis], 
-                             dist=euclidean)
-
-    # Filter repeated IDs
-    inertial_ids, skeleton_idx = filter_repeated_ids(path)
-    
-    # Apply filtering
+    interial_frob_norm = np.linalg.norm(inertial_data, axis=1)
+    distance, path = fastdtw(interial_frob_norm[:, np.newaxis], skeleton_frob_norm[:, np.newaxis], dist=euclidean)
+    interial_ids, skeleton_idx = filter_repeated_ids(path)
     data['skeleton'] = filter_data_by_ids(data['skeleton'], list(skeleton_idx))
-    for key in dynamic_keys: 
-        data[key] = filter_data_by_ids(data[key], list(inertial_ids))
-    
+    for key in dynamic_keys:
+        data[key] = filter_data_by_ids(data[key], list(interial_ids))
     return data
 
-def butterworth_filter(data: np.ndarray, cutoff: float = 7.5, fs: float = 25, 
-                       order: int = 4, filter_type: str = 'low') -> np.ndarray:
-    '''
-    Function to filter noise - exact match to PyTorch implementation
-    '''
-    nyquist = 0.5 * fs  # Nyquist frequency
-    normal_cutoff = cutoff / nyquist  # Normalized cutoff frequency
+def butterworth_filter(data: np.ndarray, cutoff: float = 7.5, fs: float = 25, order: int = 4, filter_type: str = 'low') -> np.ndarray:
+    nyquist = 0.5 * fs
+    normal_cutoff = cutoff / nyquist
     b, a = butter(order, normal_cutoff, btype=filter_type, analog=False)
     return filtfilt(b, a, data, axis=0)
 
+def sliding_window(data: Dict[str, np.ndarray], clearing_time_index: int, max_time: int, sub_window_size: int, stride_size: int, label: int) -> Dict[str, np.ndarray]:
+    assert clearing_time_index >= sub_window_size - 1, "Clearing value needs to be greater or equal to (window size - 1)"
+    start = clearing_time_index - sub_window_size + 1
+    if max_time >= data['skeleton'].shape[0]-sub_window_size:
+        max_time = max_time - sub_window_size + 1
+    sub_windows = (start + np.expand_dims(np.arange(sub_window_size), 0) + np.expand_dims(np.arange(max_time, step=stride_size), 0).T)
+    result = {}
+    for key in data.keys():
+        if key != 'labels':
+            result[key] = data[key][sub_windows]
+    result['labels'] = np.repeat(label, len(result[list(result.keys())[0]]))
+    return result
+
+def selective_sliding_window(data: Dict[str, np.ndarray], length: int, window_size: int, stride_size: int, height: float, distance: int, label: int, fuse: bool) -> Dict[str, np.ndarray]:
+    if 'accelerometer' not in data:
+        return {k: np.array([]) for k in data.keys()}
+    acc_data = data['accelerometer']
+    sqrt_sum = np.sqrt(np.sum(acc_data**2, axis=1))
+    peaks, _ = find_peaks(sqrt_sum, height=height, distance=distance)
+    windowed_data = defaultdict(list)
+    for modality, modality_data in data.items():
+        if modality == 'labels':
+            continue
+        windows = []
+        for peak in peaks:
+            start = max(0, peak - window_size//2)
+            end = min(len(modality_data), start + window_size)
+            if end - start < window_size:
+                continue
+            windows.append(modality_data[start:end])
+        if windows:
+            windowed_data[modality] = np.stack(windows)
+    if fuse and set(("accelerometer", "gyroscope")).issubset(windowed_data):
+        windowed_data = simple_fuse_inertial_data(windowed_data, window_size)
+    if windowed_data:
+        sample_modality = next(iter(windowed_data.keys()))
+        windowed_data['labels'] = np.repeat(label, len(windowed_data[sample_modality]))
+    return windowed_data
+
 class DatasetBuilder:
-    '''
-    Builds a numpy file for the data and labels - exact match to PyTorch implementation
-    '''
     def __init__(self, dataset: object, mode: str, max_length: int, task: str = 'fd', **kwargs) -> None:
         assert mode in ['avg_pool', 'sliding_window'], f'Unsupported processing method {mode}'
         self.dataset = dataset
@@ -276,160 +198,95 @@ class DatasetBuilder:
         self.fuse = None
         self.diff = []
     
-    def load_file(self, file_path: str) -> np.ndarray:
-        '''Loads a file - exact match to PyTorch implementation'''
+    def load_file(self, file_path):
         loader = self._import_loader(file_path)
         data = loader(file_path, **self.kwargs)
         return data
     
-    def _import_loader(self, file_path: str) -> callable:
-        '''Imports the correct loader for the file type - exact match to PyTorch'''
+    def _import_loader(self, file_path:str) -> callable:
         file_type = file_path.split('.')[-1]
         assert file_type in ['csv', 'mat'], f'Unsupported file type {file_type}'
         return LOADER_MAP[file_type]
     
     def process(self, data: Dict[str, np.ndarray], label: int) -> Dict[str, np.ndarray]:
-        '''Process data - exact match to PyTorch implementation'''
         if self.mode == 'avg_pool':
-            # Use average pooling
             result = {}
             for key, value in data.items():
                 if key != 'labels':
-                    result[key] = pad_sequence_numpy(
-                        sequence=value, 
-                        max_sequence_length=self.max_length,
-                        input_shape=value.shape
-                    )
+                    result[key] = pad_sequence_numpy(sequence=value, max_sequence_length=self.max_length, input_shape=value.shape)
             result['labels'] = data.get('labels', np.array([label]))
             return result
         else:
-            # Use selective sliding window for fall detection
-            if label == 1:  # Fall
-                return selective_sliding_window(
-                    data=data, 
-                    length=data['skeleton'].shape[0],
-                    window_size=self.max_length, 
-                    stride_size=10, 
-                    height=1.4, 
-                    distance=50,
-                    label=label,
-                    fuse=self.fuse
-                )
-            else:  # Non-fall
-                return selective_sliding_window(
-                    data=data, 
-                    length=data['skeleton'].shape[0],
-                    window_size=self.max_length, 
-                    stride_size=10, 
-                    height=1.2, 
-                    distance=100,
-                    label=label,
-                    fuse=self.fuse
-                )
+            if label == 1:
+                return selective_sliding_window(data=data, length=data['skeleton'].shape[0], window_size=self.max_length,
+                                              stride_size=10, height=1.4, distance=50, label=label, fuse=self.fuse)
+            else:
+                return selective_sliding_window(data=data, length=data['skeleton'].shape[0], window_size=self.max_length,
+                                              stride_size=10, height=1.2, distance=100, label=label, fuse=self.fuse)
     
-    def _add_trial_data(self, trial_data: Dict[str, np.ndarray]) -> None:
-        '''Add processed trial data to the dataset - exact match to PyTorch'''
+    def _add_trial_data(self, trial_data):
         for modality, modality_data in trial_data.items():
             self.data[modality].append(modality_data)
     
-    def _len_check(self, d: Dict[str, np.ndarray]) -> bool:
-        '''Check if all arrays have length > 1 - exact match to PyTorch'''
+    def _len_check(self, d):
         return all(len(v) > 1 for v in d.values())
     
-    def get_size_diff(self, trial_data: Dict[str, np.ndarray]) -> int:
-        '''Get difference in size between accelerometer and skeleton - exact match to PyTorch'''
+    def get_size_diff(self, trial_data):
         return trial_data['accelerometer'].shape[0] - trial_data['skeleton'].shape[0]
     
-    def store_trial_diff(self, difference: int) -> None:
-        '''Store difference in trial sizes - exact match to PyTorch'''
+    def store_trial_diff(self, difference):
         self.diff.append(difference)
     
-    def viz_trial_diff(self) -> None:
-        '''Visualize trial differences - exact match to PyTorch'''
-        plt.hist(self.diff, bins=range(min(self.diff), max(self.diff) + 2, 200), 
-                edgecolor='black', alpha=0.7)
-        plt.xlabel("Value")
-        plt.ylabel("Frequency")
-        plt.title("Distribution of Numbers")
-        plt.savefig("Distribution.png")
-    
-    def select_subwindow_pandas(self, unimodal_data: np.ndarray) -> np.ndarray:
-        '''Select subwindow with pandas - exact match to PyTorch'''
+    def select_subwindow_pandas(self, unimodal_data):
         import pandas as pd
         n = len(unimodal_data)
         magnitude = np.linalg.norm(unimodal_data, axis=1)
         df = pd.DataFrame({"values": magnitude})
         df["variance"] = df["values"].rolling(window=125).var()
-        
-        # Get index of highest variance
         max_idx = df["variance"].idxmax()
-        
-        # Get segment
         final_start = max(0, max_idx-100)
         final_end = min(n, max_idx + 100)
         return unimodal_data[final_start:final_end, :]
     
     def make_dataset(self, subjects: List[int], fuse: bool) -> None:
-        '''Reads all files and makes a numpy array - exact match to PyTorch'''
         self.data = defaultdict(list)
         self.fuse = fuse
-        count = 0
-        
         for trial in self.dataset.matched_trials:
             if trial.subject_id in subjects:
-                # Determine label based on task
-                if self.task == 'fd': 
+                if self.task == 'fd':
                     label = int(trial.action_id > 9)
                 elif self.task == 'age':
                     label = int(trial.subject_id < 29 or trial.subject_id > 46)
                 else:
                     label = trial.action_id - 1
-                
                 trial_data = defaultdict(np.ndarray)
-                executed = False
-                
-                # Load data for each modality
+                executed = True
                 for modality, file_path in trial.files.items():
                     keys = self.kwargs.get('keys', None)
                     key = None
                     if keys:
                         key = keys[modality.lower()]
-                    
-                    try: 
-                        executed = True
+                    try:
                         unimodal_data = self.load_file(file_path)
                         if unimodal_data is None:
                             executed = False
                             break
-                            
                         trial_data[modality] = unimodal_data
-                        
-                        # Apply filters and preprocessing
                         if modality == 'accelerometer':
-                            trial_data[modality] = butterworth_filter(unimodal_data, cutoff=7.5, fs=25)
-                            if unimodal_data.shape[0] > 250:
-                                trial_data[modality] = self.select_subwindow_pandas(trial_data[modality])
+                            unimodal_data = butterworth_filter(unimodal_data, cutoff=7.5, fs=25)
+                        if modality == 'accelerometer' and unimodal_data.shape[0] > 250:
+                            trial_data[modality] = self.select_subwindow_pandas(unimodal_data)
                     except Exception as e:
                         executed = False
                         logging.error(f"Error processing {modality} from {file_path}: {e}")
-                
-                # Only continue if data loading was successful
-                if executed and len(trial_data) >= 2:  # Need at least 2 modalities
-                    # Apply DTW alignment
+                if executed and len(trial_data) >= 2:
                     try:
                         trial_data = align_sequence(trial_data)
-                        # Apply sliding window or avg pool
                         trial_data = self.process(trial_data, label)
-                        
-                        # Add to dataset if valid
                         if self._len_check(trial_data):
                             self._add_trial_data(trial_data)
                     except Exception as e:
                         logging.error(f"Error in alignment/processing: {e}")
-                
-                count += 1
-        
-        # Concatenate data
         for key in self.data:
             if len(self.data[key]) > 0:
                 try:
@@ -437,43 +294,32 @@ class DatasetBuilder:
                 except Exception as e:
                     logging.error(f"Error concatenating {key}: {e}")
     
-    def random_resampling(self) -> None:
-        '''Random resampling for class balance - exact match to PyTorch'''
-        from imblearn.under_sampling import RandomUnderSampler
-        
-        ros = RandomUnderSampler(sampling_strategy='auto', random_state=42)
-        
-        # Flatten arrays for resampling
-        num_samples = len(self.data['labels'])
-        flattened_data = {}
-        original_shapes = {}
-        
-        for key, value in self.data.items():
-            if key != 'labels':
-                original_shapes[key] = value.shape[1:]
-                flattened_data[key] = value.reshape(num_samples, -1)
-        
-        # Apply resampling
-        resampled_data = {}
-        resampled_labels = None
-        
-        for key, value in flattened_data.items():
-            if resampled_labels is None:
-                resampled_value, resampled_labels = ros.fit_resample(value, self.data['labels'])
-            else:
-                resampled_value, _ = ros.fit_resample(value, self.data['labels'])
-            
-            # Reshape back to original shape
-            resampled_data[key] = resampled_value.reshape(-1, *original_shapes[key])
-        
-        # Update data
-        for key, value in resampled_data.items():
-            self.data[key] = value
-        
-        self.data['labels'] = resampled_labels
+    def random_resampling(self):
+        try:
+            from imblearn.under_sampling import RandomUnderSampler
+            ros = RandomUnderSampler(sampling_strategy='auto', random_state=42)
+            num_samples = len(self.data['labels'])
+            flattened_data = {}
+            original_shapes = {}
+            for key, value in self.data.items():
+                if key != 'labels':
+                    original_shapes[key] = value.shape[1:]
+                    flattened_data[key] = value.reshape(num_samples, -1)
+            resampled_data = {}
+            resampled_labels = None
+            for key, value in flattened_data.items():
+                if resampled_labels is None:
+                    resampled_value, resampled_labels = ros.fit_resample(value, self.data['labels'])
+                else:
+                    resampled_value, _ = ros.fit_resample(value, self.data['labels'])
+                resampled_data[key] = resampled_value.reshape(-1, *original_shapes[key])
+            for key, value in resampled_data.items():
+                self.data[key] = value
+            self.data['labels'] = resampled_labels
+        except ImportError:
+            logging.warning("imblearn not available, skipping resampling")
     
     def normalization(self) -> Dict[str, np.ndarray]:
-        '''Normalize data - exact match to PyTorch'''
         for key, value in self.data.items():
             if key != 'labels':
                 num_samples, length = value.shape[:2]
@@ -481,27 +327,14 @@ class DatasetBuilder:
                 self.data[key] = norm_data.reshape(num_samples, length, -1)
         return self.data
 
-# Main dataset classes
 class ModalityFile:
-    '''
-    Represents an individual file in a modality - exact match to PyTorch implementation
-    '''
     def __init__(self, subject_id: int, action_id: int, sequence_number: int, file_path: str) -> None:
         self.subject_id = subject_id
         self.action_id = action_id
         self.sequence_number = sequence_number
         self.file_path = file_path
 
-    def __repr__(self) -> str:
-        return (
-            f"ModalityFile(subject_id={self.subject_id}, action_id={self.action_id}, "
-            f"sequence_number={self.sequence_number}, file_path='{self.file_path}')"
-        )
-
 class Modality:
-    '''
-    Represents a modality - exact match to PyTorch implementation
-    '''
     def __init__(self, name: str) -> None:
         self.name = name
         self.files: List[ModalityFile] = []
@@ -509,14 +342,8 @@ class Modality:
     def add_file(self, subject_id: int, action_id: int, sequence_number: int, file_path: str) -> None:
         modality_file = ModalityFile(subject_id, action_id, sequence_number, file_path)
         self.files.append(modality_file)
-    
-    def __repr__(self) -> str:
-        return f"Modality(name='{self.name}', files={self.files})"
 
 class MatchedTrial:
-    """
-    Represents a matched trial - exact match to PyTorch implementation
-    """
     def __init__(self, subject_id: int, action_id: int, sequence_number: int) -> None:
         self.subject_id = subject_id
         self.action_id = action_id
@@ -525,30 +352,17 @@ class MatchedTrial:
     
     def add_file(self, modality_name: str, file_path: str) -> None:
         self.files[modality_name] = file_path
-    
-    def __repr__(self) -> str:
-        return (
-            f"MatchedTrial(subject_id={self.subject_id}, action_id={self.action_id}, "
-            f"sequence_number={self.sequence_number}, files={self.files})"
-        )
 
 class SmartFallMM:
-    """
-    Represents the SmartFallMM dataset - exact match to PyTorch implementation
-    """
     def __init__(self, root_dir: str) -> None:
         self.root_dir = root_dir
-        self.age_groups: Dict[str, Dict[str, Modality]] = {
-            "old": {},
-            "young": {}
-        }
+        self.age_groups: Dict[str, Dict[str, Modality]] = {"old": {}, "young": {}}
         self.matched_trials: List[MatchedTrial] = []
         self.selected_sensors: Dict[str, str] = {}
     
     def add_modality(self, age_group: str, modality_name: str) -> None:
         if age_group not in self.age_groups:
             raise ValueError(f"Invalid age group: {age_group}")
-        
         self.age_groups[age_group][modality_name] = Modality(modality_name)
     
     def select_sensor(self, modality_name: str, sensor_name: str = None) -> None:
@@ -564,11 +378,9 @@ class SmartFallMM:
                     if not sensor_name:
                         continue
                     modality_dir = os.path.join(self.root_dir, age_group, modality_name, sensor_name)
-                
                 if not os.path.exists(modality_dir):
                     logging.warning(f"Directory not found: {modality_dir}")
                     continue
-                
                 for root, _, files in os.walk(modality_dir):
                     for file in files:
                         if file.endswith('.csv'):
@@ -580,47 +392,28 @@ class SmartFallMM:
                                 modality.add_file(subject_id, action_id, sequence_number, file_path)
                             except Exception as e:
                                 logging.warning(f"Error parsing file {file}: {e}")
-                
-                logging.info(f"Loaded {len(modality.files)} files for {modality_name} in {age_group}")
     
     def match_trials(self) -> None:
-        '''Matches files from different modalities - exact match to PyTorch'''
+        trial_dict = {}
         for age_group, modalities in self.age_groups.items():
             for modality_name, modality in modalities.items():
                 for modality_file in modality.files:
-                    matched_trial = self._find_or_create_matched_trial(
-                        modality_file.subject_id,
-                        modality_file.action_id,
-                        modality_file.sequence_number
-                    )
-                    matched_trial.add_file(modality_name, modality_file.file_path)
-        
-        # Count trials with all required modalities
-        required_modalities = set()
-        for age_group, modalities in self.age_groups.items():
-            for modality_name in modalities.keys():
-                required_modalities.add(modality_name)
-        
+                    key = (modality_file.subject_id, modality_file.action_id, modality_file.sequence_number)
+                    if key not in trial_dict:
+                        trial_dict[key] = {}
+                    trial_dict[key][modality_name] = modality_file.file_path
+        required_modalities = list(self.age_groups['young'].keys())
         complete_trials = []
-        for trial in self.matched_trials:
-            if all(modality in trial.files for modality in required_modalities):
-                complete_trials.append(trial)
-        
+        for key, files_dict in trial_dict.items():
+            if all(modality in files_dict for modality in required_modalities):
+                subject_id, action_id, sequence_number = key
+                matched_trial = MatchedTrial(subject_id, action_id, sequence_number)
+                for modality_name, file_path in files_dict.items():
+                    matched_trial.add_file(modality_name, file_path)
+                complete_trials.append(matched_trial)
         self.matched_trials = complete_trials
-        logging.info(f"Found {len(self.matched_trials)} complete matched trials")
     
-    def _find_or_create_matched_trial(self, subject_id: int, action_id: int, sequence_number: int) -> MatchedTrial:
-        for trial in self.matched_trials:
-            if (trial.subject_id == subject_id and trial.action_id == action_id 
-                    and trial.sequence_number == sequence_number):
-                return trial
-        
-        new_trial = MatchedTrial(subject_id, action_id, sequence_number)
-        self.matched_trials.append(new_trial)
-        return new_trial
-    
-    def pipe_line(self, age_group: List[str], modalities: List[str], sensors: List[str]) -> None:
-        '''Complete data pipeline - exact match to PyTorch'''
+    def pipe_line(self, age_group: List[str], modalities: List[str], sensors: List[str]):
         for age in age_group:
             for modality in modalities:
                 self.add_modality(age, modality)
@@ -629,14 +422,14 @@ class SmartFallMM:
                 else:
                     for sensor in sensors:
                         self.select_sensor(modality, sensor)
-        
         self.load_files()
         self.match_trials()
 
-# Helper functions for SmartFallMM dataset
 def prepare_smartfallmm_tf(arg) -> DatasetBuilder:
-    '''Function for dataset preparation - exact match to PyTorch'''
-    sm_dataset = SmartFallMM(root_dir=os.path.join(os.getcwd(), 'data/smartfallmm'))
+    data_dir = os.path.join(os.getcwd(), 'data/smartfallmm')
+    if not os.path.exists(data_dir):
+        data_dir = os.path.join(os.path.dirname(os.getcwd()), 'data/smartfallmm')
+    sm_dataset = SmartFallMM(root_dir=data_dir)
     sm_dataset.pipe_line(
         age_group=arg.dataset_args['age_group'],
         modalities=arg.dataset_args['modalities'],
@@ -651,137 +444,6 @@ def prepare_smartfallmm_tf(arg) -> DatasetBuilder:
     return builder
 
 def split_by_subjects_tf(builder: DatasetBuilder, subjects: List[int], fuse: bool) -> Dict[str, np.ndarray]:
-    '''Function to filter by subjects - exact match to PyTorch'''
     builder.make_dataset(subjects, fuse)
     norm_data = builder.normalization()
     return norm_data
-
-# TensorFlow-specific dataset class for batching
-class UTD_MM_TF(tf.keras.utils.Sequence):
-    '''TensorFlow data feeder compatible with PyTorch UTD_MM'''
-    def __init__(self, dataset, batch_size, use_smv=False):
-        self.batch_size = batch_size
-        self.dataset = dataset
-        self.use_smv = use_smv
-
-        # Extract data
-        self.acc_data = dataset.get('accelerometer', None)
-        self.skl_data = dataset.get('skeleton', None)
-        self.labels = dataset.get('labels', None)
-
-        # Validate data
-        if self.acc_data is None or len(self.acc_data) == 0:
-            logging.warning("No accelerometer data in dataset")
-            self.acc_data = np.zeros((1, 64, 3), dtype=np.float32)
-            self.num_samples = 1
-        else:
-            self.num_samples = self.acc_data.shape[0]
-
-        if self.labels is None or len(self.labels) == 0:
-            logging.warning("No labels found, using zeros")
-            self.labels = np.zeros(self.num_samples, dtype=np.int32)
-
-        # Process and prepare data
-        self._prepare_data()
-        
-        # Store indices for more reliable batch generation
-        self.indices = np.arange(self.num_samples)
-
-    def _prepare_data(self):
-        '''Prepare data for TensorFlow - compatible with PyTorch'''
-        try:
-            # Convert to TensorFlow tensors
-            self.acc_data = tf.convert_to_tensor(self.acc_data, dtype=tf.float32)
-            self.labels = tf.convert_to_tensor(self.labels, dtype=tf.int32)
-
-            # Calculate signal magnitude vector (SMV) if requested
-            if self.use_smv:
-                mean = tf.reduce_mean(self.acc_data, axis=1, keepdims=True)
-                zero_mean = self.acc_data - mean
-                sum_squared = tf.reduce_sum(tf.square(zero_mean), axis=-1, keepdims=True)
-                self.smv = tf.sqrt(sum_squared)
-
-            # Convert skeleton data if available
-            if self.skl_data is not None and len(self.skl_data) > 0:
-                self.skl_data = tf.convert_to_tensor(self.skl_data, dtype=tf.float32)
-                
-            # Log shapes for debugging
-            logging.info(f"Prepared accelerometer data shape: {self.acc_data.shape}")
-            if hasattr(self, 'smv'):
-                logging.info(f"Prepared SMV data shape: {self.smv.shape}")
-            if hasattr(self, 'skl_data'):
-                logging.info(f"Prepared skeleton data shape: {self.skl_data.shape}")
-                
-        except Exception as e:
-            logging.error(f"Error preparing data: {e}")
-            logging.error(traceback.format_exc())
-            # Create fallback tensors
-            self.acc_seq = self.acc_data.shape[1] if hasattr(self, 'acc_data') and len(self.acc_data.shape) > 1 else 64
-            if self.use_smv:
-                self.smv = tf.zeros((self.num_samples, self.acc_seq, 1), dtype=tf.float32)
-
-    def __len__(self):
-        '''Number of batches - compatible with PyTorch'''
-        return (self.num_samples + self.batch_size - 1) // self.batch_size
-
-    def __getitem__(self, idx):
-        '''Get a batch - compatible with PyTorch'''
-        try:
-            start_idx = idx * self.batch_size
-            end_idx = min(start_idx + self.batch_size, self.num_samples)
-
-            # Ensure valid range (fix for the tf.range error)
-            if start_idx >= self.num_samples:
-                start_idx = 0
-                end_idx = min(self.batch_size, self.num_samples)
-
-            # Use stored indices for batch generation
-            batch_indices = self.indices[start_idx:end_idx]
-            tf_indices = tf.convert_to_tensor(batch_indices)
-
-            # Create batch data
-            batch_data = {}
-
-            # Add accelerometer data (with or without SMV)
-            batch_acc = tf.gather(self.acc_data, tf_indices)
-            if self.use_smv:
-                batch_smv = tf.gather(self.smv, tf_indices)
-                batch_data['accelerometer'] = tf.concat([batch_smv, batch_acc], axis=-1)
-            else:
-                batch_data['accelerometer'] = batch_acc
-
-            # Add skeleton if available
-            if hasattr(self, 'skl_data') and self.skl_data is not None and len(self.skl_data) > 0:
-                batch_data['skeleton'] = tf.gather(self.skl_data, tf_indices)
-
-            # Get labels
-            batch_labels = tf.gather(self.labels, tf_indices)
-
-            # For debugging the first batch of the first epoch
-            if idx == 0:
-                for key, value in batch_data.items():
-                    logging.info(f"First batch {key} shape: {value.shape}")
-                logging.info(f"First batch labels shape: {batch_labels.shape}")
-
-            return batch_data, batch_labels, batch_indices
-
-        except Exception as e:
-            logging.error(f"Error in batch generation {idx}: {e}")
-            logging.error(traceback.format_exc())
-            # Return dummy data in case of error
-            batch_size = min(self.batch_size, self.num_samples)
-            acc_seq = getattr(self, 'acc_seq', 64)
-            channels = 4 if self.use_smv else 3
-
-            dummy_acc = tf.zeros((batch_size, acc_seq, channels), dtype=tf.float32)
-            dummy_data = {'accelerometer': dummy_acc}
-            dummy_labels = tf.zeros(batch_size, dtype=tf.int32)
-            dummy_indices = np.arange(batch_size)
-
-            return dummy_data, dummy_labels, dummy_indices
-
-    def on_epoch_end(self):
-        '''Called at the end of each epoch - allows shuffling'''
-        # Optionally shuffle indices for next epoch
-        # np.random.shuffle(self.indices)
-        pass
