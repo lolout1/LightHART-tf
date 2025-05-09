@@ -22,7 +22,7 @@ dataset_args:
   modalities: ['accelerometer', 'skeleton']
   age_group: ['young']
   sensors: ['watch']
-  use_dtw: true
+  use_dtw: false 
   verbose: false
 
 # Specify the correct feeder path
