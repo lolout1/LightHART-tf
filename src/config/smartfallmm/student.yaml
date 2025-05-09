@@ -20,7 +20,7 @@ dataset_args:
   mode: 'sliding_window'
   max_length: 128
   task: 'fd'
-  modalities: ['accelerometer', 'skeleton']  # Both modalities needed for proper processing
+  modalities: ['accelerometer']  # Both modalities needed for proper processing
   age_group: ['young']
   sensors: ['watch']
   use_dtw: true  # Can toggle between true/false

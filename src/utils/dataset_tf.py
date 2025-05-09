@@ -2,20 +2,18 @@
 # -*- coding: utf-8 -*-
 """
 dataset_tf.py - TensorFlow dataset loader for SmartFallMM
-Complete implementation with robust error handling
+Exact match to PyTorch implementation with robust error handling
 """
 
 import os
 import logging
-import traceback
-from typing import List, Dict, Tuple, Any
+from typing import List, Dict, Any
 import numpy as np
-import tensorflow as tf
-from collections import defaultdict, Counter
+from collections import defaultdict
 from sklearn.preprocessing import StandardScaler
-import matplotlib.pyplot as plt
+import tensorflow as tf
 
-# Import processor functions
+# Import the fixed processor functions
 from utils.processor_tf import (
     butterworth_filter, 
     pad_sequence_tf, 
@@ -23,21 +21,11 @@ from utils.processor_tf import (
     selective_windowing
 )
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger('dataset-tf')
-
-# Constants 
-SAMPLING_RATE = 25  # Hz - Must match PyTorch implementation
-JOINT_ID_FOR_ALIGNMENT = 9  # Left wrist joint for alignment
-BUTTERWORTH_CUTOFF = 7.5  # Hz for low-pass filter
-BUTTERWORTH_ORDER = 4  # Filter order
-
-# ===== File Loading Functions =====
 
 def csvloader(file_path: str, **kwargs) -> np.ndarray:
     """
-    Load CSV sensor data with format matching PyTorch implementation.
+    Load CSV sensor data with format exactly matching PyTorch implementation.
     
     Args:
         file_path: Path to CSV file
@@ -52,67 +40,54 @@ def csvloader(file_path: str, **kwargs) -> np.ndarray:
         # Determine if this is skeleton data
         is_skeleton = 'skeleton' in file_path.lower()
         
-        # Try reading file
         try:
-            # First attempt with default settings
-            df = pd.read_csv(file_path, index_col=False, on_bad_lines='skip')
+            # First attempt - standard CSV loading
+            df = pd.read_csv(file_path, index_col=False, header=0)
+            
+            # Handle missing data
+            df = df.dropna().bfill()
             
             # Extract correct columns
             if is_skeleton:
-                # For skeleton data, take the last 96 columns (32 joints x 3 coordinates)
-                num_cols = df.shape[1]
-                data_cols = 96 if num_cols >= 96 else num_cols
-                activity_data = df.iloc[2:, -data_cols:].to_numpy(dtype=np.float32)
+                # For skeleton data (32 joints × 3 coords = 96 columns)
+                cols = 96
+                activity_data = df.iloc[2:, -cols:].to_numpy(dtype=np.float32)
+                
+                # Reshape to (frames, joints, coords) if needed
+                if activity_data.shape[1] == 96:
+                    frames = activity_data.shape[0]
+                    activity_data = activity_data.reshape(frames, 32, 3)
+                    logger.info(f"Reshaped skeleton data from {activity_data.shape} to {activity_data.shape}")
             else:
-                # For accelerometer/gyroscope data (last 3 columns: x, y, z)
+                # For accelerometer/gyroscope data (3 columns: x, y, z)
                 activity_data = df.iloc[2:, -3:].to_numpy(dtype=np.float32)
         
         except Exception as e:
-            # First approach failed, try alternative parsing
-            logger.warning(f"Standard CSV parsing failed for {file_path}. Trying alternative approach.")
+            logger.warning(f"Standard CSV parsing failed: {e}. Trying alternative approaches...")
             
-            # Check for semicolon delimiter
-            with open(file_path, 'r') as f:
-                first_line = f.readline().strip()
-                if ';' in first_line:
-                    # Parse with semicolon delimiter
-                    df = pd.read_csv(file_path, sep=';', header=None, on_bad_lines='skip')
-                    
-                    # Extract data - semicolon format typically has timestamp in column 0
-                    if df.shape[1] >= 4:
-                        activity_data = df.iloc[:, 1:4].astype(np.float32).to_numpy()
+            try:
+                # Try with no header and different indexing
+                df = pd.read_csv(file_path, header=None)
+                
+                if is_skeleton:
+                    # For skeleton data
+                    if df.shape[1] >= 96:
+                        activity_data = df.iloc[2:, -96:].to_numpy(dtype=np.float32)
+                        frames = activity_data.shape[0]
+                        activity_data = activity_data.reshape(frames, 32, 3)
                     else:
-                        logger.warning(f"Not enough columns in CSV: {df.shape[1]}")
-                        return np.array([])
+                        activity_data = df.iloc[2:, :].to_numpy(dtype=np.float32)
                 else:
-                    # Last attempt - try more aggressive skipping of initial rows
-                    df = pd.read_csv(file_path, index_col=False, header=None, on_bad_lines='skip')
-                    df = df.iloc[2:]  # Skip first two rows regardless
-                    
-                    if is_skeleton:
-                        if df.shape[1] >= 96:
-                            activity_data = df.iloc[:, -96:].to_numpy(dtype=np.float32)
-                        else:
-                            activity_data = df.iloc[:, :].to_numpy(dtype=np.float32)
-                    else:
-                        if df.shape[1] >= 3:
-                            activity_data = df.iloc[:, -3:].to_numpy(dtype=np.float32)
-                        else:
-                            # Not enough columns
-                            logger.warning(f"CSV file has insufficient columns: {df.shape[1]}")
-                            return np.array([])
+                    # For accelerometer data
+                    activity_data = df.iloc[2:, -3:].to_numpy(dtype=np.float32)
+            except Exception as e2:
+                logger.error(f"All CSV parsing attempts failed: {e2}")
+                return np.array([])
         
-        # Handle empty result
-        if activity_data.size == 0 or len(activity_data) < 5:
-            logger.warning(f"Empty or very small dataset from {file_path}")
-            return np.array([])
-        
-        # Apply Butterworth filter to accelerometer/gyroscope data
+        # Filter accelerometer data
         if not is_skeleton and len(activity_data) > 30:
             try:
-                activity_data = butterworth_filter(activity_data, 
-                                                 cutoff=BUTTERWORTH_CUTOFF, 
-                                                 fs=SAMPLING_RATE)
+                activity_data = butterworth_filter(activity_data, cutoff=7.5, fs=25)
             except Exception as e:
                 logger.warning(f"Butterworth filtering failed: {e}")
         
@@ -145,9 +120,7 @@ def matloader(file_path: str, **kwargs) -> np.ndarray:
         
         # Apply filtering for inertial data
         if key == 'd_iner' and data.shape[0] > 30:
-            data = butterworth_filter(data, 
-                                     cutoff=BUTTERWORTH_CUTOFF, 
-                                     fs=SAMPLING_RATE)
+            data = butterworth_filter(data, cutoff=7.5, fs=25)
         
         logger.info(f"Loaded MAT file {file_path}: shape={data.shape}")
         return data
@@ -161,8 +134,6 @@ LOADER_MAP = {
     'csv': csvloader,
     'mat': matloader
 }
-
-# ===== Dataset Classes =====
 
 class ModalityFile:
     """Represents a file for a specific modality."""
@@ -196,9 +167,9 @@ class SmartFallMM:
     """Manager for SmartFall multimodal dataset."""
     def __init__(self, root_dir: str) -> None:
         self.root_dir = root_dir
-        self.age_groups: Dict[str, Dict[str, Modality]] = {"old": {}, "young": {}}
-        self.matched_trials: List[MatchedTrial] = []
-        self.selected_sensors: Dict[str, str] = {}
+        self.age_groups = {"old": {}, "young": {}}
+        self.matched_trials = []
+        self.selected_sensors = {}
     
     def add_modality(self, age_group: str, modality_name: str) -> None:
         """Add a modality to track."""
@@ -235,7 +206,7 @@ class SmartFallMM:
                     for file in files:
                         if file.endswith(('.csv', '.mat')):
                             try:
-                                # Parse file name - format: S##A##T##.csv/mat
+                                # Parse file name format: S##A##T##.ext
                                 subject_id = int(file[1:3])
                                 action_id = int(file[4:6])
                                 sequence_number = int(file[7:9])
@@ -250,7 +221,7 @@ class SmartFallMM:
         
         logger.info(f"Total files loaded: {total_files}")
     
-    def match_trials(self, required_modalities=None) -> None:
+    def match_trials(self) -> None:
         """Match files across modalities."""
         trial_dict = {}
         
@@ -263,12 +234,8 @@ class SmartFallMM:
                         trial_dict[key] = {}
                     trial_dict[key][modality_name] = modality_file.file_path
         
-        # Determine required modalities
-        if required_modalities is None:
-            # Default to requiring only accelerometer if available
-            required_modalities = ['accelerometer']
-        
         # Create matched trials
+        required_modalities = ['accelerometer', 'skeleton']
         complete_trials = []
         partial_trials = 0
         
@@ -291,7 +258,7 @@ class SmartFallMM:
         logger.info(f"Matched {len(complete_trials)} complete trials across modalities")
         logger.info(f"Skipped {partial_trials} incomplete trials lacking required modalities")
     
-    def pipeline(self, age_group: List[str], modalities: List[str], sensors: List[str]):
+    def pipeline(self, age_group, modalities, sensors):
         """Run the full data pipeline."""
         # Add modalities for each age group
         for age in age_group:
@@ -307,7 +274,7 @@ class SmartFallMM:
         
         # Load and match files
         self.load_files()
-        self.match_trials(modalities)
+        self.match_trials()
 
 class DatasetBuilder:
     """Builds datasets for training/validation/testing."""
@@ -339,10 +306,10 @@ class DatasetBuilder:
         except Exception as e:
             logger.error(f"Error loading file {file_path}: {e}")
             return None
-    
+
     def make_dataset(self, subjects: List[int], fuse: bool) -> None:
         """
-        Build dataset for specified subjects
+        Build dataset for specified subjects - EXACT match to PyTorch implementation
         
         Args:
             subjects: List of subject IDs to include
@@ -394,41 +361,31 @@ class DatasetBuilder:
                     data = self.load_file(file_path, key=key)
                     
                     if data is not None and len(data) > 10:  # Skip very short sequences
-                        # Handle skeleton data format
-                        if modality == 'skeleton' and len(data.shape) == 2 and data.shape[1] % 3 == 0:
-                            joints = data.shape[1] // 3
-                            data = data.reshape(data.shape[0], joints, 3)
-                            logger.info(f"Reshaped skeleton data from {data.shape} to {data.shape}")
-                        
                         trial_data[modality] = data
                 
                 # Skip if missing key modalities
-                req_modalities = self.kwargs.get('required_modalities', ['accelerometer'])
-                if not all(m in trial_data for m in req_modalities):
-                    missing = [m for m in req_modalities if m not in trial_data]
+                if not all(m in trial_data for m in ['accelerometer', 'skeleton']):
+                    missing = [m for m in ['accelerometer', 'skeleton'] if m not in trial_data]
                     if self.verbose:
                         logger.warning(f"Trial {trial.subject_id}-{trial.action_id}-{trial.sequence_number} "
                                       f"missing required modalities: {missing}")
                     continue
                 
-                # Apply DTW alignment if configured and multiple modalities present
-                multi_modal = 'skeleton' in trial_data and 'accelerometer' in trial_data
-                
-                if multi_modal:
-                    trial_data = align_sequence_dtw(trial_data, 
-                                              joint_id=JOINT_ID_FOR_ALIGNMENT,
-                                              use_dtw=self.use_dtw)
+                # Apply DTW alignment between modalities - EXACT match to PyTorch implementation
+                aligned_data = align_sequence_dtw(trial_data, 
+                                               joint_id=9,
+                                               use_dtw=self.use_dtw)
                 
                 # Process data based on mode
                 if self.mode == 'avg_pool':
                     # Simple padding/pooling
                     result = {}
-                    for key, value in trial_data.items():
+                    for key, value in aligned_data.items():
                         result[key] = pad_sequence_tf(value, self.max_length)
                     result['labels'] = np.array([label])
                 else:
-                    # Selective sliding window
-                    result = selective_windowing(trial_data, self.max_length, label)
+                    # Selective sliding window - EXACT match to PyTorch implementation
+                    result = selective_windowing(aligned_data, self.max_length, label)
                 
                 # Add to dataset if valid
                 if result and len(result.get('labels', [])) > 0:
@@ -439,45 +396,45 @@ class DatasetBuilder:
                 
             except Exception as e:
                 logger.error(f"Error processing trial {trial.subject_id}-{trial.action_id}-{trial.sequence_number}: {e}")
-                traceback.print_exc()
+                import traceback
+                logger.error(traceback.format_exc())
         
         # Concatenate data for each modality
         for key in list(self.data.keys()):
             if len(self.data[key]) > 0:
                 try:
-                    # Concatenate arrays
-                    self.data[key] = np.concatenate(self.data[key], axis=0)
+                    # Check for consistent shapes before concatenating
+                    first_shape = self.data[key][0].shape
+                    
+                    # For 'skeleton' data, ensure consistent dimensionality
+                    if key == 'skeleton':
+                        # Find all arrays with shape [batch, frames, joints, coords]
+                        consistent_arrays = []
+                        for arr in self.data[key]:
+                            # If shape is [batch, frames, joints], reshape to [batch, frames, joints, 1]
+                            if len(arr.shape) == 3 and arr.shape[2] == 32:
+                                reshaped = arr.reshape(arr.shape[0], arr.shape[1], arr.shape[2], 1)
+                                consistent_arrays.append(reshaped)
+                            # If shape is already [batch, frames, joints, coords]
+                            elif len(arr.shape) == 4 and arr.shape[2] == 32 and arr.shape[3] == 3:
+                                consistent_arrays.append(arr)
+                        
+                        # Concatenate consistent arrays
+                        if consistent_arrays:
+                            self.data[key] = np.concatenate(consistent_arrays, axis=0)
+                            logger.info(f"Standardized {key} shape: {self.data[key].shape}")
+                        else:
+                            logger.warning(f"No consistent {key} arrays found")
+                            del self.data[key]
+                    else:
+                        # For other modalities, just concatenate
+                        self.data[key] = np.concatenate(self.data[key], axis=0)
+                        
                     logger.info(f"{key} shape: {self.data[key].shape}")
                 except Exception as e:
                     logger.error(f"Error concatenating {key}: {e}")
-                    # Handle inconsistent shapes with best-effort concatenation
-                    shapes = [arr.shape for arr in self.data[key]]
-                    logger.error(f"Inconsistent shapes for {key}: {shapes}")
-                    
-                    # Try to standardize skeleton shape
-                    if key == 'skeleton':
-                        standardized = []
-                        for arr in self.data[key]:
-                            if len(arr.shape) == 3 and arr.shape[1] == self.max_length:
-                                # Convert from (N, max_length, 96) to (N, max_length, 32, 3)
-                                if arr.shape[2] % 3 == 0:
-                                    joints = arr.shape[2] // 3
-                                    standardized.append(arr.reshape(arr.shape[0], arr.shape[1], joints, 3))
-                            elif len(arr.shape) == 4 and arr.shape[2] == 32 and arr.shape[3] == 3:
-                                # Already in correct format
-                                standardized.append(arr)
-                        
-                        if standardized:
-                            try:
-                                self.data[key] = np.concatenate(standardized, axis=0)
-                                logger.info(f"Standardized {key} shape: {self.data[key].shape}")
-                            except:
-                                del self.data[key]
-                        else:
-                            del self.data[key]
-                    else:
-                        # Last resort: Remove problematic key
-                        del self.data[key]
+                    logger.error(f"Inconsistent shapes for {key}: {[arr.shape for arr in self.data[key]]}")
+                    del self.data[key]
         
         # Check if we have any data left
         if 'labels' not in self.data or len(self.data['labels']) == 0:
@@ -488,13 +445,14 @@ class DatasetBuilder:
             }
             
             # Add skeleton if required
-            req_modalities = self.kwargs.get('required_modalities', ['accelerometer'])
-            if 'skeleton' in req_modalities:
+            if 'skeleton' in self.kwargs.get('required_modalities', ['accelerometer']):
                 self.data['skeleton'] = np.zeros((1, self.max_length, 32, 3), dtype=np.float32)
+    
+    
     
     def normalization(self) -> Dict[str, np.ndarray]:
         """
-        Normalize data for each modality using StandardScaler.
+        Normalize data for each modality using StandardScaler - EXACT match to PyTorch
         
         Returns:
             Dict[str, np.ndarray]: Normalized data
@@ -536,7 +494,7 @@ class DatasetBuilder:
             return self.data
 
 class UTD_MM_TF(tf.keras.utils.Sequence):
-    """TensorFlow dataset for multimodal data with batching support."""
+    """TensorFlow dataset for multimodal data with batch support."""
     
     def __init__(self, dataset, batch_size, use_smv=False):
         """
@@ -578,10 +536,14 @@ class UTD_MM_TF(tf.keras.utils.Sequence):
         
         # Process skeleton data - ensure correct format
         if self.skl_data is not None and len(self.skl_data) > 0:
-            # Convert from [batch, frames, joints*3] to [batch, frames, joints, 3] if needed
-            if len(self.skl_data.shape) == 3 and self.skl_data.shape[2] % 3 == 0:
-                joints = self.skl_data.shape[2] // 3
-                self.skl_data = self.skl_data.reshape(self.skl_data.shape[0], self.skl_data.shape[1], joints, 3)
+            # Fixed - Force consistent shape of [batch, frames, joints, coords]
+            if len(self.skl_data.shape) == 3:
+                if self.skl_data.shape[2] == 32:
+                    # Convert from [batch, frames, joints] to [batch, frames, joints, 1]
+                    self.skl_data = self.skl_data.reshape(self.skl_data.shape[0], self.skl_data.shape[1], 32, 1)
+                elif self.skl_data.shape[2] == 96:
+                    # Convert from [batch, frames, joints*3] to [batch, frames, joints, 3]
+                    self.skl_data = self.skl_data.reshape(self.skl_data.shape[0], self.skl_data.shape[1], 32, 3)
         else:
             logger.warning("Missing skeleton data. Creating dummy data.")
             self.skl_data = np.zeros((self.num_samples, 128, 32, 3), dtype=np.float32)
@@ -676,9 +638,7 @@ class UTD_MM_TF(tf.keras.utils.Sequence):
         """Shuffle indices at the end of each epoch"""
         np.random.shuffle(self.indices)
 
-# ===== Helper Functions for SmartFallMM Dataset =====
-
-def prepare_smartfallmm_tf(arg) -> DatasetBuilder:
+def prepare_smartfallmm_tf(arg):
     """
     Prepare SmartFall dataset builder using command line arguments.
     
@@ -714,7 +674,7 @@ def prepare_smartfallmm_tf(arg) -> DatasetBuilder:
     builder_kwargs = {
         'verbose': arg.dataset_args.get('verbose', False),
         'use_dtw': arg.dataset_args.get('use_dtw', True),
-        'required_modalities': ['accelerometer']  # Only require accelerometer for flexibility
+        'required_modalities': arg.dataset_args.get('modalities', ['accelerometer'])
     }
     
     builder = DatasetBuilder(
@@ -727,7 +687,7 @@ def prepare_smartfallmm_tf(arg) -> DatasetBuilder:
     
     return builder
 
-def split_by_subjects_tf(builder: DatasetBuilder, subjects: List[int], fuse: bool) -> Dict[str, np.ndarray]:
+def split_by_subjects_tf(builder, subjects, fuse):
     """
     Split dataset by subjects.
     
@@ -756,6 +716,27 @@ def split_by_subjects_tf(builder: DatasetBuilder, subjects: List[int], fuse: boo
                 if np.isnan(norm_data[key]).any():
                     logger.warning(f"NaN values detected in {key}, replacing with zeros")
                     norm_data[key] = np.nan_to_num(norm_data[key])
+        
+        # Final shape check for skeleton data
+        if 'skeleton' in norm_data:
+            # Ensure skeleton data has shape [batch, frames, joints, coords]
+            if len(norm_data['skeleton'].shape) != 4:
+                logger.warning(f"Unexpected skeleton shape: {norm_data['skeleton'].shape}")
+                if len(norm_data['skeleton'].shape) == 3:
+                    if norm_data['skeleton'].shape[2] == 32:
+                        # [batch, frames, joints] -> [batch, frames, joints, 1]
+                        norm_data['skeleton'] = norm_data['skeleton'].reshape(
+                            norm_data['skeleton'].shape[0],
+                            norm_data['skeleton'].shape[1],
+                            32, 1
+                        )
+                    elif norm_data['skeleton'].shape[2] == 96:
+                        # [batch, frames, joints*3] -> [batch, frames, joints, 3]
+                        norm_data['skeleton'] = norm_data['skeleton'].reshape(
+                            norm_data['skeleton'].shape[0],
+                            norm_data['skeleton'].shape[1],
+                            32, 3
+                        )
         
         # Ensure labels exist and match data length
         if 'labels' not in norm_data or len(norm_data['labels']) == 0:
@@ -786,7 +767,8 @@ def split_by_subjects_tf(builder: DatasetBuilder, subjects: List[int], fuse: boo
         
     except Exception as e:
         logger.error(f"Error in split_by_subjects_tf: {e}")
-        traceback.print_exc()
+        import traceback
+        logger.error(traceback.format_exc())
         
         # Return minimal valid dataset as fallback
         return {

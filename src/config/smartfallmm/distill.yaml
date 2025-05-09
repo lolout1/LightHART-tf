@@ -42,10 +42,10 @@ dataset_args:
   mode: 'sliding_window'
   max_length: 128
   task: 'fd'
-  modalities: ['accelerometer']  # Student only needs accelerometer
+  modalities: ['accelerometer','skeleton']  # Student only needs accelerometer
   age_group: ['young']
   sensors: ['watch']
-  use_dtw: false  # No need for DTW with only accelerometer
+  use_dtw: true # No need for DTW with only accelerometer
 
 feeder: feeder.make_dataset_tf.UTD_MM_TF
 batch_size: 16

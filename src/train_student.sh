@@ -1,14 +1,14 @@
 #!/bin/bash
-# train_student.sh - Robust training script for the student model in LightHART-TF
+# Robust student model training script with error prevention
 
-# Enable strict error handling
-set -euo pipefail
+# Enable strict error handling but handle undefined variables safely
+set -eo pipefail
 
 # Configuration
 CONFIG_FILE="config/smartfallmm/student.yaml"
 TIMESTAMP=$(date +%Y-%m-%d_%H-%M-%S)
 WORK_DIR="../experiments/student_${TIMESTAMP}"
-MODEL_NAME="student_model"
+MODEL_NAME="student_model_${TIMESTAMP}"
 GPU_ID=0
 LEARNING_RATE=0.001
 DROPOUT=0.5
@@ -78,16 +78,18 @@ mkdir -p "${WORK_DIR}/models"
 mkdir -p "${WORK_DIR}/logs"
 mkdir -p "${WORK_DIR}/visualizations"
 mkdir -p "${WORK_DIR}/results"
+mkdir -p "${WORK_DIR}/config"  # Separate config directory
 
 # Save original config and code for reference
-cp "${CONFIG_FILE}" "${WORK_DIR}/"
+cp "${CONFIG_FILE}" "${WORK_DIR}/config/original_config.yaml"
 mkdir -p "${WORK_DIR}/code"
-cp "models/transformer_optimized.py" "${WORK_DIR}/code/"
-cp "utils/dataset_tf.py" "${WORK_DIR}/code/"
-cp "train.py" "${WORK_DIR}/code/"
+cp "models/transformer_optimized.py" "${WORK_DIR}/code/" 2>/dev/null || echo "Warning: models/transformer_optimized.py not found"
+cp "utils/dataset_tf.py" "${WORK_DIR}/code/" 2>/dev/null || echo "Warning: utils/dataset_tf.py not found"
+cp "utils/processor_tf.py" "${WORK_DIR}/code/" 2>/dev/null || echo "Warning: utils/processor_tf.py not found"
+cp "train.py" "${WORK_DIR}/code/" 2>/dev/null || echo "Warning: train.py not found"
 
 # Create a custom config with our parameters
-CUSTOM_CONFIG="${WORK_DIR}/student_custom.yaml"
+CUSTOM_CONFIG="${WORK_DIR}/config/student_custom.yaml"  # Different path to avoid collision
 cp "${CONFIG_FILE}" "${CUSTOM_CONFIG}"
 
 # Update parameters in the config
@@ -100,6 +102,12 @@ sed -i "s/feeder:.*/feeder: utils.dataset_tf.UTD_MM_TF/" "${CUSTOM_CONFIG}"
 sed -i "s/num_worker:.*/num_worker: ${NUM_WORKERS}/" "${CUSTOM_CONFIG}"
 sed -i "s/use_smv:.*/use_smv: ${USE_SMV}/" "${CUSTOM_CONFIG}"
 
+# Important change: When using only accelerometer, disable DTW
+if grep -q "modalities: \['accelerometer'\]" "${CUSTOM_CONFIG}"; then
+  echo "Accelerometer-only mode detected. Disabling DTW alignment."
+  sed -i "s/use_dtw:.*/use_dtw: false/" "${CUSTOM_CONFIG}"
+fi
+
 # Set TensorFlow environment variables
 export TF_CPP_MIN_LOG_LEVEL=2  # Reduce TensorFlow logging noise
 export TF_FORCE_GPU_ALLOW_GROWTH=true  # Avoid allocating all GPU memory
@@ -110,7 +118,11 @@ export OMP_NUM_THREADS=${NUM_WORKERS}
 export TF_NUM_INTRAOP_THREADS=${NUM_WORKERS}
 export TF_NUM_INTEROP_THREADS=${NUM_WORKERS}
 
+# Add current directory to Python path (fix for undefined variable)
+export PYTHONPATH=".:${PYTHONPATH:-}"
+
 # Run training
+echo "Starting student model training..."
 python train.py \
   --config "${CUSTOM_CONFIG}" \
   --work-dir "${WORK_DIR}" \
@@ -125,62 +137,6 @@ TRAINING_STATUS=$?
 
 if [ ${TRAINING_STATUS} -eq 0 ]; then
   echo "Student model training completed successfully at $(date)"
-  
-  # Export to TFLite
-  echo "Exporting student model to TFLite..."
-  python -c "
-import os
-import glob
-import sys
-import tensorflow as tf
-import traceback
-from utils.tflite_converter import convert_to_tflite
-
-try:
-    # Find the best weights
-    model_dir = '${WORK_DIR}/models'
-    weight_files = glob.glob(f'{model_dir}/${MODEL_NAME}_*.weights.h5')
-    
-    if weight_files:
-        # Load the model architecture
-        from models.transformer_optimized import TransModel
-        
-        model = TransModel(
-            acc_frames=128,
-            num_classes=1,
-            num_heads=4,
-            acc_coords=3,
-            embed_dim=32,
-            num_layers=2,
-            dropout=${DROPOUT},
-            activation='relu'
-        )
-        
-        # Build model with dummy input
-        dummy_input = {'accelerometer': tf.zeros((1, 128, 3), dtype=tf.float32)}
-        _ = model(dummy_input, training=False)
-        
-        # Load weights
-        best_weight = weight_files[0]
-        subject_id = best_weight.split('_')[-1].split('.')[0]
-        print(f'Loading weights for subject {subject_id}: {best_weight}')
-        model.load_weights(best_weight)
-        
-        # Export to TFLite
-        tflite_path = f'{model_dir}/{MODEL_NAME}_{subject_id}.tflite'
-        success = convert_to_tflite(
-            model=model,
-            save_path=tflite_path,
-            input_shape=(1, 128, 3 if not ${USE_SMV} else 4),
-            quantize=False
-        )
-        print(f'TFLite export success: {success}')
-    else:
-        print('No model weights found for TFLite export')
-except Exception as e:
-    print(f'Error exporting to TFLite: {e}')
-    traceback.print_exc()
-"
   
   # Create symbolic link to latest experiment
   cd "$(dirname "${WORK_DIR}")"

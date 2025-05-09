@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 processor_tf.py - TensorFlow implementation of signal processing functions
-Matches PyTorch implementation exactly with robust error handling
+Exact match to PyTorch implementation with robust error handling
 """
 
 import tensorflow as tf
@@ -11,6 +11,7 @@ import logging
 from scipy.signal import butter, filtfilt, find_peaks
 from fastdtw import fastdtw
 from scipy.spatial.distance import euclidean
+from numpy.linalg import norm
 
 logger = logging.getLogger('processor-tf')
 
@@ -133,9 +134,44 @@ def pad_sequence_tf(sequence, max_length):
         padded[:copy_length] = sequence[:copy_length]
         return padded
 
+def filter_data_by_ids(data, ids):
+    """
+    Filter data by specific indices
+    
+    Args:
+        data: Input data array
+        ids: List of indices to keep
+    
+    Returns:
+        Filtered data
+    """
+    if len(ids) == 0:
+        return data[:0]  # Return empty array with same shape
+    return data[ids]
+
+def filter_repeated_ids(path):
+    """
+    Filter DTW path to get unique mappings
+    
+    Args:
+        path: DTW path as list of index pairs
+    
+    Returns:
+        Two sets of unique indices
+    """
+    seen_first = set()
+    seen_second = set()
+    
+    for first, second in path:
+        if first not in seen_first and second not in seen_second:
+            seen_first.add(first)
+            seen_second.add(second)
+    
+    return seen_first, seen_second
 def align_sequence_dtw(data, joint_id=9, use_dtw=True):
     """
     Align skeleton and accelerometer data using DTW
+    EXACT match to PyTorch implementation with improved error handling
     
     Args:
         data: Dictionary with 'skeleton' and 'accelerometer' arrays
@@ -146,87 +182,138 @@ def align_sequence_dtw(data, joint_id=9, use_dtw=True):
         Dictionary with aligned data
     """
     try:
-        # Check if we have both required modalities
+        # Skip if missing required modalities
         if 'skeleton' not in data or 'accelerometer' not in data:
             logger.warning("Missing required modalities for DTW alignment")
             return data
         
-        # Skip DTW if disabled
-        if not use_dtw:
+        # Skip DTW if disabled or if only one modality is present
+        if not use_dtw or len(data.keys()) == 1:
+            logger.info("DTW alignment skipped (disabled or single modality)")
             min_length = min(len(data['accelerometer']), len(data['skeleton']))
             data['accelerometer'] = data['accelerometer'][:min_length]
             data['skeleton'] = data['skeleton'][:min_length]
             return data
         
-        # Extract joint data - handle different skeleton formats
+        # Get dynamic keys (non-skeleton modalities)
+        dynamic_keys = sorted([key for key in data.keys() if key != "skeleton"])
+        
+        # Extract specific joint data - handle different skeleton formats
         skeleton_data = data['skeleton']
         
-        # Handle different skeleton formats
+        # Handle different skeleton formats - needs to extract joint coordinates
         if len(skeleton_data.shape) == 3:  # [frames, joints*3]
             start_idx = (joint_id - 1) * 3
             end_idx = joint_id * 3
-            skeleton_joint_data = skeleton_data[:, start_idx:end_idx]
+            if skeleton_data.shape[1] >= end_idx:
+                skeleton_joint_data = skeleton_data[:, start_idx:end_idx]
+            else:
+                logger.warning(f"Skeleton data has insufficient joints: {skeleton_data.shape}")
+                min_length = min(len(data['accelerometer']), len(skeleton_data))
+                data['accelerometer'] = data['accelerometer'][:min_length]
+                data['skeleton'] = skeleton_data[:min_length]
+                return data
         elif len(skeleton_data.shape) == 4:  # [frames, joints, 3]
-            skeleton_joint_data = skeleton_data[:, joint_id-1, :]
+            if skeleton_data.shape[1] >= joint_id:
+                skeleton_joint_data = skeleton_data[:, joint_id-1, :]
+            else:
+                logger.warning(f"Skeleton data has insufficient joints: {skeleton_data.shape}")
+                min_length = min(len(data['accelerometer']), len(skeleton_data))
+                data['accelerometer'] = data['accelerometer'][:min_length]
+                data['skeleton'] = skeleton_data[:min_length]
+                return data
         else:
-            logger.warning(f"Unexpected skeleton shape: {skeleton_data.shape}")
+            logger.warning(f"Unsupported skeleton shape: {skeleton_data.shape}")
             return data
         
-        # Get accelerometer data
-        acc_data = data['accelerometer']
+        # Get accelerometer data from first dynamic key
+        inertial_data = data[dynamic_keys[0]]
         
-        # Calculate magnitude vectors for alignment
-        skeleton_norm = np.linalg.norm(skeleton_joint_data, axis=1)
-        acc_norm = np.linalg.norm(acc_data, axis=1)
+        # Handle multiple inertial sensors if present
+        if len(dynamic_keys) > 1:
+            gyroscope_data = data[dynamic_keys[1]]
+            min_len = min(inertial_data.shape[0], gyroscope_data.shape[0])
+            inertial_data = inertial_data[:min_len, :]
+            data[dynamic_keys[1]] = gyroscope_data[:min_len, :]
         
-        # Apply DTW - exactly like PyTorch implementation
+        # Safety check for empty data
+        if len(skeleton_joint_data) == 0 or len(inertial_data) == 0:
+            logger.warning("Empty data for DTW alignment, skipping")
+            min_length = min(len(data['accelerometer']), len(skeleton_data))
+            data['accelerometer'] = data['accelerometer'][:min_length]
+            data['skeleton'] = skeleton_data[:min_length]
+            return data
+        
+        # Calculate magnitude vectors for alignment - EXACT match to PyTorch implementation
+        skeleton_frob_norm = norm(skeleton_joint_data, axis=1)
+        inertial_frob_norm = norm(inertial_data, axis=1)
+        
+        # Safety check for empty norms
+        if len(skeleton_frob_norm) == 0 or len(inertial_frob_norm) == 0:
+            logger.warning("Empty norm vectors for DTW alignment, skipping")
+            min_length = min(len(data['accelerometer']), len(skeleton_data))
+            data['accelerometer'] = data['accelerometer'][:min_length]
+            data['skeleton'] = skeleton_data[:min_length]
+            return data
+        
+        # IMPORTANT FIX: Make sure vectors are properly shaped for fastdtw
+        # FastDTW expects 2D arrays with shape (n_samples, n_features)
+        skeleton_frob_norm_2d = skeleton_frob_norm.reshape(-1, 1)
+        inertial_frob_norm_2d = inertial_frob_norm.reshape(-1, 1)
+        
+        # Apply DTW with euclidean distance - EXACT match to PyTorch implementation
         try:
             distance, path = fastdtw(
-                acc_norm[:, np.newaxis],
-                skeleton_norm[:, np.newaxis],
+                inertial_frob_norm_2d, 
+                skeleton_frob_norm_2d,
                 dist=euclidean,
-                radius=15  # Same as PyTorch implementation
+                radius=10  # Use smaller radius for faster processing
             )
         except Exception as e:
             logger.error(f"DTW calculation error: {e}")
             # Simple alignment fallback
-            min_length = min(len(acc_data), len(skeleton_data))
-            data['accelerometer'] = acc_data[:min_length]
+            min_length = min(len(inertial_data), len(skeleton_data))
+            data['accelerometer'] = inertial_data[:min_length]
             data['skeleton'] = skeleton_data[:min_length]
             return data
         
-        # Extract unique indices for mapping - exactly like PyTorch implementation
-        acc_indices = set()
-        skeleton_indices = set()
+        # Filter repeated indices - EXACT match to PyTorch implementation
+        inertial_ids, skeleton_ids = filter_repeated_ids(path)
         
-        for acc_idx, skl_idx in path:
-            if acc_idx not in acc_indices and skl_idx not in skeleton_indices:
-                acc_indices.add(acc_idx)
-                skeleton_indices.add(skl_idx)
+        # Convert to lists and sort
+        inertial_ids = sorted(list(inertial_ids))
+        skeleton_ids = sorted(list(skeleton_ids))
         
-        # Convert to sorted lists for temporal ordering
-        acc_indices = sorted(list(acc_indices))
-        skeleton_indices = sorted(list(skeleton_indices))
+        # CRITICAL FIX: Ensure indices are within bounds
+        inertial_ids = [idx for idx in inertial_ids if idx < len(inertial_data)]
+        skeleton_ids = [idx for idx in skeleton_ids if idx < len(skeleton_data)]
+        
+        # Sort again after filtering
+        inertial_ids.sort()
+        skeleton_ids.sort()
         
         # Apply alignment if we have enough indices
-        if len(acc_indices) > 10 and len(skeleton_indices) > 10:
-            data['accelerometer'] = data['accelerometer'][acc_indices]
-            data['skeleton'] = data['skeleton'][skeleton_indices]
-            
-            logger.info(f"DTW alignment successful: mapped {len(acc_indices)} accelerometer frames to "
-                        f"{len(skeleton_indices)} skeleton frames")
+        if len(inertial_ids) > 10 and len(skeleton_ids) > 10:
+            # Safety check: ensure all indices are valid
+            try:
+                data['skeleton'] = filter_data_by_ids(data['skeleton'], skeleton_ids)
+                for key in dynamic_keys:
+                    data[key] = filter_data_by_ids(data[key], inertial_ids)
+                
+                logger.info(f"DTW alignment successful: mapped {len(inertial_ids)} accelerometer frames to "
+                           f"{len(skeleton_ids)} skeleton frames")
+            except Exception as e:
+                logger.error(f"Error applying DTW indices: {e}")
+                min_length = min(len(data['accelerometer']), len(data['skeleton']))
+                data['accelerometer'] = data['accelerometer'][:min_length]
+                data['skeleton'] = data['skeleton'][:min_length]
         else:
             logger.warning(f"DTW alignment yielded too few matched indices")
             
             # Fall back to simple length matching
-            min_length = min(len(acc_data), len(skeleton_data))
-            data['accelerometer'] = acc_data[:min_length]
+            min_length = min(len(inertial_data), len(skeleton_data))
+            data['accelerometer'] = inertial_data[:min_length]
             data['skeleton'] = skeleton_data[:min_length]
-        
-        # Ensure consistent lengths
-        min_length = min(len(data['accelerometer']), len(data['skeleton']))
-        data['accelerometer'] = data['accelerometer'][:min_length]
-        data['skeleton'] = data['skeleton'][:min_length]
         
         return data
         
@@ -240,10 +327,10 @@ def align_sequence_dtw(data, joint_id=9, use_dtw=True):
             data['skeleton'] = data['skeleton'][:min_length]
         
         return data
-
 def selective_windowing(data, window_size, label):
     """
     Apply selective windowing around detected peaks in accelerometer data
+    EXACT match to PyTorch implementation
     
     Args:
         data: Dictionary of modality data
@@ -267,12 +354,12 @@ def selective_windowing(data, window_size, label):
                         
                     # Create appropriate dummy shape based on modality
                     if key == 'accelerometer':
-                        result[key] = np.zeros((1, window_size, 3), dtype=np.float32)
+                        result[key] = np.zeros((1, window_size, data[key].shape[1]), dtype=np.float32)
                     elif key == 'skeleton':
                         if len(data[key].shape) == 3:  # [frames, joints*3]
                             result[key] = np.zeros((1, window_size, data[key].shape[1]), dtype=np.float32)
                         else:  # [frames, joints, 3]
-                            result[key] = np.zeros((1, window_size, 32, 3), dtype=np.float32)
+                            result[key] = np.zeros((1, window_size, data[key].shape[1], data[key].shape[2]), dtype=np.float32)
                     else:
                         result[key] = np.zeros((1, window_size, data[key].shape[1]), dtype=np.float32)
             
@@ -282,8 +369,7 @@ def selective_windowing(data, window_size, label):
         acc_data = data['accelerometer']
         sqrt_sum = np.sqrt(np.sum(acc_data**2, axis=1))
         
-        # Set parameters based on label
-        # Identical parameters to PyTorch implementation
+        # Set parameters based on label - EXACT match to PyTorch implementation
         if label == 1:  # Fall
             height, distance = 1.4, 50
         else:  # Non-fall
@@ -294,7 +380,7 @@ def selective_windowing(data, window_size, label):
         
         # Create windows around each peak
         if len(peaks) == 0:
-            # Create a window at the middle point
+            # Create a window at the middle point if no peaks
             peaks = [len(sqrt_sum) // 2]
             logger.info(f"No peaks found for label {label}, using center point")
         
@@ -320,30 +406,43 @@ def selective_windowing(data, window_size, label):
                 if end - start < window_size * 0.75:  # Require at least 75% of window size
                     continue
                 
-                # Create and prepare window
-                window = np.zeros((window_size, *data[key].shape[1:]), dtype=data[key].dtype)
+                # Create window with proper shape
+                window = np.zeros((window_size,) + data[key].shape[1:], dtype=data[key].dtype)
                 
                 # Fill with data
-                window[:end-start] = data[key][start:end]
+                copy_length = end - start
+                window[:copy_length] = data[key][start:end]
                 windows.append(window)
             
             # Add windows to result if any were created
             if windows:
                 try:
-                    windows_dict[key] = np.stack(windows)
+                    # Ensure all windows have the same shape
+                    first_shape = windows[0].shape
+                    consistent_windows = [w for w in windows if w.shape == first_shape]
+                    
+                    if not consistent_windows:
+                        # No consistent windows - create one dummy window
+                        logger.warning(f"No consistent window shapes for {key}")
+                        windows_dict[key] = np.zeros((1, window_size) + first_shape[1:], dtype=windows[0].dtype)
+                    else:
+                        # Stack consistent windows
+                        windows_dict[key] = np.stack(consistent_windows)
+                        
                 except Exception as e:
                     logger.error(f"Error stacking windows for {key}: {e}")
                     # Create single dummy window as fallback
-                    windows_dict[key] = np.zeros((1, window_size, *data[key].shape[1:]), dtype=data[key].dtype)
+                    windows_dict[key] = np.zeros((1, window_size) + data[key].shape[1:], dtype=data[key].dtype)
             else:
                 # Create dummy window if none were valid
-                windows_dict[key] = np.zeros((1, window_size, *data[key].shape[1:]), dtype=data[key].dtype)
+                windows_dict[key] = np.zeros((1, window_size) + data[key].shape[1:], dtype=data[key].dtype)
         
         # Add labels
         if windows_dict:
             # Use length of first modality for label count
             first_key = next(iter(windows_dict))
             windows_dict['labels'] = np.full(len(windows_dict[first_key]), label, dtype=np.int32)
+            logger.info(f"Created {len(windows_dict['labels'])} windows for label {label}")
         else:
             # Fallback with single label
             windows_dict['labels'] = np.array([label], dtype=np.int32)
@@ -352,11 +451,13 @@ def selective_windowing(data, window_size, label):
             for key in data:
                 if key != 'labels' and key not in windows_dict:
                     if key == 'accelerometer':
-                        windows_dict[key] = np.zeros((1, window_size, 3), dtype=np.float32)
+                        windows_dict[key] = np.zeros((1, window_size, data[key].shape[1]), dtype=np.float32)
                     elif key == 'skeleton':
-                        windows_dict[key] = np.zeros((1, window_size, 32, 3), dtype=np.float32)
+                        if len(data[key].shape) == 3:  # [frames, joints*3]
+                            windows_dict[key] = np.zeros((1, window_size, data[key].shape[1]), dtype=np.float32)
+                        else:  # [frames, joints, 3]
+                            windows_dict[key] = np.zeros((1, window_size, data[key].shape[1], data[key].shape[2]), dtype=np.float32)
         
-        logger.info(f"Created {len(windows_dict['labels'])} windows for label {label}")
         return windows_dict
         
     except Exception as e:

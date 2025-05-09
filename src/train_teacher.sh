@@ -1,5 +1,5 @@
 #!/bin/bash
-# train_teacher.sh - Robust training script for the teacher model in LightHART-TF
+# Modified train_teacher.sh with path resolution fix
 
 # Enable strict error handling
 set -euo pipefail
@@ -72,16 +72,19 @@ mkdir -p "${WORK_DIR}/models"
 mkdir -p "${WORK_DIR}/logs"
 mkdir -p "${WORK_DIR}/visualizations" 
 mkdir -p "${WORK_DIR}/results"
+mkdir -p "${WORK_DIR}/config" # Separate config directory
 
-# Save original config and code for reference
-cp "${CONFIG_FILE}" "${WORK_DIR}/"
+# Save original config for reference
+cp "${CONFIG_FILE}" "${WORK_DIR}/config/original_config.yaml"
+
+# Save code for reference
 mkdir -p "${WORK_DIR}/code"
-cp "models/mm_transformer.py" "${WORK_DIR}/code/"
+cp "models/mm_transformer.py" "${WORK_DIR}/code/" 2>/dev/null || echo "Warning: models/mm_transformer.py not found"
 cp "utils/dataset_tf.py" "${WORK_DIR}/code/" 2>/dev/null || echo "Warning: utils/dataset_tf.py not found"
-cp "train.py" "${WORK_DIR}/code/"
+cp "train.py" "${WORK_DIR}/code/" 2>/dev/null || echo "Warning: train.py not found"
 
 # Create a custom config with our parameters
-CUSTOM_CONFIG="${WORK_DIR}/teacher_custom.yaml"
+CUSTOM_CONFIG="${WORK_DIR}/config/teacher_custom.yaml" # Changed path to avoid collision
 cp "${CONFIG_FILE}" "${CUSTOM_CONFIG}"
 
 # Update parameters in the config
@@ -93,8 +96,8 @@ sed -i "s/drop_rate:.*/drop_rate: ${DROPOUT}/" "${CUSTOM_CONFIG}"
 sed -i "s/feeder:.*/feeder: utils.dataset_tf.UTD_MM_TF/" "${CUSTOM_CONFIG}"
 sed -i "s/num_worker:.*/num_worker: ${NUM_WORKERS}/" "${CUSTOM_CONFIG}"
 
-# Suppress TensorFlow warnings
-export TF_CPP_MIN_LOG_LEVEL=2  # Reduce TensorFlow logging noise
+# Set TensorFlow environment variables
+export TF_CPP_MIN_LOG_LEVEL=2  # Reduce TF logging noise
 export TF_FORCE_GPU_ALLOW_GROWTH=true  # Avoid allocating all GPU memory
 export CUDA_VISIBLE_DEVICES=${GPU_ID}
 
@@ -103,8 +106,8 @@ export OMP_NUM_THREADS=${NUM_WORKERS}
 export TF_NUM_INTRAOP_THREADS=${NUM_WORKERS}
 export TF_NUM_INTEROP_THREADS=${NUM_WORKERS}
 
-# Add current directory to Python path to help with imports
-export PYTHONPATH=".:$PYTHONPATH"
+# Add current directory to Python path (with proper handling of undefined variable)
+export PYTHONPATH=".:${PYTHONPATH:-}"
 
 # Run training
 echo "Starting teacher model training..."
