@@ -109,7 +109,7 @@ class BaseTrainer:
         if import_str is None:
             raise ValueError("Import path cannot be None")
         mod_str, _sep, class_str = import_str.rpartition('.')
-        for prefix in ['', 'src.']:
+        for prefix in ['', 'src.', 'models.', 'utils.']:
             try:
                 import importlib
                 module = importlib.import_module(f"{prefix}{mod_str}")

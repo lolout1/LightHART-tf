@@ -19,17 +19,36 @@ TEMPERATURE=4.5
 ALPHA=0.6
 USE_SMV=false
 
-# Check for latest teacher model
-if [ -L "../experiments/latest_teacher" ]; then
-    LATEST_TEACHER="../experiments/latest_teacher"
-    TEACHER_WEIGHTS=$(find "$LATEST_TEACHER/models" -name "teacher_model_*.weights.h5" | head -n 1)
-    if [ -z "$TEACHER_WEIGHTS" ]; then
-        echo "No teacher weights found in latest_teacher directory"
-        exit 1
+# Set the teacher model path directly to a .h5 weights file
+TEACHER_WEIGHTS="../experiments/teacher_2025-05-09_15-04-49_2025-05-09_15-04-52/models/teacher_model_32.weights.h5"
+
+# Check if teacher weights exist
+if [ ! -f "$TEACHER_WEIGHTS" ]; then
+    # Try to find .weights.h5 file
+    if [ -f "${TEACHER_WEIGHTS%.keras}.weights.h5" ]; then
+        TEACHER_WEIGHTS="${TEACHER_WEIGHTS%.keras}.weights.h5"
+        echo "Using weights file: $TEACHER_WEIGHTS"
+    else
+        echo "ERROR: Teacher model weights not found at: $TEACHER_WEIGHTS"
+        echo "Looking for other weights files..."
+        
+        # Search for any available weights files
+        TEACHER_DIR=$(dirname "$TEACHER_WEIGHTS")
+        if [ -d "$TEACHER_DIR" ]; then
+            echo "Searching in directory: $TEACHER_DIR"
+            FOUND_WEIGHTS=$(find "$TEACHER_DIR" -name "teacher_model_*.weights.h5" | head -n 1)
+            if [ -n "$FOUND_WEIGHTS" ]; then
+                TEACHER_WEIGHTS="$FOUND_WEIGHTS"
+                echo "Found alternative teacher weights: $TEACHER_WEIGHTS"
+            else
+                echo "No teacher weight files found. Please train a teacher model first."
+                exit 1
+            fi
+        else
+            echo "Teacher model directory not found."
+            exit 1
+        fi
     fi
-else
-    echo "No latest_teacher symlink found. Please train a teacher model first."
-    exit 1
 fi
 
 # Parse command line arguments
@@ -114,7 +133,8 @@ mkdir -p "${WORK_DIR}/code"
 cp "distiller.py" "${WORK_DIR}/code/"
 cp "models/transformer_optimized.py" "${WORK_DIR}/code/"
 cp "models/mm_transformer.py" "${WORK_DIR}/code/"
-cp "utils/dataset_tf.py" "${WORK_DIR}/code/"
+cp "utils/dataset_tf.py" "${WORK_DIR}/code/" 2>/dev/null || echo "Warning: dataset_tf.py not found"
+cp "utils/loss.py" "${WORK_DIR}/code/" 2>/dev/null || echo "Warning: loss.py not found"
 
 # Create a custom config with our parameters
 CUSTOM_CONFIG="${WORK_DIR}/distill_custom.yaml"
@@ -132,18 +152,19 @@ sed -i "s/use_smv:.*/use_smv: ${USE_SMV}/" "${CUSTOM_CONFIG}"
 sed -i "s/dropout:.*/dropout: ${DROPOUT}/" "${CUSTOM_CONFIG}"
 sed -i "s/feeder:.*/feeder: utils.dataset_tf.UTD_MM_TF/" "${CUSTOM_CONFIG}"
 
-# Set TensorFlow environment variables
+# Suppress TensorFlow warnings
 export TF_CPP_MIN_LOG_LEVEL=2  # Reduce TensorFlow logging noise
 export TF_FORCE_GPU_ALLOW_GROWTH=true  # Avoid allocating all GPU memory
 export CUDA_VISIBLE_DEVICES=${GPU_ID}
 
-# For better multi-processing performance
+# Performance settings
 export OMP_NUM_THREADS=${NUM_WORKERS}
 export TF_NUM_INTRAOP_THREADS=${NUM_WORKERS}
 export TF_NUM_INTEROP_THREADS=${NUM_WORKERS}
 
 # Run distillation
-python distiller.py \
+echo "Starting knowledge distillation using teacher model: ${TEACHER_WEIGHTS}"
+PYTHONPATH=".:$PYTHONPATH" python distiller.py \
   --config "${CUSTOM_CONFIG}" \
   --work-dir "${WORK_DIR}" \
   --model-saved-name "${MODEL_NAME}" \
@@ -163,44 +184,88 @@ if [ ${DISTILL_STATUS} -eq 0 ]; then
   
   # Export to TFLite
   echo "Exporting distilled model to TFLite..."
-  python -c "
+  PYTHONPATH=".:$PYTHONPATH" python -c "
 import os
 import glob
 import sys
 import tensorflow as tf
 import traceback
-from utils.tflite_converter import convert_to_tflite
+
+# Import TFLite converter
+try:
+    from utils.tflite_converter import convert_to_tflite
+except ImportError:
+    print('TFLite converter not found, using simplified converter')
+    def convert_to_tflite(model, save_path, input_shape, quantize=False):
+        try:
+            # Build converter
+            converter = tf.lite.TFLiteConverter.from_keras_model(model)
+            
+            # Set optimization options
+            if quantize:
+                converter.optimizations = [tf.lite.Optimize.DEFAULT]
+            
+            # Convert model
+            tflite_model = converter.convert()
+            
+            # Save model
+            with open(save_path, 'wb') as f:
+                f.write(tflite_model)
+                
+            print(f'Model exported to {save_path}')
+            return True
+        except Exception as e:
+            print(f'Error converting to TFLite: {e}')
+            return False
+
+# Find the best weights
+model_dir = '${WORK_DIR}/models'
+keras_files = glob.glob(f'{model_dir}/{MODEL_NAME}_*.keras')
+weight_files = glob.glob(f'{model_dir}/{MODEL_NAME}_*.weights.h5')
 
 try:
-    # Find the best weights
-    model_dir = '${WORK_DIR}/models'
-    weight_files = glob.glob(f'{model_dir}/${MODEL_NAME}_*.weights.h5')
+    # Import model
+    from models.transformer_optimized import TransModel
     
-    if weight_files:
-        # Load the model architecture
-        from models.transformer_optimized import TransModel
-        
-        model = TransModel(
-            acc_frames=128,
-            num_classes=1,
-            num_heads=4,
-            acc_coords=3,
-            embed_dim=32,
-            num_layers=2,
-            dropout=${DROPOUT},
-            activation='relu'
-        )
-        
-        # Build model with dummy input
-        dummy_input = {'accelerometer': tf.zeros((1, 128, 3), dtype=tf.float32)}
-        _ = model(dummy_input, training=False)
-        
-        # Load weights
-        best_weight = weight_files[0]
-        subject_id = best_weight.split('_')[-1].split('.')[0]
-        print(f'Loading weights for subject {subject_id}: {best_weight}')
-        model.load_weights(best_weight)
-        
+    model = TransModel(
+        acc_frames=128,
+        num_classes=1,
+        num_heads=4,
+        acc_coords=3,
+        embed_dim=32,
+        num_layers=2,
+        dropout=${DROPOUT},
+        activation='relu'
+    )
+    
+    # Build model with dummy input
+    dummy_input = {'accelerometer': tf.zeros((1, 128, 3), dtype=tf.float32)}
+    _ = model(dummy_input, training=False)
+    
+    # Try loading keras file first, then weights
+    loaded = False
+    
+    if keras_files:
+        model_file = keras_files[0]
+        subject_id = model_file.split('_')[-1].split('.')[0]
+        try:
+            model = tf.keras.models.load_model(model_file)
+            loaded = True
+            print(f'Loaded full model for subject {subject_id}: {model_file}')
+        except Exception as e:
+            print(f'Error loading keras model: {e}')
+    
+    if not loaded and weight_files:
+        weight_file = weight_files[0]
+        subject_id = weight_file.split('_')[-1].split('.')[0]
+        try:
+            model.load_weights(weight_file)
+            loaded = True
+            print(f'Loaded weights for subject {subject_id}: {weight_file}')
+        except Exception as e:
+            print(f'Error loading weights: {e}')
+    
+    if loaded:
         # Export to TFLite
         tflite_path = f'{model_dir}/{MODEL_NAME}_{subject_id}.tflite'
         success = convert_to_tflite(
@@ -211,10 +276,11 @@ try:
         )
         print(f'TFLite export success: {success}')
     else:
-        print('No model weights found for TFLite export')
+        print('No model weights loaded for TFLite export')
+        for file in os.listdir(model_dir):
+            print(f'Found file: {file}')
 except Exception as e:
-    print(f'Error exporting to TFLite: {e}')
-    traceback.print_exc()
+    print(f'Error exporting to TFLite: {traceback.format_exc()}')
 "
   
   # Create symbolic link to latest experiment
