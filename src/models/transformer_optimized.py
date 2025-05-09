@@ -1,21 +1,64 @@
 #!/usr/bin/env python
-# -*- coding: utf-8 -*-
-"""
-transformer_optimized.py - TensorFlow implementation of the TransModel student
-Matches PyTorch implementation exactly with proper feature extraction
-"""
-
 import tensorflow as tf
 from tensorflow.keras import layers
 import logging
 
 logger = logging.getLogger('transformer-tf')
 
+class TransformerBlock(layers.Layer):
+    def __init__(self, dim, num_heads, mlp_dim, dropout=0.1, activation='relu', norm_first=True, **kwargs):
+        super().__init__(**kwargs)
+        self.dim = dim
+        self.num_heads = num_heads
+        self.mlp_dim = mlp_dim
+        self.dropout_rate = dropout
+        self.activation = activation
+        self.norm_first = norm_first
+        
+        self.mha = layers.MultiHeadAttention(
+            num_heads=num_heads,
+            key_dim=dim // num_heads,
+            dropout=dropout
+        )
+        
+        self.norm1 = layers.LayerNormalization(epsilon=1e-6)
+        self.norm2 = layers.LayerNormalization(epsilon=1e-6)
+        
+        self.dropout1 = layers.Dropout(dropout)
+        self.dropout2 = layers.Dropout(dropout)
+        
+        self.mlp = tf.keras.Sequential([
+            layers.Dense(mlp_dim, activation=activation),
+            layers.Dropout(dropout),
+            layers.Dense(dim),
+            layers.Dropout(dropout)
+        ])
+    
+    def call(self, inputs, training=False):
+        if self.norm_first:
+            attn_output = self.attention_block(self.norm1(inputs), training=training)
+            x = inputs + attn_output
+            outputs = x + self.mlp_block(self.norm2(x), training=training)
+        else:
+            attn_output = self.attention_block(inputs, training=training)
+            x = self.norm1(inputs + attn_output)
+            outputs = self.norm2(x + self.mlp_block(x, training=training))
+        
+        return outputs
+    
+    def attention_block(self, inputs, training=False):
+        attention_output = self.mha(
+            query=inputs,
+            key=inputs,
+            value=inputs,
+            training=training
+        )
+        return self.dropout1(attention_output, training=training)
+    
+    def mlp_block(self, inputs, training=False):
+        return self.mlp(inputs, training=training)
+
 class TransModel(tf.keras.Model):
-    """
-    TensorFlow implementation of TransModel student
-    Exactly matches the PyTorch implementation structure and function
-    """
     def __init__(
         self,
         acc_frames=128,
@@ -30,7 +73,6 @@ class TransModel(tf.keras.Model):
         **kwargs
     ):
         super().__init__(**kwargs)
-        # Configuration
         self.acc_frames = acc_frames
         self.num_classes = num_classes
         self.num_heads = num_heads
@@ -41,7 +83,6 @@ class TransModel(tf.keras.Model):
         self.activation = activation
         self.norm_first = norm_first
         
-        # Input projection - matches PyTorch implementation exactly
         self.input_proj = tf.keras.Sequential([
             layers.Conv1D(
                 filters=embed_dim,
@@ -53,7 +94,6 @@ class TransModel(tf.keras.Model):
             layers.BatchNormalization(name="input_proj_bn")
         ], name="input_projection")
         
-        # Transformer layers
         self.transformer_blocks = []
         for i in range(self.num_layers):
             block = TransformerBlock(
@@ -67,34 +107,29 @@ class TransModel(tf.keras.Model):
             )
             self.transformer_blocks.append(block)
         
-        # Output layers
         self.temporal_norm = layers.LayerNormalization(epsilon=1e-6, name="temporal_norm")
         self.output_layer = layers.Dense(num_classes, name="output_layer")
         
-        logger.info(f"TransModel initialized: frames={acc_frames}, embed_dim={embed_dim}, "
-                    f"layers={num_layers}, heads={num_heads}")
+        logger.info(f"TransModel initialized: frames={acc_frames}, embed_dim={embed_dim}, layers={num_layers}, heads={num_heads}")
     
     def call(self, inputs, training=False, **kwargs):
-        """Forward pass handling different input types"""
-        # Handle different input formats
         if isinstance(inputs, dict):
-            # Dictionary input with named modalities
-            x = inputs.get('accelerometer')
-            if x is None:
+            acc_data = inputs.get('accelerometer')
+            if acc_data is None:
                 raise ValueError("Accelerometer data is required")
         else:
-            # Direct tensor input
-            x = inputs
+            acc_data = inputs
         
-        # Ensure 3D input [batch, frames, features]
-        if len(tf.shape(x)) != 3:
-            raise ValueError(f"Expected 3D input [batch, frames, features], got shape {tf.shape(x)}")
+        # Process for both original data and SMV-augmented
+        if isinstance(acc_data, tf.Tensor) and len(acc_data.shape) == 3:
+            x = acc_data
+        else:
+            raise ValueError(f"Expected 3D input [batch, frames, features], got shape {tf.shape(acc_data)}")
         
-        # Reorganize if SMV is present (4 channels instead of 3)
-        input_channels = tf.shape(x)[-1]
-        
-        # Project input - [batch, frames, channels] -> [batch, frames, embed_dim]
+        # Project input - convert to channels-first for Conv1D
+        x = tf.transpose(x, [0, 2, 1])  # [batch, channels, frames]
         x = self.input_proj(x, training=training)
+        x = tf.transpose(x, [0, 2, 1])  # [batch, frames, channels]
         
         # Process through transformer blocks
         for block in self.transformer_blocks:
@@ -113,82 +148,3 @@ class TransModel(tf.keras.Model):
         
         # Return both logits and features for distillation
         return logits, features
-    
-    def export_to_tflite(self, save_path, input_shape=None, quantize=False):
-        """Export model to TFLite format"""
-        if input_shape is None:
-            input_shape = [1, self.acc_frames, self.acc_coords]
-        
-        try:
-            # Create a concrete function that processes raw accelerometer data
-            @tf.function(input_signature=[
-                tf.TensorSpec(shape=input_shape, dtype=tf.float32)
-            ])
-            def serving_fn(accelerometer):
-                # Create input dictionary
-                inputs = {'accelerometer': accelerometer}
-                # Get model output (only logits)
-                logits, _ = self(inputs, training=False)
-                # For binary classification, ensure output is of shape [1, 1]
-                if self.num_classes == 1:
-                    logits = tf.reshape(logits, [1, 1])
-                return {'output': logits}
-            
-            # Convert to SavedModel
-            temp_dir = save_path + "_temp"
-            tf.saved_model.save(self, temp_dir, signatures=serving_fn)
-            
-            # Convert to TFLite
-            converter = tf.lite.TFLiteConverter.from_saved_model(temp_dir)
-            
-            # Apply optimization if requested
-            if quantize:
-                converter.optimizations = [tf.lite.Optimize.DEFAULT]
-            
-            # Convert model
-            tflite_model = converter.convert()
-            
-            # Save to file
-            with open(save_path, 'wb') as f:
-                f.write(tflite_model)
-            
-            # Clean up temporary files
-            import shutil
-            shutil.rmtree(temp_dir)
-            
-            logger.info(f"Model exported to TFLite: {save_path}")
-            return True
-        
-        except Exception as e:
-            logger.error(f"Failed to export to TFLite: {e}")
-            return False
-
-
-class TransformerBlock(layers.Layer):
-    """Transformer encoder block implementation"""
-    def __init__(self, dim, num_heads, mlp_dim, dropout=0.1, 
-                 activation='relu', norm_first=True, **kwargs):
-        super().__init__(**kwargs)
-        self.dim = dim
-        self.num_heads = num_heads
-        self.mlp_dim = mlp_dim
-        self.dropout_rate = dropout
-        self.activation = activation
-        self.norm_first = norm_first
-        
-        # Multi-head attention
-        self.mha = layers.MultiHeadAttention(
-            num_heads=num_heads,
-            key_dim=dim // num_heads,
-            dropout=dropout
-        )
-        
-        # Layer normalization
-        self.norm1 = layers.LayerNormalization(epsilon=1e-6)
-        self.norm2 = layers.LayerNormalization(epsilon=1e-6)
-        
-        # Dropout layers
-        self.dropout1 = layers.Dropout(dropout)
-        self.dropout2 = layers.Dropout(dropout)
-        
-        # MLP block - exactly like PyTorch imp

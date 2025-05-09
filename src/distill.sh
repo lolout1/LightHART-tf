@@ -1,5 +1,5 @@
 #!/bin/bash
-# distill.sh - Robust knowledge distillation script for LightHART-TF
+# Robust knowledge distillation script for LightHART-TF
 
 # Enable strict error handling
 set -euo pipefail
@@ -19,36 +19,49 @@ TEMPERATURE=4.5
 ALPHA=0.6
 USE_SMV=false
 
-# Set the teacher model path directly to a .h5 weights file
-TEACHER_WEIGHTS="../experiments/teacher_2025-05-09_15-04-49_2025-05-09_15-04-52/models/teacher_model_32.weights.h5"
+# Find teacher model weights - search known locations
+declare -a TEACHER_DIRS=(
+    "../experiments/latest_teacher" 
+    "../experiments/latest_teacher/models"
+    "../experiments/teacher" 
+    "../experiments/teacher/models"
+)
 
-# Check if teacher weights exist
-if [ ! -f "$TEACHER_WEIGHTS" ]; then
-    # Try to find .weights.h5 file
-    if [ -f "${TEACHER_WEIGHTS%.keras}.weights.h5" ]; then
-        TEACHER_WEIGHTS="${TEACHER_WEIGHTS%.keras}.weights.h5"
-        echo "Using weights file: $TEACHER_WEIGHTS"
-    else
-        echo "ERROR: Teacher model weights not found at: $TEACHER_WEIGHTS"
-        echo "Looking for other weights files..."
-        
-        # Search for any available weights files
-        TEACHER_DIR=$(dirname "$TEACHER_WEIGHTS")
-        if [ -d "$TEACHER_DIR" ]; then
-            echo "Searching in directory: $TEACHER_DIR"
-            FOUND_WEIGHTS=$(find "$TEACHER_DIR" -name "teacher_model_*.weights.h5" | head -n 1)
-            if [ -n "$FOUND_WEIGHTS" ]; then
-                TEACHER_WEIGHTS="$FOUND_WEIGHTS"
-                echo "Found alternative teacher weights: $TEACHER_WEIGHTS"
-            else
-                echo "No teacher weight files found. Please train a teacher model first."
-                exit 1
+TEACHER_WEIGHTS=""
+for dir in "${TEACHER_DIRS[@]}"; do
+    if [ -d "$dir" ]; then
+        # Try to find teacher weights for any subject
+        for subject in 32 39 30 31 33 34 35 37 43 44; do
+            pattern="${dir}/*_${subject}*.weights.h5"
+            matches=$(find "${dir}" -name "*_${subject}*.weights.h5" 2>/dev/null | head -n 1)
+            
+            if [ -n "$matches" ]; then
+                # Remove subject suffix and file extension to get base path
+                TEACHER_WEIGHTS="${matches%.weights.h5}"
+                TEACHER_WEIGHTS="${TEACHER_WEIGHTS%_*}"
+                echo "Found teacher weights: $TEACHER_WEIGHTS"
+                break 2
             fi
-        else
-            echo "Teacher model directory not found."
-            exit 1
+        done
+        
+        # If no subject-specific weights found, look for generic weights
+        if [ -z "$TEACHER_WEIGHTS" ]; then
+            pattern="${dir}/*.weights.h5"
+            matches=$(find "${dir}" -name "*.weights.h5" 2>/dev/null | head -n 1)
+            
+            if [ -n "$matches" ]; then
+                # Remove file extension to get base path
+                TEACHER_WEIGHTS="${matches%.weights.h5}"
+                echo "Found generic teacher weights: $TEACHER_WEIGHTS"
+                break
+            fi
         fi
     fi
+done
+
+if [ -z "$TEACHER_WEIGHTS" ]; then
+    echo "WARNING: No teacher weights found automatically. Please specify with --teacher"
+    TEACHER_WEIGHTS="../experiments/teacher/models/teacher_model"
 fi
 
 # Parse command line arguments
@@ -121,18 +134,76 @@ echo "  Using SMV: $USE_SMV"
 echo "  Working directory: $WORK_DIR"
 echo "==========================================\n"
 
+# Verify teacher weights exist for at least one subject
+TEACHER_WEIGHTS_FOUND=false
+for SUBJECT in 32 39 30 31 33 34 35 37 43 44; do
+    WEIGHT_PATH="${TEACHER_WEIGHTS}_${SUBJECT}.weights.h5"
+    if [ -f "$WEIGHT_PATH" ]; then
+        TEACHER_WEIGHTS_FOUND=true
+        echo "Verified teacher weights for subject ${SUBJECT}: ${WEIGHT_PATH}"
+        break
+    fi
+done
+
+if [ "$TEACHER_WEIGHTS_FOUND" = false ]; then
+    # Check if we're using a directory pattern
+    BASE_DIR=$(dirname "$TEACHER_WEIGHTS")
+    if [ -d "$BASE_DIR" ]; then
+        echo "Searching for teacher weights in $BASE_DIR"
+        ALL_WEIGHTS=$(find "$BASE_DIR" -name "*.weights.h5" | sort)
+        echo "Available weights:"
+        echo "$ALL_WEIGHTS"
+        
+        if [ -n "$ALL_WEIGHTS" ]; then
+            echo "Will try to use available weights during distillation"
+            TEACHER_WEIGHTS_FOUND=true
+        fi
+    fi
+    
+    if [ "$TEACHER_WEIGHTS_FOUND" = false ]; then
+        echo "ERROR: No teacher weights found matching pattern: ${TEACHER_WEIGHTS}_*.weights.h5"
+        echo "Please train a teacher model first or specify the correct path with --teacher"
+        exit 1
+    fi
+fi
+
+# Verify data directory exists
+echo "Checking for data directory..."
+declare -a DATA_DIRS=(
+  "../data/smartfallmm"
+  "./data/smartfallmm"
+  "$HOME/data/smartfallmm"
+  "/mmfs1/home/sww35/data/smartfallmm"
+)
+
+DATA_DIR_FOUND=false
+for dir in "${DATA_DIRS[@]}"; do
+  if [ -d "$dir" ]; then
+    echo "Found data directory at: $dir"
+    echo "Contents:"
+    ls -la "$dir"
+    DATA_DIR_FOUND=true
+    break
+  fi
+done
+
+if [ "$DATA_DIR_FOUND" = false ]; then
+  echo "WARNING: No data directory found! Create one manually at ../data/smartfallmm"
+  mkdir -p "../data/smartfallmm"
+fi
+
 # Create required directories
 mkdir -p "${WORK_DIR}/models"
 mkdir -p "${WORK_DIR}/logs"
 mkdir -p "${WORK_DIR}/visualizations"
 mkdir -p "${WORK_DIR}/results"
+mkdir -p "${WORK_DIR}/code"
 
 # Save code for reference
 cp "${CONFIG_FILE}" "${WORK_DIR}/"
-mkdir -p "${WORK_DIR}/code"
 cp "distiller.py" "${WORK_DIR}/code/"
-cp "models/transformer_optimized.py" "${WORK_DIR}/code/"
-cp "models/mm_transformer.py" "${WORK_DIR}/code/"
+cp "models/transformer_optimized.py" "${WORK_DIR}/code/" 2>/dev/null || echo "Warning: transformer_optimized.py not found"
+cp "models/mm_transformer.py" "${WORK_DIR}/code/" 2>/dev/null || echo "Warning: mm_transformer.py not found"
 cp "utils/dataset_tf.py" "${WORK_DIR}/code/" 2>/dev/null || echo "Warning: dataset_tf.py not found"
 cp "utils/loss.py" "${WORK_DIR}/code/" 2>/dev/null || echo "Warning: loss.py not found"
 
@@ -151,6 +222,7 @@ sed -i "s/num_worker:.*/num_worker: ${NUM_WORKERS}/" "${CUSTOM_CONFIG}"
 sed -i "s/use_smv:.*/use_smv: ${USE_SMV}/" "${CUSTOM_CONFIG}"
 sed -i "s/dropout:.*/dropout: ${DROPOUT}/" "${CUSTOM_CONFIG}"
 sed -i "s/feeder:.*/feeder: utils.dataset_tf.UTD_MM_TF/" "${CUSTOM_CONFIG}"
+sed -i "s/verbose:.*/verbose: true/" "${CUSTOM_CONFIG}"
 
 # Suppress TensorFlow warnings
 export TF_CPP_MIN_LOG_LEVEL=2  # Reduce TensorFlow logging noise
@@ -162,9 +234,12 @@ export OMP_NUM_THREADS=${NUM_WORKERS}
 export TF_NUM_INTRAOP_THREADS=${NUM_WORKERS}
 export TF_NUM_INTEROP_THREADS=${NUM_WORKERS}
 
+# Add current directory to Python path
+export PYTHONPATH=".:${PYTHONPATH:-}"
+
 # Run distillation
 echo "Starting knowledge distillation using teacher model: ${TEACHER_WEIGHTS}"
-PYTHONPATH=".:$PYTHONPATH" python distiller.py \
+python distiller.py \
   --config "${CUSTOM_CONFIG}" \
   --work-dir "${WORK_DIR}" \
   --model-saved-name "${MODEL_NAME}" \
@@ -176,112 +251,11 @@ PYTHONPATH=".:$PYTHONPATH" python distiller.py \
   --use-smv "${USE_SMV}" \
   --phase "distill"
 
-# Check training status
+# Check distillation status
 DISTILL_STATUS=$?
 
 if [ ${DISTILL_STATUS} -eq 0 ]; then
   echo "Distillation completed successfully at $(date)"
-  
-  # Export to TFLite
-  echo "Exporting distilled model to TFLite..."
-  PYTHONPATH=".:$PYTHONPATH" python -c "
-import os
-import glob
-import sys
-import tensorflow as tf
-import traceback
-
-# Import TFLite converter
-try:
-    from utils.tflite_converter import convert_to_tflite
-except ImportError:
-    print('TFLite converter not found, using simplified converter')
-    def convert_to_tflite(model, save_path, input_shape, quantize=False):
-        try:
-            # Build converter
-            converter = tf.lite.TFLiteConverter.from_keras_model(model)
-            
-            # Set optimization options
-            if quantize:
-                converter.optimizations = [tf.lite.Optimize.DEFAULT]
-            
-            # Convert model
-            tflite_model = converter.convert()
-            
-            # Save model
-            with open(save_path, 'wb') as f:
-                f.write(tflite_model)
-                
-            print(f'Model exported to {save_path}')
-            return True
-        except Exception as e:
-            print(f'Error converting to TFLite: {e}')
-            return False
-
-# Find the best weights
-model_dir = '${WORK_DIR}/models'
-keras_files = glob.glob(f'{model_dir}/{MODEL_NAME}_*.keras')
-weight_files = glob.glob(f'{model_dir}/{MODEL_NAME}_*.weights.h5')
-
-try:
-    # Import model
-    from models.transformer_optimized import TransModel
-    
-    model = TransModel(
-        acc_frames=128,
-        num_classes=1,
-        num_heads=4,
-        acc_coords=3,
-        embed_dim=32,
-        num_layers=2,
-        dropout=${DROPOUT},
-        activation='relu'
-    )
-    
-    # Build model with dummy input
-    dummy_input = {'accelerometer': tf.zeros((1, 128, 3), dtype=tf.float32)}
-    _ = model(dummy_input, training=False)
-    
-    # Try loading keras file first, then weights
-    loaded = False
-    
-    if keras_files:
-        model_file = keras_files[0]
-        subject_id = model_file.split('_')[-1].split('.')[0]
-        try:
-            model = tf.keras.models.load_model(model_file)
-            loaded = True
-            print(f'Loaded full model for subject {subject_id}: {model_file}')
-        except Exception as e:
-            print(f'Error loading keras model: {e}')
-    
-    if not loaded and weight_files:
-        weight_file = weight_files[0]
-        subject_id = weight_file.split('_')[-1].split('.')[0]
-        try:
-            model.load_weights(weight_file)
-            loaded = True
-            print(f'Loaded weights for subject {subject_id}: {weight_file}')
-        except Exception as e:
-            print(f'Error loading weights: {e}')
-    
-    if loaded:
-        # Export to TFLite
-        tflite_path = f'{model_dir}/{MODEL_NAME}_{subject_id}.tflite'
-        success = convert_to_tflite(
-            model=model,
-            save_path=tflite_path,
-            input_shape=(1, 128, 3 if not ${USE_SMV} else 4),
-            quantize=False
-        )
-        print(f'TFLite export success: {success}')
-    else:
-        print('No model weights loaded for TFLite export')
-        for file in os.listdir(model_dir):
-            print(f'Found file: {file}')
-except Exception as e:
-    print(f'Error exporting to TFLite: {traceback.format_exc()}')
-"
   
   # Create symbolic link to latest experiment
   cd "$(dirname "${WORK_DIR}")"
