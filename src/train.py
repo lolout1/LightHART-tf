@@ -73,7 +73,7 @@ def get_args():
     parser.add_argument('--optimizer', type=str, default='adamw',
                         choices=['adam', 'adamw', 'sgd'],
                         help='Optimizer type')
-    parser.add_argument('--base-lr', type=float, default=0.001,
+    parser.add_argument('--base-lr', type=float, default=0.0001,
                         help='Base learning rate')
     parser.add_argument('--weight-decay', type=float, default=0.0004,
                         help='Weight decay factor')

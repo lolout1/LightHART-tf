@@ -1,8 +1,7 @@
-# config/smartfallmm/mm_transformer.yaml
+# config/smartfallmm/teacher.yaml
 model: models.mm_transformer.MMTransformer
 dataset: smartfallmm
 
-# Subjects for fall detection
 subjects: [32, 39, 30, 31, 33, 34, 35, 37, 43, 44, 45, 36, 29]
 
 model_args:
@@ -12,7 +11,7 @@ model_args:
   in_chans: 3
   num_patch: 4
   acc_coords: 3
-  spatial_embed: 16  # Make sure this matches between dimensions
+  spatial_embed: 16
   sdepth: 4
   adepth: 4
   tdepth: 2
