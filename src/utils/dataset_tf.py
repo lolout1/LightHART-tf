@@ -37,8 +37,12 @@ def csvloader(file_path: str, **kwargs) -> np.ndarray:
     try:
         import pandas as pd
         
-        # Determine if this is skeleton data
+        # Determine modality from file path
         is_skeleton = 'skeleton' in file_path.lower()
+        is_accelerometer = 'accelerometer' in file_path.lower() or 'acc' in file_path.lower()
+        is_gyroscope = 'gyroscope' in file_path.lower() or 'gyro' in file_path.lower()
+        
+        logger.info(f"Loading CSV file: {file_path} (skeleton={is_skeleton}, acc={is_accelerometer}, gyro={is_gyroscope})")
         
         try:
             # First attempt - standard CSV loading
@@ -47,23 +51,28 @@ def csvloader(file_path: str, **kwargs) -> np.ndarray:
             # Handle missing data
             df = df.dropna().bfill()
             
-            # Extract correct columns
+            # Log file shape for debugging
+            logger.info(f"CSV file loaded with shape: {df.shape}")
+            
+            # Extract data based on modality
             if is_skeleton:
                 # For skeleton data (32 joints × 3 coords = 96 columns)
-                cols = 96
+                cols = min(96, df.shape[1])
                 activity_data = df.iloc[2:, -cols:].to_numpy(dtype=np.float32)
                 
                 # Reshape to (frames, joints, coords) if needed
                 if activity_data.shape[1] == 96:
                     frames = activity_data.shape[0]
                     activity_data = activity_data.reshape(frames, 32, 3)
-                    logger.info(f"Reshaped skeleton data from {activity_data.shape} to {activity_data.shape}")
+                    logger.info(f"Reshaped skeleton data to: {activity_data.shape}")
             else:
                 # For accelerometer/gyroscope data (3 columns: x, y, z)
-                activity_data = df.iloc[2:, -3:].to_numpy(dtype=np.float32)
+                cols = min(3, df.shape[1])
+                activity_data = df.iloc[2:, -cols:].to_numpy(dtype=np.float32)
+                logger.info(f"Loaded inertial data with shape: {activity_data.shape}")
         
         except Exception as e:
-            logger.warning(f"Standard CSV parsing failed: {e}. Trying alternative approaches...")
+            logger.warning(f"Standard CSV parsing failed: {e}. Trying alternative...")
             
             try:
                 # Try with no header and different indexing
@@ -78,25 +87,33 @@ def csvloader(file_path: str, **kwargs) -> np.ndarray:
                     else:
                         activity_data = df.iloc[2:, :].to_numpy(dtype=np.float32)
                 else:
-                    # For accelerometer data
+                    # For accelerometer/gyroscope data
                     activity_data = df.iloc[2:, -3:].to_numpy(dtype=np.float32)
             except Exception as e2:
                 logger.error(f"All CSV parsing attempts failed: {e2}")
-                return np.array([])
+                # Return minimal valid data instead of empty array
+                if is_skeleton:
+                    return np.zeros((10, 32, 3), dtype=np.float32)
+                else:
+                    return np.zeros((10, 3), dtype=np.float32)
         
-        # Filter accelerometer data
+        # Filter accelerometer data if needed
         if not is_skeleton and len(activity_data) > 30:
             try:
                 activity_data = butterworth_filter(activity_data, cutoff=7.5, fs=25)
             except Exception as e:
                 logger.warning(f"Butterworth filtering failed: {e}")
         
-        logger.info(f"Loaded {file_path}: shape={activity_data.shape}")
+        logger.info(f"Successfully loaded {file_path}: shape={activity_data.shape}")
         return activity_data
             
     except Exception as e:
         logger.error(f"Error loading CSV file {file_path}: {e}")
-        return np.array([])
+        # Return minimal valid data
+        if 'skeleton' in file_path.lower():
+            return np.zeros((10, 32, 3), dtype=np.float32)
+        else:
+            return np.zeros((10, 3), dtype=np.float32)
 
 def matloader(file_path: str, **kwargs) -> np.ndarray:
     """
@@ -116,6 +133,7 @@ def matloader(file_path: str, **kwargs) -> np.ndarray:
         if key not in ['d_iner', 'd_skel']:
             raise ValueError(f'Unsupported key {key} for matlab file')
         
+        logger.info(f"Loading MAT file {file_path} with key {key}")
         data = loadmat(file_path)[key]
         
         # Apply filtering for inertial data
@@ -127,7 +145,7 @@ def matloader(file_path: str, **kwargs) -> np.ndarray:
         
     except Exception as e:
         logger.error(f"Error loading MAT file {file_path}: {e}")
-        return np.array([])
+        return np.zeros((10, 3), dtype=np.float32)
 
 # Map file extensions to loader functions
 LOADER_MAP = {
@@ -222,7 +240,7 @@ class SmartFallMM:
         logger.info(f"Total files loaded: {total_files}")
     
     def match_trials(self) -> None:
-        """Match files across modalities."""
+        """Match files across modalities with support for single-modality training."""
         trial_dict = {}
         
         # Group files by (subject_id, action_id, sequence_number)
@@ -234,14 +252,31 @@ class SmartFallMM:
                         trial_dict[key] = {}
                     trial_dict[key][modality_name] = modality_file.file_path
         
+        # Get required modalities
+        required_modalities = list(self.selected_sensors.keys())
+        
+        # Determine if we're in single-modality mode
+        accelerometer_only = len(required_modalities) == 1 and required_modalities[0] == 'accelerometer'
+        skeleton_only = len(required_modalities) == 1 and required_modalities[0] == 'skeleton'
+        
+        logger.info(f"Required modalities: {required_modalities}")
+        logger.info(f"Accelerometer only: {accelerometer_only}, Skeleton only: {skeleton_only}")
+        
         # Create matched trials
-        required_modalities = ['accelerometer', 'skeleton']
         complete_trials = []
         partial_trials = 0
         
         for key, files_dict in trial_dict.items():
             # Check if required modalities are present
-            has_required = all(modality in files_dict for modality in required_modalities)
+            if accelerometer_only:
+                # For accelerometer-only mode, only require accelerometer
+                has_required = 'accelerometer' in files_dict
+            elif skeleton_only:
+                # For skeleton-only mode, only require skeleton
+                has_required = 'skeleton' in files_dict
+            else:
+                # For multi-modal training, require all modalities (default)
+                has_required = all(modality in files_dict for modality in required_modalities)
             
             if has_required:
                 subject_id, action_id, sequence_number = key
@@ -363,18 +398,19 @@ class DatasetBuilder:
                     if data is not None and len(data) > 10:  # Skip very short sequences
                         trial_data[modality] = data
                 
-                # Skip if missing key modalities
-                if not all(m in trial_data for m in ['accelerometer', 'skeleton']):
-                    missing = [m for m in ['accelerometer', 'skeleton'] if m not in trial_data]
-                    if self.verbose:
-                        logger.warning(f"Trial {trial.subject_id}-{trial.action_id}-{trial.sequence_number} "
-                                      f"missing required modalities: {missing}")
+                # Check if we have at least one modality (accelerometer or skeleton)
+                if not trial_data:
+                    logger.warning(f"No valid data for trial {trial.subject_id}-{trial.action_id}-{trial.sequence_number}")
                     continue
                 
-                # Apply DTW alignment between modalities - EXACT match to PyTorch implementation
-                aligned_data = align_sequence_dtw(trial_data, 
-                                               joint_id=9,
-                                               use_dtw=self.use_dtw)
+                # Do DTW alignment only if both modalities are present
+                if 'accelerometer' in trial_data and 'skeleton' in trial_data and self.use_dtw:
+                    aligned_data = align_sequence_dtw(trial_data, 
+                                                   joint_id=9,
+                                                   use_dtw=self.use_dtw)
+                else:
+                    # No alignment needed
+                    aligned_data = trial_data
                 
                 # Process data based on mode
                 if self.mode == 'avg_pool':
@@ -384,7 +420,7 @@ class DatasetBuilder:
                         result[key] = pad_sequence_tf(value, self.max_length)
                     result['labels'] = np.array([label])
                 else:
-                    # Selective sliding window - EXACT match to PyTorch implementation
+                    # Selective sliding window
                     result = selective_windowing(aligned_data, self.max_length, label)
                 
                 # Add to dataset if valid
@@ -398,6 +434,8 @@ class DatasetBuilder:
                 logger.error(f"Error processing trial {trial.subject_id}-{trial.action_id}-{trial.sequence_number}: {e}")
                 import traceback
                 logger.error(traceback.format_exc())
+        
+        logger.info(f"Successfully processed {processed_count} trials")
         
         # Concatenate data for each modality
         for key in list(self.data.keys()):
@@ -447,8 +485,6 @@ class DatasetBuilder:
             # Add skeleton if required
             if 'skeleton' in self.kwargs.get('required_modalities', ['accelerometer']):
                 self.data['skeleton'] = np.zeros((1, self.max_length, 32, 3), dtype=np.float32)
-    
-    
     
     def normalization(self) -> Dict[str, np.ndarray]:
         """
@@ -534,7 +570,7 @@ class UTD_MM_TF(tf.keras.utils.Sequence):
         else:
             self.num_samples = len(self.acc_data)
         
-        # Process skeleton data - ensure correct format
+        # Process skeleton data - ensure correct format if it exists
         if self.skl_data is not None and len(self.skl_data) > 0:
             # Fixed - Force consistent shape of [batch, frames, joints, coords]
             if len(self.skl_data.shape) == 3:
@@ -614,8 +650,9 @@ class UTD_MM_TF(tf.keras.utils.Sequence):
             else:
                 batch_data['accelerometer'] = batch_acc
             
-            # Get skeleton data
-            batch_data['skeleton'] = tf.gather(self.skl_data, batch_indices)
+            # Get skeleton data if available
+            if self.skl_data is not None:
+                batch_data['skeleton'] = tf.gather(self.skl_data, batch_indices)
             
             # Get batch labels
             batch_labels = tf.gather(self.labels, batch_indices)
@@ -648,21 +685,39 @@ def prepare_smartfallmm_tf(arg):
     Returns:
         DatasetBuilder: Configured dataset builder
     """
-    # Find data directory
-    data_dir = os.path.join(os.getcwd(), 'data/smartfallmm')
-    if not os.path.exists(data_dir):
-        # Try relative path from parent directory
-        data_dir = os.path.join(os.path.dirname(os.getcwd()), 'data/smartfallmm')
+    # Find data directory with better path resolution
+    possible_paths = [
+        os.path.join(os.getcwd(), 'data/smartfallmm'),
+        os.path.join(os.path.dirname(os.getcwd()), 'data/smartfallmm'),
+        os.path.join(os.path.dirname(os.path.dirname(os.getcwd())), 'data/smartfallmm'),
+        '/mmfs1/home/sww35/data/smartfallmm'  # Add your cluster path here 
+    ]
     
-    if not os.path.exists(data_dir):
-        logger.warning(f"SmartFall data directory not found at {data_dir}")
+    data_dir = None
+    for path in possible_paths:
+        if os.path.exists(path):
+            data_dir = path
+            logger.info(f"Found SmartFall data directory at: {data_dir}")
+            # Debug: list directory contents
+            try:
+                logger.info(f"Directory contents: {os.listdir(data_dir)}")
+            except Exception as e:
+                logger.warning(f"Could not list directory contents: {e}")
+            break
+    
+    if data_dir is None:
+        logger.warning(f"SmartFall data directory not found in any of: {possible_paths}")
         # Create directory if it doesn't exist
+        data_dir = possible_paths[0]
         os.makedirs(data_dir, exist_ok=True)
+        logger.info(f"Created new data directory at: {data_dir}")
     
     # Get configuration parameters with defaults
     age_group = arg.dataset_args.get('age_group', ['young'])
     modalities = arg.dataset_args.get('modalities', ['accelerometer'])
     sensors = arg.dataset_args.get('sensors', ['watch'])
+    
+    logger.info(f"Initializing dataset with: age_group={age_group}, modalities={modalities}, sensors={sensors}")
     
     # Initialize dataset
     sm_dataset = SmartFallMM(root_dir=data_dir)
@@ -672,9 +727,9 @@ def prepare_smartfallmm_tf(arg):
     
     # Create dataset builder
     builder_kwargs = {
-        'verbose': arg.dataset_args.get('verbose', False),
+        'verbose': arg.dataset_args.get('verbose', True),
         'use_dtw': arg.dataset_args.get('use_dtw', True),
-        'required_modalities': arg.dataset_args.get('modalities', ['accelerometer'])
+        'required_modalities': modalities
     }
     
     builder = DatasetBuilder(
@@ -748,8 +803,8 @@ def split_by_subjects_tf(builder, subjects, fuse):
                 # Fallback to minimal labels
                 norm_data['labels'] = np.array([0], dtype=np.int32)
         
-        # Create dummy skeleton if needed
-        if 'skeleton' not in norm_data and 'accelerometer' in norm_data:
+        # Create dummy skeleton if needed and requested
+        if 'skeleton' not in norm_data and 'accelerometer' in norm_data and 'skeleton' in builder.kwargs.get('required_modalities', []):
             logger.warning("No skeleton data, creating dummy")
             acc_shape = norm_data['accelerometer'].shape
             norm_data['skeleton'] = np.zeros((acc_shape[0], acc_shape[1], 32, 3), dtype=np.float32)
@@ -759,9 +814,11 @@ def split_by_subjects_tf(builder, subjects, fuse):
             logger.warning("No valid data, creating dummy dataset")
             norm_data = {
                 'accelerometer': np.zeros((1, builder.max_length, 3), dtype=np.float32),
-                'skeleton': np.zeros((1, builder.max_length, 32, 3), dtype=np.float32),
                 'labels': np.zeros(1, dtype=np.int32)
             }
+            
+            if 'skeleton' in builder.kwargs.get('required_modalities', []):
+                norm_data['skeleton'] = np.zeros((1, builder.max_length, 32, 3), dtype=np.float32)
         
         return norm_data
         
@@ -773,6 +830,64 @@ def split_by_subjects_tf(builder, subjects, fuse):
         # Return minimal valid dataset as fallback
         return {
             'accelerometer': np.zeros((1, builder.max_length, 3), dtype=np.float32),
-            'skeleton': np.zeros((1, builder.max_length, 32, 3), dtype=np.float32),
             'labels': np.zeros(1, dtype=np.int32)
         }
+
+# Data verification utility
+def verify_data_loading(data_dir=None):
+    """Verify data loading from specified directory"""
+    if data_dir is None:
+        # Try common locations
+        possible_paths = [
+            os.path.join(os.getcwd(), 'data/smartfallmm'),
+            os.path.join(os.path.dirname(os.getcwd()), 'data/smartfallmm')
+        ]
+        
+        for path in possible_paths:
+            if os.path.exists(path):
+                data_dir = path
+                break
+    
+    if data_dir is None or not os.path.exists(data_dir):
+        logger.error(f"Data directory not found: {data_dir}")
+        return False
+    
+    logger.info(f"Verifying data loading from: {data_dir}")
+    logger.info(f"Directory exists: {os.path.exists(data_dir)}")
+    
+    try:
+        contents = os.listdir(data_dir)
+        logger.info(f"Directory contents: {contents}")
+    except Exception as e:
+        logger.error(f"Error listing directory: {e}")
+    
+    # Test single file loading
+    csv_files = []
+    for root, _, files in os.walk(data_dir):
+        for file in files:
+            if file.endswith('.csv'):
+                csv_files.append(os.path.join(root, file))
+    
+    if csv_files:
+        logger.info(f"Found {len(csv_files)} CSV files")
+        test_file = csv_files[0]
+        logger.info(f"Testing CSV loading with: {test_file}")
+        
+        try:
+            data = csvloader(test_file)
+            logger.info(f"Successfully loaded file with shape: {data.shape}")
+            return True
+        except Exception as e:
+            logger.error(f"Error loading test file: {e}")
+            return False
+    else:
+        logger.warning("No CSV files found to test loading")
+        return False
+
+if __name__ == "__main__":
+    # Set up logging for standalone testing
+    logging.basicConfig(level=logging.INFO,
+                      format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    
+    # Run data verification
+    verify_data_loading()

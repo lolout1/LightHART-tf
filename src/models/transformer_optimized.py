@@ -75,10 +75,23 @@ class TransModel(tf.keras.Model):
                     f"layers={num_layers}, heads={num_heads}")
     
     def call(self, inputs, training=False, **kwargs):
-        # Handle different input types
-        x = inputs
-        if isinstance(inputs, dict) and 'accelerometer' in inputs:
-            x = inputs['accelerometer']
+        """Forward pass handling different input types"""
+        # Handle different input formats
+        if isinstance(inputs, dict):
+            # Dictionary input with named modalities
+            x = inputs.get('accelerometer')
+            if x is None:
+                raise ValueError("Accelerometer data is required")
+        else:
+            # Direct tensor input
+            x = inputs
+        
+        # Ensure 3D input [batch, frames, features]
+        if len(tf.shape(x)) != 3:
+            raise ValueError(f"Expected 3D input [batch, frames, features], got shape {tf.shape(x)}")
+        
+        # Reorganize if SMV is present (4 channels instead of 3)
+        input_channels = tf.shape(x)[-1]
         
         # Project input - [batch, frames, channels] -> [batch, frames, embed_dim]
         x = self.input_proj(x, training=training)
@@ -101,12 +114,15 @@ class TransModel(tf.keras.Model):
         # Return both logits and features for distillation
         return logits, features
     
-    def export_to_tflite(self, save_path, input_length=128, quantize=False):
+    def export_to_tflite(self, save_path, input_shape=None, quantize=False):
         """Export model to TFLite format"""
+        if input_shape is None:
+            input_shape = [1, self.acc_frames, self.acc_coords]
+        
         try:
             # Create a concrete function that processes raw accelerometer data
             @tf.function(input_signature=[
-                tf.TensorSpec(shape=[1, input_length, self.acc_coords], dtype=tf.float32)
+                tf.TensorSpec(shape=input_shape, dtype=tf.float32)
             ])
             def serving_fn(accelerometer):
                 # Create input dictionary
@@ -148,7 +164,7 @@ class TransModel(tf.keras.Model):
             return False
 
 
-class TransformerBlock(tf.keras.layers.Layer):
+class TransformerBlock(layers.Layer):
     """Transformer encoder block implementation"""
     def __init__(self, dim, num_heads, mlp_dim, dropout=0.1, 
                  activation='relu', norm_first=True, **kwargs):
@@ -175,44 +191,4 @@ class TransformerBlock(tf.keras.layers.Layer):
         self.dropout1 = layers.Dropout(dropout)
         self.dropout2 = layers.Dropout(dropout)
         
-        # MLP block - exactly like PyTorch implementation
-        self.mlp = tf.keras.Sequential([
-            layers.Dense(mlp_dim, activation=activation),
-            layers.Dropout(dropout),
-            layers.Dense(dim),
-            layers.Dropout(dropout)
-        ])
-    
-    def call(self, x, training=False):
-        if self.norm_first:
-            # Pre-norm architecture (like PyTorch implementation)
-            # First multi-head attention block
-            attn_input = self.norm1(x)
-            attn_output = self.mha(
-                query=attn_input, 
-                key=attn_input, 
-                value=attn_input,
-                training=training
-            )
-            attn_output = self.dropout1(attn_output, training=training)
-            out1 = x + attn_output  # First residual connection
-            
-            # Second feed-forward block
-            ff_input = self.norm2(out1)
-            ff_output = self.mlp(ff_input, training=training)
-            return out1 + ff_output  # Second residual connection
-        else:
-            # Post-norm architecture (original Transformer)
-            # First multi-head attention block
-            attn_output = self.mha(
-                query=x, 
-                key=x, 
-                value=x,
-                training=training
-            )
-            attn_output = self.dropout1(attn_output, training=training)
-            out1 = self.norm1(x + attn_output)  # First residual + norm
-            
-            # Second feed-forward block
-            ff_output = self.mlp(out1, training=training)
-            return self.norm2(out1 + ff_output)  # Second residual + norm
+        # MLP block - exactly like PyTorch imp
