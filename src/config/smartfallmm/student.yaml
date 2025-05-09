@@ -9,34 +9,42 @@ model_args:
   acc_frames: 128 
   num_classes: 1
   num_heads: 4
-  acc_coords: 3  # Original accelerometer channels
+  acc_coords: 3
   embed_dim: 32
   num_layers: 2
   dropout: 0.5
   activation: 'relu'
+  norm_first: true
 
 dataset_args: 
   mode: 'sliding_window'
   max_length: 128
   task: 'fd'
-  modalities: ['accelerometer', 'skeleton']
+  modalities: ['accelerometer', 'skeleton']  # Both modalities needed for proper processing
   age_group: ['young']
   sensors: ['watch']
-  use_dtw: false 
-  verbose: false
+  use_dtw: true  # Can toggle between true/false
+  verbose: true  # Enable for debugging
 
-# Specify the correct feeder path
+# Data loading
 feeder: utils.dataset_tf.UTD_MM_TF
-
 batch_size: 16
 test_batch_size: 16
 val_batch_size: 16
 num_epoch: 80
+use_smv: false  # Set to false by default
+
+# Optimization
 optimizer: adamw
 base_lr: 0.001
 weight_decay: 0.0004
 
-# Multi-processing parameters
-num_worker: 0
+# Processing
+num_worker: 4
 seed: 2
-print_log: True
+print_log: true
+
+# Cross-validation definition
+train_subjects_fixed: [45, 36, 29]
+val_subjects_fixed: [38, 46]
+test_eligible_subjects: [32, 39, 30, 31, 33, 34, 35, 37, 43, 44]
