@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 import tensorflow as tf
-from tensorflow.keras import layers
+from tensorflow.keras import layers, Model, Sequential
 import logging
 
 logger = logging.getLogger('transformer-tf')
@@ -15,19 +15,23 @@ class TransformerBlock(layers.Layer):
         self.activation = activation
         self.norm_first = norm_first
         
+        # Multi-head attention
         self.mha = layers.MultiHeadAttention(
             num_heads=num_heads,
             key_dim=dim // num_heads,
             dropout=dropout
         )
         
+        # Layer normalization
         self.norm1 = layers.LayerNormalization(epsilon=1e-6)
         self.norm2 = layers.LayerNormalization(epsilon=1e-6)
         
+        # Dropout layers
         self.dropout1 = layers.Dropout(dropout)
         self.dropout2 = layers.Dropout(dropout)
         
-        self.mlp = tf.keras.Sequential([
+        # MLP layers
+        self.mlp = Sequential([
             layers.Dense(mlp_dim, activation=activation),
             layers.Dropout(dropout),
             layers.Dense(dim),
@@ -35,30 +39,41 @@ class TransformerBlock(layers.Layer):
         ])
     
     def call(self, inputs, training=False):
+        # Pre-norm architecture
         if self.norm_first:
-            attn_output = self.attention_block(self.norm1(inputs), training=training)
-            x = inputs + attn_output
-            outputs = x + self.mlp_block(self.norm2(x), training=training)
+            # First attention block
+            norm_inputs = self.norm1(inputs)
+            attn_output = self.mha(
+                query=norm_inputs, 
+                key=norm_inputs, 
+                value=norm_inputs,
+                training=training
+            )
+            attn_output = self.dropout1(attn_output, training=training)
+            inputs_plus_attn = inputs + attn_output  # First residual connection
+            
+            # Second MLP block
+            norm_inputs_plus_attn = self.norm2(inputs_plus_attn)
+            mlp_output = self.mlp(norm_inputs_plus_attn, training=training)
+            output = inputs_plus_attn + mlp_output  # Second residual connection
         else:
-            attn_output = self.attention_block(inputs, training=training)
-            x = self.norm1(inputs + attn_output)
-            outputs = self.norm2(x + self.mlp_block(x, training=training))
+            # Post-norm architecture
+            attn_output = self.mha(
+                query=inputs, 
+                key=inputs, 
+                value=inputs,
+                training=training
+            )
+            attn_output = self.dropout1(attn_output, training=training)
+            inputs_plus_attn = self.norm1(inputs + attn_output)
+            
+            mlp_output = self.mlp(inputs_plus_attn, training=training)
+            output = self.norm2(inputs_plus_attn + mlp_output)
         
-        return outputs
-    
-    def attention_block(self, inputs, training=False):
-        attention_output = self.mha(
-            query=inputs,
-            key=inputs,
-            value=inputs,
-            training=training
-        )
-        return self.dropout1(attention_output, training=training)
-    
-    def mlp_block(self, inputs, training=False):
-        return self.mlp(inputs, training=training)
+        return output
 
-class TransModel(tf.keras.Model):
+
+class TransModel(Model):
     def __init__(
         self,
         acc_frames=128,
@@ -83,19 +98,14 @@ class TransModel(tf.keras.Model):
         self.activation = activation
         self.norm_first = norm_first
         
-        self.input_proj = tf.keras.Sequential([
-            layers.Conv1D(
-                filters=embed_dim,
-                kernel_size=8,
-                padding='same',
-                use_bias=True,
-                name="input_proj_conv"
-            ),
-            layers.BatchNormalization(name="input_proj_bn")
-        ], name="input_projection")
+        # Create all layers directly
+        self.feature_proj = layers.Dense(embed_dim, name="feature_projection")
+        self.input_dropout = layers.Dropout(dropout)
+        self.input_norm = layers.LayerNormalization(epsilon=1e-6)
         
+        # Create transformer blocks
         self.transformer_blocks = []
-        for i in range(self.num_layers):
+        for i in range(num_layers):
             block = TransformerBlock(
                 dim=embed_dim,
                 num_heads=num_heads,
@@ -107,44 +117,41 @@ class TransModel(tf.keras.Model):
             )
             self.transformer_blocks.append(block)
         
+        # Output layers
         self.temporal_norm = layers.LayerNormalization(epsilon=1e-6, name="temporal_norm")
+        self.global_pool = layers.GlobalAveragePooling1D(name="global_pool")
         self.output_layer = layers.Dense(num_classes, name="output_layer")
         
-        logger.info(f"TransModel initialized: frames={acc_frames}, embed_dim={embed_dim}, layers={num_layers}, heads={num_heads}")
+        logger.info(f"TransModel initialized with: embed_dim={embed_dim}, heads={num_heads}, layers={num_layers}")
     
     def call(self, inputs, training=False, **kwargs):
+        # Handle different input formats
         if isinstance(inputs, dict):
-            acc_data = inputs.get('accelerometer')
-            if acc_data is None:
+            x = inputs.get('accelerometer')
+            if x is None:
                 raise ValueError("Accelerometer data is required")
         else:
-            acc_data = inputs
+            x = inputs
         
-        # Process for both original data and SMV-augmented
-        if isinstance(acc_data, tf.Tensor) and len(acc_data.shape) == 3:
-            x = acc_data
-        else:
-            raise ValueError(f"Expected 3D input [batch, frames, features], got shape {tf.shape(acc_data)}")
-        
-        # Project input - convert to channels-first for Conv1D
-        x = tf.transpose(x, [0, 2, 1])  # [batch, channels, frames]
-        x = self.input_proj(x, training=training)
-        x = tf.transpose(x, [0, 2, 1])  # [batch, frames, channels]
+        # Project input features to embedding dimension
+        x = self.feature_proj(x)
+        x = self.input_norm(x)
+        x = self.input_dropout(x, training=training)
         
         # Process through transformer blocks
         for block in self.transformer_blocks:
             x = block(x, training=training)
         
-        # Final normalization - save features for distillation
+        # Extract features for distillation
         features = self.temporal_norm(x)
         
-        # Global pooling and output
-        pooled = tf.reduce_mean(features, axis=1)
-        logits = self.output_layer(pooled)
+        # Global pooling and classification
+        x = self.global_pool(features)
+        logits = self.output_layer(x)
         
-        # Ensure correct output shape for binary classification
+        # Make sure output shape is correct for binary classification
         if self.num_classes == 1:
-            logits = tf.reshape(logits, [-1, 1])
+            batch_size = tf.shape(inputs['accelerometer'])[0] if isinstance(inputs, dict) else tf.shape(inputs)[0]
+            logits = tf.reshape(logits, [batch_size, 1])
         
-        # Return both logits and features for distillation
         return logits, features

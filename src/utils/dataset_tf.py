@@ -409,47 +409,95 @@ class DatasetBuilder:
         except Exception as e:
             logger.error(f"Error in normalization: {e}")
             return self.data
-
 class UTD_MM_TF(tf.keras.utils.Sequence):
+    """
+    TensorFlow dataset for multi-modal fall detection data with batch support.
+    Provides accelerometer and skeleton data with proper preprocessing.
+    """
     def __init__(self, dataset, batch_size, use_smv=False):
+        """
+        Initialize dataset with multi-modal data.
+        
+        Args:
+            dataset: Dictionary containing modality data and labels
+            batch_size: Batch size for training
+            use_smv: Whether to use Signal Magnitude Vector augmentation
+        """
         self.batch_size = batch_size
         self.dataset = dataset
         self.use_smv = use_smv
         
+        # Extract and validate data
         self.acc_data = dataset.get('accelerometer', None)
         self.skl_data = dataset.get('skeleton', None)
         self.labels = dataset.get('labels', None)
         
-        self._validate_data()
-        self._prepare_data()
+        # Process and validate data
+        self._validate_and_prepare_data()
         
-        self.num_samples = len(self.labels)
+        # Initialize batch indices
         self.indices = np.arange(self.num_samples)
         
         logger.info(f"UTD_MM_TF initialized with {self.num_samples} samples. SMV: {use_smv}")
     
-    def _validate_data(self):
+    def _validate_and_prepare_data(self):
+        """Validate and prepare data structures for batching"""
+        # Handle missing accelerometer data
         if self.acc_data is None or len(self.acc_data) == 0:
             logger.warning("Missing accelerometer data. Creating dummy data.")
             self.acc_data = np.zeros((1, 128, 3), dtype=np.float32)
             self.num_samples = 1
         else:
             self.num_samples = len(self.acc_data)
+            
+            # Ensure correct shape and data type
+            if not isinstance(self.acc_data, np.ndarray):
+                self.acc_data = np.array(self.acc_data, dtype=np.float32)
+            
+            if self.acc_data.dtype != np.float32:
+                self.acc_data = self.acc_data.astype(np.float32)
         
+        # Handle skeleton data - ensure consistent format
         if self.skl_data is not None and len(self.skl_data) > 0:
+            # Ensure consistent shape: [samples, frames, joints, coords]
             if len(self.skl_data.shape) == 3:
-                if self.skl_data.shape[2] == 32:
-                    self.skl_data = self.skl_data.reshape(self.skl_data.shape[0], self.skl_data.shape[1], 32, 1)
-                elif self.skl_data.shape[2] == 96:
-                    self.skl_data = self.skl_data.reshape(self.skl_data.shape[0], self.skl_data.shape[1], 32, 3)
+                # Handle [samples, frames, joints*coords]
+                if self.skl_data.shape[2] % 3 == 0:
+                    num_joints = self.skl_data.shape[2] // 3
+                    self.skl_data = self.skl_data.reshape(
+                        self.skl_data.shape[0], 
+                        self.skl_data.shape[1], 
+                        num_joints, 
+                        3
+                    )
+            
+            # Ensure float32 data type
+            if not isinstance(self.skl_data, np.ndarray):
+                self.skl_data = np.array(self.skl_data, dtype=np.float32)
+                
+            if self.skl_data.dtype != np.float32:
+                self.skl_data = self.skl_data.astype(np.float32)
         else:
             logger.warning("Missing skeleton data. Creating dummy data.")
             self.skl_data = np.zeros((self.num_samples, 128, 32, 3), dtype=np.float32)
         
+        # Handle labels
         if self.labels is None or len(self.labels) == 0:
             logger.warning("Missing labels. Creating dummy labels.")
             self.labels = np.zeros(self.num_samples, dtype=np.int32)
+        else:
+            if not isinstance(self.labels, np.ndarray):
+                self.labels = np.array(self.labels)
+            
+            # Ensure int32 for labels
+            if self.labels.dtype != np.int32:
+                self.labels = self.labels.astype(np.int32)
+            
+            # Flatten any multi-dimensional labels
+            if len(self.labels.shape) > 1:
+                self.labels = self.labels.flatten()
         
+        # Ensure all data has matching first dimension
         min_samples = min(len(self.acc_data), len(self.skl_data), len(self.labels))
         if min_samples < self.num_samples:
             logger.warning(f"Data size mismatch. Truncating to {min_samples} samples.")
@@ -457,64 +505,125 @@ class UTD_MM_TF(tf.keras.utils.Sequence):
             self.skl_data = self.skl_data[:min_samples]
             self.labels = self.labels[:min_samples]
             self.num_samples = min_samples
-    
-    def _prepare_data(self):
-        try:
-            self.acc_data = tf.convert_to_tensor(self.acc_data, dtype=tf.float32)
-            self.skl_data = tf.convert_to_tensor(self.skl_data, dtype=tf.float32)
-            self.labels = tf.convert_to_tensor(self.labels, dtype=tf.int32)
-            
-            if self.use_smv:
+        
+        # Convert to TensorFlow tensors
+        self.acc_data = tf.convert_to_tensor(self.acc_data, dtype=tf.float32)
+        self.skl_data = tf.convert_to_tensor(self.skl_data, dtype=tf.float32)
+        self.labels = tf.convert_to_tensor(self.labels, dtype=tf.int32)
+        
+        # Pre-calculate SMV if needed
+        if self.use_smv:
+            try:
+                # Calculate signal magnitude vector (SMV)
                 mean = tf.reduce_mean(self.acc_data, axis=1, keepdims=True)
                 zero_mean = self.acc_data - mean
                 sum_squared = tf.reduce_sum(tf.square(zero_mean), axis=-1, keepdims=True)
                 self.smv = tf.sqrt(sum_squared)
-                logger.info(f"Signal Magnitude Vector calculated: {self.smv.shape}")
-        except Exception as e:
-            logger.error(f"Error preparing data tensors: {e}")
+                logger.info(f"Pre-calculated SMV with shape: {self.smv.shape}")
+            except Exception as e:
+                logger.error(f"Error calculating SMV: {e}. Will calculate on-the-fly.")
+                self.smv = None
     
     def __len__(self):
+        """Return number of batches in the dataset"""
         return (self.num_samples + self.batch_size - 1) // self.batch_size
     
     def __getitem__(self, idx):
+        """Get a batch of data by index"""
         try:
+            # Calculate batch indices
             batch_start = idx * self.batch_size
             batch_end = min(batch_start + self.batch_size, self.num_samples)
+            current_batch_size = batch_end - batch_start
             batch_indices = self.indices[batch_start:batch_end]
             
-            batch_data = {}
-            batch_acc = tf.gather(self.acc_data, batch_indices)
+            # Convert batch indices to tensor for gathering
+            batch_indices_tensor = tf.convert_to_tensor(batch_indices, dtype=tf.int32)
             
+            # Prepare batch data
+            batch_data = {}
+            
+            # Get accelerometer data for this batch
+            batch_acc = tf.gather(self.acc_data, batch_indices_tensor)
+            
+            # Handle SMV calculation
             if self.use_smv:
-                if hasattr(self, 'smv'):
-                    batch_smv = tf.gather(self.smv, batch_indices)
+                if hasattr(self, 'smv') and self.smv is not None:
+                    # Use pre-calculated SMV
+                    batch_smv = tf.gather(self.smv, batch_indices_tensor)
                 else:
+                    # Calculate SMV on-the-fly
                     mean = tf.reduce_mean(batch_acc, axis=1, keepdims=True)
                     zero_mean = batch_acc - mean
                     sum_squared = tf.reduce_sum(tf.square(zero_mean), axis=-1, keepdims=True)
                     batch_smv = tf.sqrt(sum_squared)
+                
+                # Concatenate SMV with original accelerometer data
                 batch_data['accelerometer'] = tf.concat([batch_smv, batch_acc], axis=-1)
             else:
                 batch_data['accelerometer'] = batch_acc
             
-            if self.skl_data is not None:
-                batch_data['skeleton'] = tf.gather(self.skl_data, batch_indices)
+            # Get skeleton data
+            batch_data['skeleton'] = tf.gather(self.skl_data, batch_indices_tensor)
             
-            batch_labels = tf.gather(self.labels, batch_indices)
+            # Get batch labels
+            batch_labels = tf.gather(self.labels, batch_indices_tensor)
             
+            # Return batch data and indices
             return batch_data, batch_labels, batch_indices
             
         except Exception as e:
             logger.error(f"Error creating batch {idx}: {e}")
-            batch_size = min(self.batch_size, self.num_samples - batch_start)
-            dummy_acc = tf.zeros((batch_size, self.acc_data.shape[1], 4 if self.use_smv else 3), dtype=tf.float32)
-            dummy_skl = tf.zeros((batch_size, self.skl_data.shape[1], self.skl_data.shape[2], 3), dtype=tf.float32)
+            traceback.print_exc()
+            
+            # Return valid dummy data in case of error
+            current_batch_size = min(self.batch_size, self.num_samples - batch_start)
+            if current_batch_size <= 0:
+                current_batch_size = self.batch_size
+            
+            # Create dummy data with correct shapes
+            acc_channels = 4 if self.use_smv else 3
+            dummy_acc = tf.zeros((current_batch_size, self.acc_data.shape[1], acc_channels), dtype=tf.float32)
+            dummy_skl = tf.zeros((current_batch_size, self.skl_data.shape[1], 
+                                 self.skl_data.shape[2], self.skl_data.shape[3]), dtype=tf.float32)
+            
             dummy_data = {'accelerometer': dummy_acc, 'skeleton': dummy_skl}
-            dummy_labels = tf.zeros(batch_size, dtype=tf.int32)
-            return dummy_data, dummy_labels, tf.range(batch_size)
+            dummy_labels = tf.zeros(current_batch_size, dtype=tf.int32)
+            dummy_indices = tf.range(current_batch_size, dtype=tf.int32)
+            
+            return dummy_data, dummy_labels, dummy_indices
     
     def on_epoch_end(self):
+        """Shuffle data indices at the end of each epoch"""
         np.random.shuffle(self.indices)
+    
+    def get_data_shapes(self):
+        """Return data shapes for debugging purposes"""
+        shapes = {
+            'accelerometer': tuple(self.acc_data.shape),
+            'skeleton': tuple(self.skl_data.shape),
+            'labels': tuple(self.labels.shape),
+        }
+        if hasattr(self, 'smv') and self.smv is not None:
+            shapes['smv'] = tuple(self.smv.shape)
+        return shapes
+    
+    def get_sample(self, idx):
+        """Get a single sample for debugging or visualization"""
+        if idx < 0 or idx >= self.num_samples:
+            logger.error(f"Index {idx} out of range [0, {self.num_samples-1}]")
+            return None
+        
+        sample = {
+            'accelerometer': self.acc_data[idx].numpy(),
+            'skeleton': self.skl_data[idx].numpy(),
+            'label': int(self.labels[idx].numpy())
+        }
+        
+        if hasattr(self, 'smv') and self.smv is not None:
+            sample['smv'] = self.smv[idx].numpy()
+            
+        return sample
 
 def prepare_smartfallmm_tf(arg):
     possible_paths = [
