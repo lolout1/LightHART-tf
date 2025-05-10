@@ -12,7 +12,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import seaborn as sns
 from train import Trainer, str2bool
-from utils.loss import DistillationLoss
+from utils.loss import DistillationLoss, BinaryFocalLoss
 from models.cross_align_tf import CrossModalAligner
 
 logger = logging.getLogger('distiller')
@@ -23,9 +23,12 @@ class Distiller(Trainer):
         self.teacher_model = None
         self.cross_aligner = None
         self.distillation_loss = None
+        # Initialize standard loss for evaluation
+        self.criterion = None
+        self.print_log("Distiller initialized successfully")
     
     def load_data(self):
-        """Override load_data to add more debugging information"""
+        """Override load_data to ensure proper data loading like train.py"""
         from utils.dataset_tf import prepare_smartfallmm_tf, split_by_subjects_tf
         
         self.print_log("=== Loading Data for Distillation ===")
@@ -37,36 +40,22 @@ class Distiller(Trainer):
             Feeder = self.import_class(self.arg.feeder)
             
             if self.arg.dataset == 'smartfallmm':
-                self.print_log("Preparing SmartFallMM dataset...")
                 builder = prepare_smartfallmm_tf(self.arg)
-                self.print_log(f"Dataset builder created: {builder}")
             else:
                 raise ValueError(f"Unsupported dataset: {self.arg.dataset}")
             
             if self.arg.phase in ['train', 'distill']:
-                # Compute global statistics
+                # Compute global statistics from all subjects
                 all_subjects = self.train_subjects + self.val_subject + self.test_subject
                 self.print_log(f"Computing global statistics from {len(all_subjects)} subjects")
                 
-                try:
-                    all_data = split_by_subjects_tf(builder, all_subjects, False, compute_stats_only=True)
-                    self.acc_mean = all_data.get('acc_mean')
-                    self.acc_std = all_data.get('acc_std')
-                    self.skl_mean = all_data.get('skl_mean')
-                    self.skl_std = all_data.get('skl_std')
-                    self.print_log("Global statistics computed successfully")
-                except Exception as e:
-                    self.print_log(f"ERROR computing global statistics: {e}")
-                    import traceback
-                    self.print_log(traceback.format_exc())
-                    # Continue without normalization
-                    self.acc_mean = None
-                    self.acc_std = None
-                    self.skl_mean = None
-                    self.skl_std = None
+                all_data = split_by_subjects_tf(builder, all_subjects, False, compute_stats_only=True)
+                self.acc_mean = all_data.get('acc_mean')
+                self.acc_std = all_data.get('acc_std')
+                self.skl_mean = all_data.get('skl_mean')
+                self.skl_std = all_data.get('skl_std')
                 
                 # Load training data
-                self.print_log("Loading training data...")
                 self.norm_train = split_by_subjects_tf(builder, self.train_subjects, False, 
                                                       acc_mean=self.acc_mean, acc_std=self.acc_std,
                                                       skl_mean=self.skl_mean, skl_std=self.skl_std)
@@ -78,7 +67,6 @@ class Distiller(Trainer):
                 self.print_log(f"Training data loaded: {len(self.norm_train['labels'])} samples")
                 
                 # Load validation data
-                self.print_log("Loading validation data...")
                 self.norm_val = split_by_subjects_tf(builder, self.val_subject, False,
                                                     acc_mean=self.acc_mean, acc_std=self.acc_std,
                                                     skl_mean=self.skl_mean, skl_std=self.skl_std)
@@ -90,7 +78,6 @@ class Distiller(Trainer):
                 self.print_log(f"Validation data loaded: {len(self.norm_val['labels'])} samples")
                 
                 # Load test data
-                self.print_log("Loading test data...")
                 self.norm_test = split_by_subjects_tf(builder, self.test_subject, False,
                                                      acc_mean=self.acc_mean, acc_std=self.acc_std,
                                                      skl_mean=self.skl_mean, skl_std=self.skl_std)
@@ -135,8 +122,33 @@ class Distiller(Trainer):
             self.print_log(traceback.format_exc())
             return False
     
+    def load_loss(self):
+        """Override to load both standard loss and distillation loss"""
+        # Load standard criterion for evaluation (from parent class)
+        from utils.loss import BinaryFocalLoss
+        self.pos_weights = getattr(self, 'pos_weights', tf.constant(1.0))
+        self.criterion = BinaryFocalLoss(alpha=0.75, gamma=2.0)
+        self.print_log(f"Loaded standard loss with pos_weight: {self.pos_weights.numpy()}")
+        
+        # Load distillation loss for training
+        self.load_distillation_loss()
+    
+    def load_distillation_loss(self):
+        """Load distillation loss with proper configuration"""
+        temperature = getattr(self.arg, 'temperature', 4.5)
+        alpha = getattr(self.arg, 'alpha', 0.6)
+        pos_weight = self.pos_weights if hasattr(self, 'pos_weights') else None
+        
+        self.distillation_loss = DistillationLoss(
+            temperature=temperature,
+            alpha=alpha,
+            pos_weight=pos_weight
+        )
+        
+        self.print_log(f"Initialized distillation loss with temp={temperature}, alpha={alpha}")
+    
     def load_teacher_model(self):
-        """Load teacher model - exact match to PyTorch implementation"""
+        """Load teacher model - match PyTorch implementation"""
         logger.info(f"Loading teacher model: {self.arg.teacher_model}")
         
         teacher_class = self.import_class(self.arg.teacher_model)
@@ -158,25 +170,30 @@ class Distiller(Trainer):
         subject_id = self.test_subject[0] if hasattr(self, 'test_subject') and self.test_subject else None
         
         if subject_id:
-            weight_path = f"{self.arg.teacher_weight}_{subject_id}.weights.h5"
-            if os.path.exists(weight_path):
-                teacher_model.load_weights(weight_path)
-                logger.info(f"Loaded teacher weights from {weight_path}")
-            else:
-                # Try loading full model
-                model_path = f"{self.arg.teacher_weight}_{subject_id}.keras"
-                if os.path.exists(model_path):
-                    teacher_model = tf.keras.models.load_model(model_path)
-                    logger.info(f"Loaded teacher model from {model_path}")
-                else:
-                    logger.warning(f"Teacher weights not found for subject {subject_id}")
-                    # Try without underscore if filename doesn't include redundant "teacher_model"
-                    alt_weight_path = f"{os.path.dirname(self.arg.teacher_weight)}/teacher_model_{subject_id}.weights.h5"
-                    if os.path.exists(alt_weight_path):
-                        teacher_model.load_weights(alt_weight_path)
-                        logger.info(f"Loaded teacher weights from {alt_weight_path}")
-                    else:
-                        logger.error(f"No teacher weights found for subject {subject_id}")
+            # Try different weight file paths
+            weight_paths = [
+                f"{self.arg.teacher_weight}_{subject_id}.weights.h5",
+                f"{self.arg.teacher_weight}_{subject_id}.keras",
+                f"{os.path.dirname(self.arg.teacher_weight)}/teacher_model_{subject_id}.weights.h5",
+                f"{os.path.dirname(self.arg.teacher_weight)}/teacher_model_{subject_id}.keras"
+            ]
+            
+            loaded = False
+            for weight_path in weight_paths:
+                if os.path.exists(weight_path):
+                    try:
+                        if weight_path.endswith('.weights.h5'):
+                            teacher_model.load_weights(weight_path)
+                        else:
+                            teacher_model = tf.keras.models.load_model(weight_path, compile=False)
+                        logger.info(f"Loaded teacher weights from {weight_path}")
+                        loaded = True
+                        break
+                    except Exception as e:
+                        logger.warning(f"Failed to load weights from {weight_path}: {e}")
+            
+            if not loaded:
+                logger.error(f"No teacher weights found for subject {subject_id}")
         
         # Set teacher to non-trainable
         teacher_model.trainable = False
@@ -190,23 +207,10 @@ class Distiller(Trainer):
         logger.info(f"Initialized cross-modal aligner with dim={feature_dim}, heads={num_heads}")
         return aligner
     
-    def load_distillation_loss(self):
-        """Load distillation loss with proper configuration"""
-        temperature = getattr(self.arg, 'temperature', 4.5)
-        alpha = getattr(self.arg, 'alpha', 0.6)
-        pos_weight = self.pos_weights if hasattr(self, 'pos_weights') else None
-        
-        self.distillation_loss = DistillationLoss(
-            temperature=temperature,
-            alpha=alpha,
-            pos_weight=pos_weight
-        )
-        
-        self.print_log(f"Initialized distillation loss with temp={temperature}, alpha={alpha}")
-    
     def viz_feature(self, teacher_features, student_features, epoch):
         """Visualize feature distributions - match PyTorch implementation"""
         try:
+            # Flatten features for visualization
             teacher_features = tf.reshape(teacher_features, (teacher_features.shape[0], -1))
             student_features = tf.reshape(student_features, (student_features.shape[0], -1))
             
@@ -225,6 +229,7 @@ class Distiller(Trainer):
                            color='red', label='Student')
                 
                 plt.legend()
+                plt.title(f'Sample {i+1}')
                 
             plt.tight_layout()
             viz_path = os.path.join(self.arg.work_dir, 'visualizations', 
@@ -318,9 +323,10 @@ class Distiller(Trainer):
                     student_outputs = self.model(inputs, training=False)
                     
                     if isinstance(teacher_outputs, tuple) and isinstance(student_outputs, tuple):
-                        _, teacher_features = teacher_outputs
-                        _, student_features = student_outputs
-                        self.viz_feature(teacher_features, student_features, epoch)
+                        if len(teacher_outputs) > 1 and len(student_outputs) > 1:
+                            _, teacher_features = teacher_outputs
+                            _, student_features = student_outputs
+                            self.viz_feature(teacher_features, student_features, epoch)
                 
             except Exception as e:
                 self.print_log(f"Error in training batch {batch_idx}: {e}")
@@ -340,7 +346,7 @@ class Distiller(Trainer):
             self.print_log(f'Epoch {epoch+1} Distillation Results:')
             self.print_log(f'  Loss: {train_loss:.4f}')
             self.print_log(f'  Accuracy: {accuracy:.2f}%')
-            self.print_log(f'  F1 Score: {f1:.2f}%')
+            self.print_log(f'  F1 Score: {f1:.2f}%')  
             self.print_log(f'  Precision: {precision:.2f}%')
             self.print_log(f'  Recall: {recall:.2f}%')
             self.print_log(f'  AUC: {auc_score:.2f}%')
@@ -350,7 +356,7 @@ class Distiller(Trainer):
             self.print_log("Warning: No valid training batches!")
             return True
         
-        # Validation
+        # Validation using standard loss
         val_loss = self.eval(epoch, loader_name='val')
         self.val_loss_summary.append(float(val_loss))
         
@@ -395,26 +401,23 @@ class Distiller(Trainer):
                     # Clear TF session
                     tf.keras.backend.clear_session()
                     
-                    # Load teacher model
+                    # Load models
                     self.teacher_model = self.load_teacher_model()
-                    
-                    # Load student model
                     self.model = self.load_model()
-                    self.print_log(f'Student Model Parameters: {self.count_parameters()}')
+                    self.print_log(f'Model Parameters: {self.count_parameters()}')
                     
                     # Load cross-modal aligner if enabled
                     if hasattr(self.arg, 'use_cross_aligner') and self.arg.use_cross_aligner:
                         self.cross_aligner = self.load_cross_aligner()
                     
-                    # Load data with detailed error handling
-                    self.print_log("Loading data for distillation...")
+                    # Load data
                     if not self.load_data():
-                        self.print_log(f"Failed to load data for subject {test_subject} - skipping fold")
+                        self.print_log(f"Failed to load data for subject {test_subject}")
                         continue
                     
-                    # Setup optimization
+                    # Setup optimization and losses
                     self.load_optimizer()
-                    self.load_distillation_loss()
+                    self.load_loss()
                     
                     # Reset early stopping
                     self.early_stop.reset()
@@ -424,16 +427,11 @@ class Distiller(Trainer):
                         if self.train(epoch):
                             break
                     
-                    # Save distilled model
-                    weight_path = f'{self.model_path}_{test_subject}.weights.h5'
-                    self.model.save_weights(weight_path)
-                    self.print_log(f"Distilled model saved to: {weight_path}")
-                    
-                    # Reload best weights and evaluate
+                    # Reload best model and evaluate
                     self.model = self.load_model()
-                    self.model.load_weights(weight_path)
+                    self.load_weights()
                     
-                    self.print_log(f'\n=== Testing Subject {test_subject} ===')
+                    self.print_log(f'\n=== Testing Subject {self.test_subject[0]} ===')
                     self.eval(epoch=0, loader_name='test')
                     
                     # Visualize loss curves
@@ -441,7 +439,7 @@ class Distiller(Trainer):
                     
                     # Store results
                     subject_result = {
-                        'test_subject': str(test_subject),
+                        'test_subject': str(self.test_subject[0]),
                         'accuracy': round(self.test_accuracy, 2),
                         'f1_score': round(self.test_f1, 2),
                         'precision': round(self.test_precision, 2),
@@ -491,12 +489,10 @@ class Distiller(Trainer):
                 self.print_log("="*60)
                 
                 # Create overall visualization
-                if hasattr(self, 'create_overall_visualization'):
-                    self.create_overall_visualization(df_results)
+                self.create_overall_visualization(df_results)
                 
                 # Create summary report
-                if hasattr(self, 'create_summary_report'):
-                    self.create_summary_report(df_results, stats)
+                self.create_summary_report(df_results, stats)
             else:
                 self.print_log("Warning: No results collected!")
         else:
@@ -507,24 +503,7 @@ def get_distill_args():
     parser = argparse.ArgumentParser(description='Knowledge Distillation')
     
     parser.add_argument('--config', default='./config/smartfallmm/distill.yaml')
-    parser.add_argument('--work-dir', type=str, default='distilled')
-    parser.add_argument('--model-saved-name', type=str, default='distilled_model')
-    parser.add_argument('--device', nargs='+', default=[0], type=int)
-    parser.add_argument('--phase', type=str, default='distill')
-    
-    # Teacher model args
-    parser.add_argument('--teacher-model', type=str, default=None)
-    parser.add_argument('--teacher-args', type=str, default=None)
-    parser.add_argument('--teacher-weight', type=str, default=None)
-    
-    # Student model args
-    parser.add_argument('--model', type=str, default=None)
-    parser.add_argument('--model-args', type=str, default=None)
-    
-    # Distillation args
-    parser.add_argument('--temperature', type=float, default=4.5)
-    parser.add_argument('--alpha', type=float, default=0.6)
-    parser.add_argument('--use-cross-aligner', type=str2bool, default=True)
+    parser.add_argument('--dataset', type=str, default='smartfallmm')
     
     # Training args
     parser.add_argument('--batch-size', type=int, default=16)
@@ -536,17 +515,39 @@ def get_distill_args():
     parser.add_argument('--base-lr', type=float, default=0.001)
     parser.add_argument('--weight-decay', type=float, default=0.0004)
     
+    # Model args
+    parser.add_argument('--model', default=None)
+    parser.add_argument('--device', nargs='+', default=[0], type=int)
+    parser.add_argument('--model-args', default=None, type=str)
+    parser.add_argument('--model-saved-name', type=str, default='distilled_model')
+    
+    # Teacher model args
+    parser.add_argument('--teacher-model', type=str, default=None)
+    parser.add_argument('--teacher-args', type=str, default=None)
+    parser.add_argument('--teacher-weight', type=str, default=None)
+    
+    # Distillation args
+    parser.add_argument('--temperature', type=float, default=4.5)
+    parser.add_argument('--alpha', type=float, default=0.6) 
+    parser.add_argument('--use-cross-aligner', type=str2bool, default=False)
+    
     # Dataset args
-    parser.add_argument('--dataset', type=str, default='smartfallmm')
-    parser.add_argument('--dataset-args', type=str, default=None)
-    parser.add_argument('--subjects', nargs='+', type=int, default=None)
-    parser.add_argument('--feeder', type=str, default=None)
+    parser.add_argument('--dataset-args', default=None, type=str)
+    parser.add_argument('--subjects', nargs='+', type=int)
+    parser.add_argument('--feeder', default=None)
     
     # Other args
     parser.add_argument('--seed', type=int, default=2)
-    parser.add_argument('--num-worker', type=int, default=0)
-    parser.add_argument('--use-smv', type=str2bool, default=False)
+    parser.add_argument('--work-dir', type=str, default='distilled')
     parser.add_argument('--print-log', type=str2bool, default=True)
+    parser.add_argument('--phase', type=str, default='distill')
+    parser.add_argument('--num-worker', type=int, default=22)
+    parser.add_argument('--use-smv', type=str2bool, default=False)
+    
+    # Cross validation args
+    parser.add_argument('--train-subjects-fixed', nargs='+', type=int)
+    parser.add_argument('--val-subjects-fixed', nargs='+', type=int)
+    parser.add_argument('--test-eligible-subjects', nargs='+', type=int)
     
     return parser
 
