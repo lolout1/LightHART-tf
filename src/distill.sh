@@ -19,50 +19,9 @@ TEMPERATURE=4.5
 ALPHA=0.6
 USE_SMV=false
 
-# Find teacher model weights - search known locations
-declare -a TEACHER_DIRS=(
-    "../experiments/latest_teacher" 
-    "../experiments/latest_teacher/models"
-    "../experiments/teacher" 
-    "../experiments/teacher/models"
-)
-
-TEACHER_WEIGHTS=""
-for dir in "${TEACHER_DIRS[@]}"; do
-    if [ -d "$dir" ]; then
-        # Try to find teacher weights for any subject
-        for subject in 32 39 30 31 33 34 35 37 43 44; do
-            pattern="${dir}/*_${subject}*.weights.h5"
-            matches=$(find "${dir}" -name "*_${subject}*.weights.h5" 2>/dev/null | head -n 1)
-            
-            if [ -n "$matches" ]; then
-                # Remove subject suffix and file extension to get base path
-                TEACHER_WEIGHTS="${matches%.weights.h5}"
-                TEACHER_WEIGHTS="${TEACHER_WEIGHTS%_*}"
-                echo "Found teacher weights: $TEACHER_WEIGHTS"
-                break 2
-            fi
-        done
-        
-        # If no subject-specific weights found, look for generic weights
-        if [ -z "$TEACHER_WEIGHTS" ]; then
-            pattern="${dir}/*.weights.h5"
-            matches=$(find "${dir}" -name "*.weights.h5" 2>/dev/null | head -n 1)
-            
-            if [ -n "$matches" ]; then
-                # Remove file extension to get base path
-                TEACHER_WEIGHTS="${matches%.weights.h5}"
-                echo "Found generic teacher weights: $TEACHER_WEIGHTS"
-                break
-            fi
-        fi
-    fi
-done
-
-if [ -z "$TEACHER_WEIGHTS" ]; then
-    echo "WARNING: No teacher weights found automatically. Please specify with --teacher"
-    TEACHER_WEIGHTS="../experiments/teacher/models/teacher_model"
-fi
+# Override default teacher weights path
+# Use the actual path from your directory listing
+TEACHER_WEIGHTS="../experiments/teacher_2025-05-09_21-04-16/models/teacher_model_20250509_210419"
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -136,35 +95,29 @@ echo "==========================================\n"
 
 # Verify teacher weights exist for at least one subject
 TEACHER_WEIGHTS_FOUND=false
-for SUBJECT in 32 39 30 31 33 34 35 37 43 44; do
-    WEIGHT_PATH="${TEACHER_WEIGHTS}_${SUBJECT}.weights.h5"
-    if [ -f "$WEIGHT_PATH" ]; then
+echo "Checking for teacher weights..."
+
+# List all subjects we need to check
+SUBJECTS=(32 39 30 31 33 34 35 37 43 44 29 36 45)
+
+for SUBJECT in "${SUBJECTS[@]}"; do
+    # Check for both weight file formats
+    WEIGHT_PATH_H5="${TEACHER_WEIGHTS}_${SUBJECT}.weights.h5"
+    WEIGHT_PATH_KERAS="${TEACHER_WEIGHTS}_${SUBJECT}.keras"
+    
+    if [ -f "$WEIGHT_PATH_H5" ]; then
         TEACHER_WEIGHTS_FOUND=true
-        echo "Verified teacher weights for subject ${SUBJECT}: ${WEIGHT_PATH}"
-        break
+        echo "✓ Verified teacher weights for subject ${SUBJECT}: ${WEIGHT_PATH_H5}"
+    elif [ -f "$WEIGHT_PATH_KERAS" ]; then
+        TEACHER_WEIGHTS_FOUND=true
+        echo "✓ Verified teacher weights for subject ${SUBJECT}: ${WEIGHT_PATH_KERAS}"
     fi
 done
 
 if [ "$TEACHER_WEIGHTS_FOUND" = false ]; then
-    # Check if we're using a directory pattern
-    BASE_DIR=$(dirname "$TEACHER_WEIGHTS")
-    if [ -d "$BASE_DIR" ]; then
-        echo "Searching for teacher weights in $BASE_DIR"
-        ALL_WEIGHTS=$(find "$BASE_DIR" -name "*.weights.h5" | sort)
-        echo "Available weights:"
-        echo "$ALL_WEIGHTS"
-        
-        if [ -n "$ALL_WEIGHTS" ]; then
-            echo "Will try to use available weights during distillation"
-            TEACHER_WEIGHTS_FOUND=true
-        fi
-    fi
-    
-    if [ "$TEACHER_WEIGHTS_FOUND" = false ]; then
-        echo "ERROR: No teacher weights found matching pattern: ${TEACHER_WEIGHTS}_*.weights.h5"
-        echo "Please train a teacher model first or specify the correct path with --teacher"
-        exit 1
-    fi
+    echo "ERROR: No teacher weights found at path: ${TEACHER_WEIGHTS}_*.weights.h5 or ${TEACHER_WEIGHTS}_*.keras"
+    echo "Please check the path and try again."
+    exit 1
 fi
 
 # Verify data directory exists
@@ -180,16 +133,14 @@ DATA_DIR_FOUND=false
 for dir in "${DATA_DIRS[@]}"; do
   if [ -d "$dir" ]; then
     echo "Found data directory at: $dir"
-    echo "Contents:"
-    ls -la "$dir"
     DATA_DIR_FOUND=true
     break
   fi
 done
 
 if [ "$DATA_DIR_FOUND" = false ]; then
-  echo "WARNING: No data directory found! Create one manually at ../data/smartfallmm"
-  mkdir -p "../data/smartfallmm"
+  echo "WARNING: No data directory found! Please ensure SmartFall data is available."
+  echo "Expected locations: ${DATA_DIRS[*]}"
 fi
 
 # Create required directories
@@ -224,6 +175,13 @@ sed -i "s/dropout:.*/dropout: ${DROPOUT}/" "${CUSTOM_CONFIG}"
 sed -i "s/feeder:.*/feeder: utils.dataset_tf.UTD_MM_TF/" "${CUSTOM_CONFIG}"
 sed -i "s/verbose:.*/verbose: true/" "${CUSTOM_CONFIG}"
 
+# Ensure model and teacher model paths are correct
+sed -i "s|model:.*|model: models.transformer_optimized.TransModel|" "${CUSTOM_CONFIG}"
+sed -i "s|teacher_model:.*|teacher_model: models.mm_transformer.MMTransformer|" "${CUSTOM_CONFIG}"
+
+# Update dataset mode to selective window
+sed -i "s/mode:.*/mode: 'selective_window'/" "${CUSTOM_CONFIG}"
+
 # Suppress TensorFlow warnings
 export TF_CPP_MIN_LOG_LEVEL=2  # Reduce TensorFlow logging noise
 export TF_FORCE_GPU_ALLOW_GROWTH=true  # Avoid allocating all GPU memory
@@ -239,6 +197,8 @@ export PYTHONPATH=".:${PYTHONPATH:-}"
 
 # Run distillation
 echo "Starting knowledge distillation using teacher model: ${TEACHER_WEIGHTS}"
+echo "Running with configuration from: ${CUSTOM_CONFIG}"
+
 python distiller.py \
   --config "${CUSTOM_CONFIG}" \
   --work-dir "${WORK_DIR}" \
@@ -265,6 +225,18 @@ if [ ${DISTILL_STATUS} -eq 0 ]; then
   
   echo "Created latest_distilled symlink"
   echo "All distillation artifacts saved to: ${WORK_DIR}"
+  
+  # List the results
+  echo "Generated models:"
+  ls -la "${WORK_DIR}/models/" || echo "No models found"
+  
+  echo "Results:"
+  if [ -f "${WORK_DIR}/distillation_scores.csv" ]; then
+    cat "${WORK_DIR}/distillation_scores.csv"
+  else
+    echo "No scores file found"
+  fi
+  
 else
   echo "⚠️ Distillation failed with status ${DISTILL_STATUS}"
   exit ${DISTILL_STATUS}

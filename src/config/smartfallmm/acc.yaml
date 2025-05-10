@@ -17,19 +17,14 @@ model_args:
   norm_first: true
 
 dataset_args: 
-  mode: 'selective_window'  # Changed from sliding_window to match PyTorch
+  mode: 'sliding_window'
   max_length: 128
   task: 'fd'
-  modalities: ['accelerometer', 'skeleton']
+  modalities: ['accelerometer'] # Both modalities needed for proper processing
   age_group: ['young']
   sensors: ['watch']
-  use_dtw: true
-  verbose: true
-  # Peak detection parameters from PyTorch
-  fall_height: 1.4
-  fall_distance: 50
-  non_fall_height: 1.2
-  non_fall_distance: 100
+  use_dtw: false # toggle between true/false
+  verbose: true  # Enable for debugging
 
 # Data loading
 feeder: utils.dataset_tf.UTD_MM_TF
@@ -37,7 +32,7 @@ batch_size: 16
 test_batch_size: 16
 val_batch_size: 16
 num_epoch: 80
-use_smv: false
+use_smv: false  # Set to false by default
 
 # Optimization
 optimizer: adamw

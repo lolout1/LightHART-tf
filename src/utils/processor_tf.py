@@ -75,13 +75,10 @@ def align_sequence_dtw(data, joint_id=9, use_dtw=True):
     try:
         has_skeleton = 'skeleton' in data and data['skeleton'] is not None and len(data['skeleton']) > 0
         has_accelerometer = 'accelerometer' in data and data['accelerometer'] is not None and len(data['accelerometer']) > 0
-        
         if (not has_skeleton or not has_accelerometer) or not use_dtw:
             logger.info(f"DTW skipped (use_dtw={use_dtw}, has_skeleton={has_skeleton}, has_acc={has_accelerometer})")
             return data
-        
         logger.info(f"Performing DTW alignment between skeleton and accelerometer data")
-        
         if len(data['skeleton'].shape) == 4:
             skeleton_joint_data = data['skeleton'][:, joint_id-1, :]
         elif len(data['skeleton'].shape) == 3 and data['skeleton'].shape[1] >= joint_id * 3:
@@ -91,32 +88,22 @@ def align_sequence_dtw(data, joint_id=9, use_dtw=True):
         else:
             logger.warning(f"Skeleton shape not compatible: {data['skeleton'].shape}")
             return data
-        
         inertial_data = data['accelerometer']
         dynamic_keys = [k for k in data.keys() if k != 'skeleton' and k != 'labels']
-        
         if len(dynamic_keys) > 1:
             min_length = min(len(data[key]) for key in dynamic_keys)
             for key in dynamic_keys:
                 data[key] = data[key][:min_length]
-        
         skeleton_frob_norm = norm(skeleton_joint_data, axis=1)
         inertial_frob_norm = norm(inertial_data, axis=1)
-        
         if len(skeleton_frob_norm) == 0 or len(inertial_frob_norm) == 0:
             logger.warning(f"Empty norm vectors for DTW, skipping")
             min_length = min(len(data['accelerometer']), len(data['skeleton']))
             data['accelerometer'] = data['accelerometer'][:min_length]
             data['skeleton'] = data['skeleton'][:min_length]
             return data
-        
         try:
-            distance, path = fastdtw(
-                inertial_frob_norm.reshape(-1, 1), 
-                skeleton_frob_norm.reshape(-1, 1),
-                dist=euclidean,
-                radius=10
-            )
+            distance, path = fastdtw(inertial_frob_norm.reshape(-1, 1), skeleton_frob_norm.reshape(-1, 1), dist=euclidean, radius=10)
             logger.info(f"DTW completed with distance: {distance:.2f}")
         except Exception as e:
             logger.error(f"DTW calculation error: {e}")
@@ -125,14 +112,11 @@ def align_sequence_dtw(data, joint_id=9, use_dtw=True):
                 data[key] = data[key][:min_length]
             data['skeleton'] = data['skeleton'][:min_length]
             return data
-        
         inertial_ids, skeleton_ids = filter_repeated_ids(path)
         inertial_ids = sorted(list(inertial_ids))
         skeleton_ids = sorted(list(skeleton_ids))
-        
         inertial_ids = [idx for idx in inertial_ids if idx < len(inertial_data)]
         skeleton_ids = [idx for idx in skeleton_ids if idx < len(data['skeleton'])]
-        
         min_required_length = 128
         if len(inertial_ids) < min_required_length or len(skeleton_ids) < min_required_length:
             logger.warning(f"DTW sequences too short: {len(inertial_ids)}/{len(skeleton_ids)} < {min_required_length}")
@@ -145,7 +129,6 @@ def align_sequence_dtw(data, joint_id=9, use_dtw=True):
             data['skeleton'] = filter_data_by_ids(data['skeleton'], skeleton_ids)
             for key in dynamic_keys:
                 data[key] = filter_data_by_ids(data[key], inertial_ids)
-        
         return data
     except Exception as e:
         logger.error(f"Error in DTW alignment: {e}")
@@ -169,34 +152,25 @@ def create_dummy_windows(data, label, window_size):
 
 def selective_windowing(data, window_size, label):
     try:
+        if label == 1:
+            height, distance = 1.4, 50
+        else:
+            height, distance = 1.2, 100
         required_modalities = [k for k in data.keys() if k != 'labels' and len(data[k]) > 0]
         logger.info(f"Available modalities for windowing: {required_modalities}")
-        
         if not required_modalities:
             logger.warning("No valid modalities for windowing")
             return create_dummy_windows(data, label, window_size)
-        
         peak_modality = 'accelerometer' if 'accelerometer' in required_modalities else required_modalities[0]
         peak_data = data[peak_modality]
-        
         if len(peak_data) < window_size:
             logger.warning(f"Insufficient {peak_modality} data: {len(peak_data)} < {window_size}")
             return create_dummy_windows(data, label, window_size)
-        
         sqrt_sum = np.sqrt(np.sum(peak_data**2, axis=1))
-        
-        if label == 1:  # Fall
-            height, distance = 1.4, 50
-        else:  # Non-fall
-            height, distance = 1.2, 100
-        
         peaks, _ = find_peaks(sqrt_sum, height=height, distance=distance)
-        
         if len(peaks) == 0:
             peaks = [len(sqrt_sum) // 2]
             logger.info(f"No peaks found for label {label}, using center point")
-        
-        # Verify windows across ALL modalities first
         valid_windows_indices = []
         for peak in peaks:
             valid_for_all_modalities = True
@@ -208,11 +182,9 @@ def selective_windowing(data, window_size, label):
                     break
             if valid_for_all_modalities:
                 valid_windows_indices.append(peak)
-        
         if not valid_windows_indices:
             logger.warning(f"No valid windows across all modalities for label {label}")
             return create_dummy_windows(data, label, window_size)
-        
         windows_dict = {}
         for key in required_modalities:
             windows = []
@@ -226,11 +198,9 @@ def selective_windowing(data, window_size, label):
             if windows:
                 windows_dict[key] = np.stack(windows)
                 logger.info(f"Created {len(windows)} windows for {key}, shape: {windows_dict[key].shape}")
-        
         if not windows_dict:
             logger.warning(f"Failed to create windows for any modality")
             return create_dummy_windows(data, label, window_size)
-        
         windows_dict['labels'] = np.full(len(valid_windows_indices), label, dtype=np.int32)
         logger.info(f"Created {len(windows_dict['labels'])} synchronized windows for label {label}")
         return windows_dict
@@ -242,21 +212,16 @@ def sliding_window(data, max_length, stride=10, label=0):
     try:
         available_modalities = [k for k in data.keys() if k != 'labels' and len(data[k]) > 0]
         logger.info(f"Sliding window for modalities: {available_modalities}")
-        
         if not available_modalities:
             logger.warning("No valid modalities for sliding window")
             return {'labels': np.array([label])}
-        
         first_modality = available_modalities[0]
         seq_length = len(data[first_modality])
-        
         if seq_length < max_length:
             logger.warning(f"Insufficient {first_modality} data: {seq_length} < {max_length}")
             return create_dummy_windows(data, label, max_length)
-        
         window_starts = range(0, seq_length - max_length + 1, stride)
         windows_dict = {}
-        
         for key in available_modalities:
             windows = []
             for start in window_starts:
@@ -264,14 +229,12 @@ def sliding_window(data, max_length, stride=10, label=0):
                 window = data[key][start:end]
                 if len(window) == max_length:
                     windows.append(window)
-            
             if windows:
                 try:
                     windows_dict[key] = np.stack(windows)
                     logger.info(f"Created {len(windows)} sliding windows for {key}, shape: {windows_dict[key].shape}")
                 except Exception as e:
                     logger.error(f"Error stacking windows for {key}: {e}")
-        
         if windows_dict:
             first_key = next(iter(windows_dict))
             windows_dict['labels'] = np.full(len(windows_dict[first_key]), label, dtype=np.int32)

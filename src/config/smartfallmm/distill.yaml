@@ -14,6 +14,8 @@ model_args:
   embed_dim: 32
   num_layers: 2
   dropout: 0.5
+  activation: 'relu'
+  norm_first: true
 
 teacher_args:
   mocap_frames: 128
@@ -39,15 +41,21 @@ temperature: 4.5
 alpha: 0.6
 
 dataset_args: 
-  mode: 'sliding_window'
+  mode: 'selective_window'  # Changed from sliding_window
   max_length: 128
   task: 'fd'
-  modalities: ['accelerometer','skeleton']  # Student only needs accelerometer
+  modalities: ['accelerometer', 'skeleton']
   age_group: ['young']
   sensors: ['watch']
-  use_dtw: true # No need for DTW with only accelerometer
+  use_dtw: true
+  verbose: true
+  # Peak detection parameters
+  fall_height: 1.4
+  fall_distance: 50
+  non_fall_height: 1.2
+  non_fall_distance: 100
 
-feeder: feeder.make_dataset_tf.UTD_MM_TF
+feeder: utils.dataset_tf.UTD_MM_TF
 batch_size: 16
 test_batch_size: 16
 val_batch_size: 16
@@ -55,6 +63,12 @@ num_epoch: 80
 optimizer: adamw
 base_lr: 0.001
 weight_decay: 0.0004
+use_smv: false
 
-# Path to teacher model weights (will be set by distill.sh)
-teacher_weight: "../experiments/latest_teacher/models/teacher_model.weights.h5"
+# Cross-validation configuration
+train_subjects_fixed: [45, 36, 29]
+val_subjects_fixed: [38, 46]
+test_eligible_subjects: [32, 39, 30, 31, 33, 34, 35, 37, 43, 44]
+
+# Path to teacher model weights
+teacher_weight: "../experiments/teacher_2025-05-09_18-06-45/models/teacher_model_20250509_180648"
