@@ -1,5 +1,5 @@
 #!/bin/bash
-# distill.sh - Robust knowledge distillation script for LightHART-TF
+# Robust knowledge distillation script for LightHART-TF
 
 # Enable strict error handling
 set -euo pipefail
@@ -19,18 +19,9 @@ TEMPERATURE=4.5
 ALPHA=0.6
 USE_SMV=false
 
-# Check for latest teacher model
-if [ -L "../experiments/latest_teacher" ]; then
-    LATEST_TEACHER="../experiments/latest_teacher"
-    TEACHER_WEIGHTS=$(find "$LATEST_TEACHER/models" -name "teacher_model_*.weights.h5" | head -n 1)
-    if [ -z "$TEACHER_WEIGHTS" ]; then
-        echo "No teacher weights found in latest_teacher directory"
-        exit 1
-    fi
-else
-    echo "No latest_teacher symlink found. Please train a teacher model first."
-    exit 1
-fi
+# Override default teacher weights path
+# Use the actual path from your directory listing
+TEACHER_WEIGHTS="../experiments/teacher_2025-05-09_21-04-16/models/teacher_model_20250509_210419"
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -102,19 +93,70 @@ echo "  Using SMV: $USE_SMV"
 echo "  Working directory: $WORK_DIR"
 echo "==========================================\n"
 
+# Verify teacher weights exist for at least one subject
+TEACHER_WEIGHTS_FOUND=false
+echo "Checking for teacher weights..."
+
+# List all subjects we need to check
+SUBJECTS=(32 39 30 31 33 34 35 37 43 44 29 36 45)
+
+for SUBJECT in "${SUBJECTS[@]}"; do
+    # Check for both weight file formats
+    WEIGHT_PATH_H5="${TEACHER_WEIGHTS}_${SUBJECT}.weights.h5"
+    WEIGHT_PATH_KERAS="${TEACHER_WEIGHTS}_${SUBJECT}.keras"
+    
+    if [ -f "$WEIGHT_PATH_H5" ]; then
+        TEACHER_WEIGHTS_FOUND=true
+        echo "✓ Verified teacher weights for subject ${SUBJECT}: ${WEIGHT_PATH_H5}"
+    elif [ -f "$WEIGHT_PATH_KERAS" ]; then
+        TEACHER_WEIGHTS_FOUND=true
+        echo "✓ Verified teacher weights for subject ${SUBJECT}: ${WEIGHT_PATH_KERAS}"
+    fi
+done
+
+if [ "$TEACHER_WEIGHTS_FOUND" = false ]; then
+    echo "ERROR: No teacher weights found at path: ${TEACHER_WEIGHTS}_*.weights.h5 or ${TEACHER_WEIGHTS}_*.keras"
+    echo "Please check the path and try again."
+    exit 1
+fi
+
+# Verify data directory exists
+echo "Checking for data directory..."
+declare -a DATA_DIRS=(
+  "../data/smartfallmm"
+  "./data/smartfallmm"
+  "$HOME/data/smartfallmm"
+  "/mmfs1/home/sww35/data/smartfallmm"
+)
+
+DATA_DIR_FOUND=false
+for dir in "${DATA_DIRS[@]}"; do
+  if [ -d "$dir" ]; then
+    echo "Found data directory at: $dir"
+    DATA_DIR_FOUND=true
+    break
+  fi
+done
+
+if [ "$DATA_DIR_FOUND" = false ]; then
+  echo "WARNING: No data directory found! Please ensure SmartFall data is available."
+  echo "Expected locations: ${DATA_DIRS[*]}"
+fi
+
 # Create required directories
 mkdir -p "${WORK_DIR}/models"
 mkdir -p "${WORK_DIR}/logs"
 mkdir -p "${WORK_DIR}/visualizations"
 mkdir -p "${WORK_DIR}/results"
+mkdir -p "${WORK_DIR}/code"
 
 # Save code for reference
 cp "${CONFIG_FILE}" "${WORK_DIR}/"
-mkdir -p "${WORK_DIR}/code"
 cp "distiller.py" "${WORK_DIR}/code/"
-cp "models/transformer_optimized.py" "${WORK_DIR}/code/"
-cp "models/mm_transformer.py" "${WORK_DIR}/code/"
-cp "utils/dataset_tf.py" "${WORK_DIR}/code/"
+cp "models/transformer_optimized.py" "${WORK_DIR}/code/" 2>/dev/null || echo "Warning: transformer_optimized.py not found"
+cp "models/mm_transformer.py" "${WORK_DIR}/code/" 2>/dev/null || echo "Warning: mm_transformer.py not found"
+cp "utils/dataset_tf.py" "${WORK_DIR}/code/" 2>/dev/null || echo "Warning: dataset_tf.py not found"
+cp "utils/loss.py" "${WORK_DIR}/code/" 2>/dev/null || echo "Warning: loss.py not found"
 
 # Create a custom config with our parameters
 CUSTOM_CONFIG="${WORK_DIR}/distill_custom.yaml"
@@ -131,18 +173,32 @@ sed -i "s/num_worker:.*/num_worker: ${NUM_WORKERS}/" "${CUSTOM_CONFIG}"
 sed -i "s/use_smv:.*/use_smv: ${USE_SMV}/" "${CUSTOM_CONFIG}"
 sed -i "s/dropout:.*/dropout: ${DROPOUT}/" "${CUSTOM_CONFIG}"
 sed -i "s/feeder:.*/feeder: utils.dataset_tf.UTD_MM_TF/" "${CUSTOM_CONFIG}"
+sed -i "s/verbose:.*/verbose: true/" "${CUSTOM_CONFIG}"
 
-# Set TensorFlow environment variables
+# Ensure model and teacher model paths are correct
+sed -i "s|model:.*|model: models.transformer_optimized.TransModel|" "${CUSTOM_CONFIG}"
+sed -i "s|teacher_model:.*|teacher_model: models.mm_transformer.MMTransformer|" "${CUSTOM_CONFIG}"
+
+# Update dataset mode to selective window
+sed -i "s/mode:.*/mode: 'selective_window'/" "${CUSTOM_CONFIG}"
+
+# Suppress TensorFlow warnings
 export TF_CPP_MIN_LOG_LEVEL=2  # Reduce TensorFlow logging noise
 export TF_FORCE_GPU_ALLOW_GROWTH=true  # Avoid allocating all GPU memory
 export CUDA_VISIBLE_DEVICES=${GPU_ID}
 
-# For better multi-processing performance
+# Performance settings
 export OMP_NUM_THREADS=${NUM_WORKERS}
 export TF_NUM_INTRAOP_THREADS=${NUM_WORKERS}
 export TF_NUM_INTEROP_THREADS=${NUM_WORKERS}
 
+# Add current directory to Python path
+export PYTHONPATH=".:${PYTHONPATH:-}"
+
 # Run distillation
+echo "Starting knowledge distillation using teacher model: ${TEACHER_WEIGHTS}"
+echo "Running with configuration from: ${CUSTOM_CONFIG}"
+
 python distiller.py \
   --config "${CUSTOM_CONFIG}" \
   --work-dir "${WORK_DIR}" \
@@ -155,67 +211,11 @@ python distiller.py \
   --use-smv "${USE_SMV}" \
   --phase "distill"
 
-# Check training status
+# Check distillation status
 DISTILL_STATUS=$?
 
 if [ ${DISTILL_STATUS} -eq 0 ]; then
   echo "Distillation completed successfully at $(date)"
-  
-  # Export to TFLite
-  echo "Exporting distilled model to TFLite..."
-  python -c "
-import os
-import glob
-import sys
-import tensorflow as tf
-import traceback
-from utils.tflite_converter import convert_to_tflite
-
-try:
-    # Find the best weights
-    model_dir = '${WORK_DIR}/models'
-    weight_files = glob.glob(f'{model_dir}/${MODEL_NAME}_*.weights.h5')
-    
-    if weight_files:
-        # Load the model architecture
-        from models.transformer_optimized import TransModel
-        
-        model = TransModel(
-            acc_frames=128,
-            num_classes=1,
-            num_heads=4,
-            acc_coords=3,
-            embed_dim=32,
-            num_layers=2,
-            dropout=${DROPOUT},
-            activation='relu'
-        )
-        
-        # Build model with dummy input
-        dummy_input = {'accelerometer': tf.zeros((1, 128, 3), dtype=tf.float32)}
-        _ = model(dummy_input, training=False)
-        
-        # Load weights
-        best_weight = weight_files[0]
-        subject_id = best_weight.split('_')[-1].split('.')[0]
-        print(f'Loading weights for subject {subject_id}: {best_weight}')
-        model.load_weights(best_weight)
-        
-        # Export to TFLite
-        tflite_path = f'{model_dir}/{MODEL_NAME}_{subject_id}.tflite'
-        success = convert_to_tflite(
-            model=model,
-            save_path=tflite_path,
-            input_shape=(1, 128, 3 if not ${USE_SMV} else 4),
-            quantize=False
-        )
-        print(f'TFLite export success: {success}')
-    else:
-        print('No model weights found for TFLite export')
-except Exception as e:
-    print(f'Error exporting to TFLite: {e}')
-    traceback.print_exc()
-"
   
   # Create symbolic link to latest experiment
   cd "$(dirname "${WORK_DIR}")"
@@ -225,6 +225,18 @@ except Exception as e:
   
   echo "Created latest_distilled symlink"
   echo "All distillation artifacts saved to: ${WORK_DIR}"
+  
+  # List the results
+  echo "Generated models:"
+  ls -la "${WORK_DIR}/models/" || echo "No models found"
+  
+  echo "Results:"
+  if [ -f "${WORK_DIR}/distillation_scores.csv" ]; then
+    cat "${WORK_DIR}/distillation_scores.csv"
+  else
+    echo "No scores file found"
+  fi
+  
 else
   echo "⚠️ Distillation failed with status ${DISTILL_STATUS}"
   exit ${DISTILL_STATUS}

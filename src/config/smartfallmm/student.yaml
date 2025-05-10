@@ -1,33 +1,31 @@
-# config/smartfallmm/student.yaml
+# src/config/smartfallmm/student.yaml
 model: models.transformer_optimized.TransModel
 dataset: smartfallmm
-
-# Subjects for fall detection
 subjects: [32, 39, 30, 31, 33, 34, 35, 37, 43, 44, 45, 36, 29]
-
 model_args:
-  acc_frames: 128 
+  acc_frames: 64
   num_classes: 1
   num_heads: 4
-  acc_coords: 3  # Original accelerometer channels
+  acc_coords: 3
   embed_dim: 32
   num_layers: 2
   dropout: 0.5
   activation: 'relu'
-
+  norm_first: true
 dataset_args: 
-  mode: 'sliding_window'
-  max_length: 128
+  mode: 'selective_window'
+  max_length: 64
   task: 'fd'
   modalities: ['accelerometer', 'skeleton']
   age_group: ['young']
   sensors: ['watch']
-  use_dtw: true
-  verbose: false
-
-# Specify the correct feeder path
+  use_dtw: true 
+  verbose: true
+  fall_height: 1.4
+  fall_distance: 50
+  non_fall_height: 1.2
+  non_fall_distance: 100
 feeder: utils.dataset_tf.UTD_MM_TF
-
 batch_size: 16
 test_batch_size: 16
 val_batch_size: 16
@@ -35,8 +33,6 @@ num_epoch: 80
 optimizer: adamw
 base_lr: 0.001
 weight_decay: 0.0004
-
-# Multi-processing parameters
-num_worker: 0
+use_smv: false
 seed: 2
-print_log: True
+print_log: true

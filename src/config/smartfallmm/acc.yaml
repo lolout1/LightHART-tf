@@ -1,4 +1,4 @@
-# config/smartfallmm/optimized.yaml
+# config/smartfallmm/student.yaml
 model: models.transformer_optimized.TransModel
 dataset: smartfallmm
 
@@ -9,30 +9,42 @@ model_args:
   acc_frames: 128 
   num_classes: 1
   num_heads: 4
-  acc_coords: 3  # Original accelerometer channels (SMV is added internally)
-  embed_dim: 32  # Match PyTorch implementation
+  acc_coords: 3
+  embed_dim: 32
   num_layers: 2
   dropout: 0.5
   activation: 'relu'
+  norm_first: true
 
 dataset_args: 
   mode: 'sliding_window'
   max_length: 128
   task: 'fd'
-  modalities: ['accelerometer', 'skeleton']  # Keep both for DTW alignment
+  modalities: ['accelerometer'] # Both modalities needed for proper processing
   age_group: ['young']
   sensors: ['watch']
-  use_dtw: true
+  use_dtw: false # toggle between true/false
+  verbose: true  # Enable for debugging
+
+# Data loading
 feeder: utils.dataset_tf.UTD_MM_TF
 batch_size: 16
 test_batch_size: 16
 val_batch_size: 16
 num_epoch: 80
-use_smv: true  # Enable Signal Magnitude Vector calculation
+use_smv: false  # Set to false by default
+
+# Optimization
 optimizer: adamw
 base_lr: 0.001
 weight_decay: 0.0004
 
-phase: 'train'
+# Processing
+num_worker: 4
 seed: 2
-print_log: True
+print_log: true
+
+# Cross-validation definition
+train_subjects_fixed: [45, 36, 29]
+val_subjects_fixed: [38, 46]
+test_eligible_subjects: [32, 39, 30, 31, 33, 34, 35, 37, 43, 44]

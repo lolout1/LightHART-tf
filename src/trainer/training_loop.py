@@ -93,60 +93,74 @@ def cal_prediction(logits):
 def train_epoch(model, optimizer, criterion, data_loader, epoch, num_epochs, logger):
     """Train model for one epoch"""
     model.trainable = True
-    
+
     # Start timer
     start_time = time.time()
-    
+
     # Initialize metrics
     train_loss = 0.0
     all_labels = []
     all_preds = []
     steps = 0
-    
-    # Create progress bar with correct total
+
+    # Get total number of batches
     total_steps = len(data_loader)
+
+    # Always print beginning of epoch
+    print(f"Epoch {epoch+1}/{num_epochs} - Training started ({total_steps} batches)")
+    logger(f"Epoch {epoch+1}/{num_epochs} - Training started ({total_steps} batches)")
+
+    # Create progress bar with correct total
     desc = f"Epoch {epoch+1}/{num_epochs}"
     progress_bar = tqdm(data_loader, desc=desc, total=total_steps)
-    
+
     # Iterate through batches
     for batch_idx, (inputs, targets, _) in enumerate(progress_bar):
         try:
             # Convert targets to float32
             targets = tf.cast(targets, tf.float32)
-            
+
             # Train step
             loss, predictions = train_step(model, inputs, targets, optimizer, criterion)
-            
+
             # Update metrics
             loss_val = loss.numpy() if isinstance(loss, tf.Tensor) else float(loss)
             train_loss += loss_val
             all_labels.extend(targets.numpy())
             all_preds.extend(predictions.numpy())
             steps += 1
-            
+
             # Update progress bar
             progress_bar.set_postfix({
                 'loss': f"{train_loss/steps:.4f}"
             })
-            
+
+            # Log progress periodically
+            if batch_idx % 10 == 0:
+                batch_msg = f"Batch {batch_idx+1}/{total_steps}, Loss: {loss_val:.4f}"
+                print(batch_msg)
+                logger(batch_msg)
+
             # Break if we've gone through all batches
             if batch_idx >= total_steps - 1:
                 break
-                
+
         except tf.errors.InvalidArgumentError as e:
-            logger(f"Error in batch {batch_idx}: {e}")
+            error_msg = f"Error in batch {batch_idx}: {e}"
+            print(error_msg)
+            logger(error_msg)
             # Continue with next batch
             continue
-    
+
     # Calculate average loss and metrics
     train_loss /= steps if steps > 0 else 1.0
     metrics = calculate_metrics(all_labels, all_preds)
-    
+
     # Calculate epoch time
     epoch_time = time.time() - start_time
-    
+
     # Log results
-    logger(
+    results_msg = (
         f"Epoch {epoch+1}: "
         f"Train Loss={train_loss:.4f}, "
         f"Acc={metrics['accuracy']:.2f}%, "
@@ -156,7 +170,9 @@ def train_epoch(model, optimizer, criterion, data_loader, epoch, num_epochs, log
         f"AUC={metrics['auc']:.2f}% "
         f"({epoch_time:.2f}s)"
     )
-    
+    print(results_msg)
+    logger(results_msg)
+
     return train_loss, metrics, all_labels, all_preds
 
 def evaluate_model(model, criterion, data_loader, epoch, name='val', logger=None):
@@ -173,8 +189,16 @@ def evaluate_model(model, criterion, data_loader, epoch, name='val', logger=None
     all_logits = []
     steps = 0
 
-    # Create progress bar with correct total
+    # Get total number of batches
     total_steps = len(data_loader)
+
+    # Always print beginning of evaluation
+    eval_start_msg = f"Evaluating {name} (epoch {epoch+1}) - {total_steps} batches"
+    print(eval_start_msg)
+    if logger:
+        logger(eval_start_msg)
+
+    # Create progress bar with correct total
     desc = f"Eval {name} ({epoch+1})"
     progress_bar = tqdm(data_loader, desc=desc, total=total_steps)
 
@@ -200,13 +224,22 @@ def evaluate_model(model, criterion, data_loader, epoch, name='val', logger=None
                 'loss': f"{eval_loss/steps:.4f}"
             })
 
+            # Log progress periodically
+            if batch_idx % 5 == 0:
+                batch_msg = f"Evaluating {name} - Batch {batch_idx+1}/{total_steps}, Loss: {loss_val:.4f}"
+                print(batch_msg)
+                if logger:
+                    logger(batch_msg)
+
             # Break if we've gone through all batches
             if batch_idx >= total_steps - 1:
                 break
 
         except tf.errors.InvalidArgumentError as e:
+            error_msg = f"Error in batch {batch_idx}: {e}"
+            print(error_msg)
             if logger:
-                logger(f"Error in batch {batch_idx}: {e}")
+                logger(error_msg)
             # Continue with next batch
             continue
 
@@ -214,20 +247,22 @@ def evaluate_model(model, criterion, data_loader, epoch, name='val', logger=None
     eval_loss /= steps if steps > 0 else 1.0
     metrics = calculate_metrics(all_labels, all_preds)
 
-    # Log results
-    if logger:
-        logger(
-            f"{name.capitalize()}: "
-            f"Loss={eval_loss:.4f}, "
-            f"Acc={metrics['accuracy']:.2f}%, "
-            f"F1={metrics['f1']:.2f}%, "
-            f"Prec={metrics['precision']:.2f}%, "
-            f"Rec={metrics['recall']:.2f}%, "
-            f"AUC={metrics['auc']:.2f}%"
-        )
+    # Calculate epoch time
+    epoch_time = time.time() - start_time
 
-        # Calculate epoch time
-        epoch_time = time.time() - start_time
-        logger(f"{name.capitalize()} time: {epoch_time:.2f}s")
+    # Log results - always print even if logger is None
+    results_msg = (
+        f"{name.capitalize()} evaluation complete: "
+        f"Loss={eval_loss:.4f}, "
+        f"Acc={metrics['accuracy']:.2f}%, "
+        f"F1={metrics['f1']:.2f}%, "
+        f"Prec={metrics['precision']:.2f}%, "
+        f"Rec={metrics['recall']:.2f}%, "
+        f"AUC={metrics['auc']:.2f}% "
+        f"({epoch_time:.2f}s)"
+    )
+    print(results_msg)
+    if logger:
+        logger(results_msg)
 
     return eval_loss, metrics

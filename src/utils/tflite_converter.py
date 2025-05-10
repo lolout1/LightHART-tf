@@ -2,135 +2,110 @@ import os
 import tensorflow as tf
 import logging
 import numpy as np
+import time
 
-def convert_to_tflite(model, save_path, input_shape=(1, 64, 3), quantize=False):
-    """Convert model to TFLite format with accelerometer-only input.
-    
-    This function creates a TFLite model that only takes accelerometer data as input,
-    even if the original model was trained with both skeleton and accelerometer data.
-    
-    Args:
-        model: TensorFlow model to convert
-        save_path: Path to save the TFLite model
-        input_shape: Input shape for accelerometer data (batch, frames, channels)
-        quantize: Whether to apply quantization
-        
-    Returns:
-        bool: Success status
-    """
+logger = logging.getLogger(__name__)
+
+def convert_to_tflite(model, save_path, input_shape=(1, 64, 3), quantize=False, optimize_for_mobile=True):
     try:
-        # Ensure the directory exists
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        
-        # Add .tflite extension if not present
         if not save_path.endswith('.tflite'):
             save_path += '.tflite'
         
-        # Use the model's built-in export method if available
-        if hasattr(model, 'export_to_tflite'):
-            logging.info("Using model's built-in TFLite export method")
-            return model.export_to_tflite(save_path, 64, False)
+        logger.info(f"Starting TFLite conversion with input shape {input_shape}")
+        logger.info(f"TensorFlow version: {tf.__version__}")
         
-        logging.info(f"Starting TFLite conversion with input shape {input_shape}")
-        
-        # Create concrete function for accelerometer-only input
-        class WrapperModel(tf.keras.Model):
+        # Simple wrapper for accelerometer-only input
+        class AccelerometerOnlyModel(tf.keras.Model):
             def __init__(self, parent_model):
                 super().__init__()
                 self.parent = parent_model
             
-            @tf.function
+            @tf.function(input_signature=[tf.TensorSpec(shape=input_shape, dtype=tf.float32)])
             def call(self, inputs):
-                # Wrap accelerometer data in dictionary for parent model
+                # Direct input without SMV calculation
                 inputs_dict = {'accelerometer': inputs}
-                # Get output from parent model
-                return self.parent(inputs_dict, training=False)
+                outputs = self.parent(inputs_dict, training=False)
+                if isinstance(outputs, tuple):
+                    return outputs[0]
+                return outputs
         
-        # Create and initialize wrapper model
-        wrapper_model = WrapperModel(model)
-        dummy_input = tf.zeros(input_shape, dtype=tf.float32)
-        _ = wrapper_model(dummy_input)  # Initialize variables
+        wrapper_model = AccelerometerOnlyModel(model)
         
-        # Create concrete function for TF 2.x compatibility
+        # Get concrete function
         concrete_func = wrapper_model.call.get_concrete_function(
-            tf.TensorSpec(shape=input_shape, dtype=tf.float32, name='accelerometer_input')
+            tf.TensorSpec(shape=input_shape, dtype=tf.float32)
         )
         
-        # Create temporary saved model 
-        temp_saved_model_dir = os.path.join(os.path.dirname(save_path), "temp_savedmodel")
-        if os.path.exists(temp_saved_model_dir):
-            import shutil
-            shutil.rmtree(temp_saved_model_dir)
+        # Create converter
+        converter = tf.lite.TFLiteConverter.from_concrete_functions([concrete_func])
         
-        # Save model with concrete function
-        tf.saved_model.save(
-            wrapper_model,
-            temp_saved_model_dir,
-            signatures=concrete_func
-        )
-        
-        # Create converter from saved model
-        converter = tf.lite.TFLiteConverter.from_saved_model(temp_saved_model_dir)
-        
-        # Set optimization options
-        if quantize:
+        # Set optimization flags
+        if optimize_for_mobile:
             converter.optimizations = [tf.lite.Optimize.DEFAULT]
+            converter.target_spec.supported_ops = [
+                tf.lite.OpsSet.TFLITE_BUILTINS,
+                tf.lite.OpsSet.SELECT_TF_OPS
+            ]
         
-        # Configure TFLite conversion options for TF 2.19 compatibility
-        converter.target_spec.supported_ops = [
-            tf.lite.OpsSet.TFLITE_BUILTINS,
-            tf.lite.OpsSet.SELECT_TF_OPS  # Include TF ops for better compatibility
-        ]
+        if quantize:
+            converter.representative_dataset = lambda: representative_dataset_gen(input_shape)
+            converter.target_spec.supported_types = [tf.float16]
         
-        # Convert the model
-        logging.info("Converting model to TFLite...")
+        # Convert model
+        logger.info("Converting model to TFLite...")
+        start_time = time.time()
         tflite_model = converter.convert()
+        conversion_time = time.time() - start_time
+        logger.info(f"Conversion completed in {conversion_time:.2f} seconds")
         
-        # Save the converted model
+        # Save model
         with open(save_path, 'wb') as f:
             f.write(tflite_model)
         
-        logging.info(f"TFLite model saved to {save_path}")
+        model_size = os.path.getsize(save_path) / (1024 * 1024)
+        logger.info(f"TFLite model saved to {save_path} (Size: {model_size:.2f} MB)")
         
-        # Validate the TFLite model
-        interpreter = tf.lite.Interpreter(model_content=tflite_model)
+        # Verify model
+        verify_tflite_model(save_path, input_shape)
+        return True
+        
+    except Exception as e:
+        logger.error(f"TFLite conversion failed: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return False
+
+def representative_dataset_gen(input_shape, num_samples=100):
+    for _ in range(num_samples):
+        data = np.random.randn(*input_shape).astype(np.float32)
+        yield [data]
+
+def verify_tflite_model(model_path, input_shape):
+    try:
+        logger.info("Verifying TFLite model...")
+        interpreter = tf.lite.Interpreter(model_path=model_path)
         interpreter.allocate_tensors()
         
-        # Get input and output details
         input_details = interpreter.get_input_details()
         output_details = interpreter.get_output_details()
         
-        logging.info(f"TFLite input details: {input_details}")
-        logging.info(f"TFLite output details: {output_details}")
-        
-        # Create sample input
-        sample_input = np.random.randn(*input_shape).astype(np.float32)
+        logger.info(f"Input shape: {input_details[0]['shape']}")
+        logger.info(f"Output shape: {output_details[0]['shape']}")
         
         # Test inference
-        interpreter.set_tensor(input_details[0]['index'], sample_input)
+        test_input = np.random.randn(*input_shape).astype(np.float32)
+        interpreter.set_tensor(input_details[0]['index'], test_input)
+        
+        start_time = time.time()
         interpreter.invoke()
+        inference_time = time.time() - start_time
+        
         output = interpreter.get_tensor(output_details[0]['index'])
-        
-        logging.info(f"TFLite test successful - output shape: {output.shape}")
-        
-        # Clean up temporary SavedModel
-        import shutil
-        if os.path.exists(temp_saved_model_dir):
-            shutil.rmtree(temp_saved_model_dir)
-            
+        logger.info(f"Test inference successful - Output shape: {output.shape}")
+        logger.info(f"Inference time: {inference_time*1000:.2f} ms")
         return True
-    except Exception as e:
-        logging.error(f"TFLite conversion failed: {e}")
-        import traceback
-        traceback.print_exc()
         
-        # Clean up temporary model if exists
-        try:
-            import shutil
-            temp_saved_model_dir = os.path.join(os.path.dirname(save_path), "temp_savedmodel")
-            if os.path.exists(temp_saved_model_dir):
-                shutil.rmtree(temp_saved_model_dir)
-        except:
-            pass
-            
+    except Exception as e:
+        logger.error(f"TFLite verification failed: {e}")
         return False
