@@ -5,17 +5,32 @@ import logging
 import argparse
 import yaml
 import time
+import datetime
 import numpy as np
 import pandas as pd
 import tensorflow as tf
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import seaborn as sns
 from sklearn.metrics import confusion_matrix, f1_score, accuracy_score, precision_score, recall_score, roc_auc_score
+from collections import Counter
+import shutil
 
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Set up logging with more detail
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler('training_debug.log')
+    ]
+)
 logger = logging.getLogger('lightheart-tf')
+
+# Suppress TensorFlow warnings
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+
 
 class EarlyStopping:
     def __init__(self, patience=15, min_delta=0.00001):
@@ -24,6 +39,7 @@ class EarlyStopping:
         self.counter = 0
         self.best_loss = None
         self.early_stop = False
+    
     def __call__(self, val_loss):
         if self.best_loss is None or val_loss < self.best_loss - self.min_delta:
             self.best_loss = val_loss
@@ -32,10 +48,12 @@ class EarlyStopping:
             self.counter += 1
             if self.counter >= self.patience:
                 self.early_stop = True
+    
     def reset(self):
         self.counter = 0
         self.best_loss = None
         self.early_stop = False
+
 
 class Trainer:
     def __init__(self, arg):
@@ -54,250 +72,426 @@ class Trainer:
         self.optimizer = None
         self.data_loader = {}
         self.early_stop = EarlyStopping(patience=15, min_delta=.001)
+        
+        # Create work directory with timestamp to avoid collisions
+        timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        if self.arg.work_dir:
+            self.arg.work_dir = f"{self.arg.work_dir}_{timestamp}"
+        
         if not os.path.exists(self.arg.work_dir):
             os.makedirs(self.arg.work_dir)
+        
+        # Create subdirectories
+        os.makedirs(os.path.join(self.arg.work_dir, 'models'), exist_ok=True)
+        os.makedirs(os.path.join(self.arg.work_dir, 'logs'), exist_ok=True)
+        os.makedirs(os.path.join(self.arg.work_dir, 'visualizations'), exist_ok=True)
+        
         self.model_path = os.path.join(self.arg.work_dir, 'models', self.arg.model_saved_name)
-        os.makedirs(os.path.dirname(self.model_path), exist_ok=True)
+        
+        # Setup logging
+        self.setup_logging()
+        
+        # Save configuration
         self.save_config(arg.config, arg.work_dir)
-        self.model = self.load_model()
-        self.print_log(f'# Parameters: {self.count_parameters()}')
+        
+        # Handle cross-validation subject lists
+        self.setup_cross_validation()
+        
+        # DO NOT LOAD MODEL HERE - Load per fold instead
+        self.model = None
+        
+        # Log initialization
+        self.print_log("Trainer initialized successfully")
+        self.print_log(f"Working directory: {self.arg.work_dir}")
+    
+    def setup_logging(self):
+        """Setup comprehensive logging"""
+        log_file = os.path.join(self.arg.work_dir, 'training.log')
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setLevel(logging.DEBUG)
+        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+    
+    def setup_cross_validation(self):
+        """Setup cross-validation subject lists with extensive logging"""
+        if hasattr(self.arg, 'subjects') and self.arg.subjects is not None:
+            # Extract fixed subjects from config if available, handling None values
+            self.fixed_val_subjects = getattr(self.arg, 'val_subjects_fixed', None) or [38, 46]
+            self.fixed_train_subjects = getattr(self.arg, 'train_subjects_fixed', None) or [45, 36, 29]
+            
+            # Ensure these are lists even if None was passed
+            if self.fixed_val_subjects is None:
+                self.fixed_val_subjects = [38, 46]
+            if self.fixed_train_subjects is None:
+                self.fixed_train_subjects = [45, 36, 29]
+            
+            # Calculate eligible test subjects
+            self.test_eligible_subjects = [s for s in self.arg.subjects 
+                                         if s not in self.fixed_val_subjects 
+                                         and s not in self.fixed_train_subjects]
+            self.total_folds = len(self.test_eligible_subjects)
+            
+            # Log cross-validation setup
+            self.print_log("=== Cross-Validation Setup ===")
+            self.print_log(f"Total subjects: {self.arg.subjects}")
+            self.print_log(f"Fixed validation subjects: {self.fixed_val_subjects}")
+            self.print_log(f"Fixed training subjects: {self.fixed_train_subjects}")
+            self.print_log(f"Test eligible subjects: {self.test_eligible_subjects}")
+            self.print_log(f"Total folds: {self.total_folds}")
+            self.print_log("============================")
+        else:
+            self.total_folds = 1
+            self.fixed_val_subjects = []
+            self.fixed_train_subjects = []
+            self.test_eligible_subjects = []
+            self.print_log("No cross-validation setup (subjects not specified)")
     
     def save_config(self, src_path, dest_path):
-        import shutil
+        """Save configuration file to working directory with error handling"""
         config_dest = os.path.join(dest_path, 'config')
         os.makedirs(config_dest, exist_ok=True)
-        dest_file = os.path.join(config_dest, os.path.basename(src_path))
-        if os.path.abspath(src_path) != os.path.abspath(dest_file):
-            shutil.copy(src_path, dest_file)
+        
+        if os.path.exists(src_path):
+            dest_file = os.path.join(config_dest, os.path.basename(src_path))
+            
+            # Check if source and destination are the same file
+            if os.path.abspath(src_path) != os.path.abspath(dest_file):
+                try:
+                    shutil.copy(src_path, dest_file)
+                    self.print_log(f"Config saved to: {dest_file}")
+                except Exception as e:
+                    self.print_log(f"Error copying config: {e}")
+            else:
+                self.print_log(f"Config already exists at destination: {dest_file}")
+        else:
+            self.print_log(f"Warning: Config file not found: {src_path}")
     
     def count_parameters(self):
+        """Count trainable parameters"""
+        if self.model is None:
+            return 0
         return sum(np.prod(v.shape.as_list()) for v in self.model.trainable_variables)
     
     def import_class(self, import_str):
+        """Import a class from a string"""
         mod_str, _, class_str = import_str.rpartition('.')
         import importlib
-        module = importlib.import_module(mod_str)
-        return getattr(module, class_str)
+        
+        try:
+            module = importlib.import_module(mod_str)
+            return getattr(module, class_str)
+        except Exception as e:
+            self.print_log(f"Error importing class {import_str}: {e}")
+            raise
     
     def load_model(self):
-        model_class = self.import_class(self.arg.model)
-        model = model_class(**self.arg.model_args)
-        acc_frames = self.arg.model_args.get('acc_frames', 64)
-        acc_coords = self.arg.model_args.get('acc_coords', 3)
-        if getattr(self.arg, 'use_smv', False):
-            acc_coords += 1
-        dummy_input = {'accelerometer': tf.zeros((1, acc_frames, acc_coords)), 'skeleton': tf.zeros((1, self.arg.model_args.get('mocap_frames', 64), self.arg.model_args.get('num_joints', 32), 3))}
-        _ = model(dummy_input, training=False)
-        return model
+        """Load model with comprehensive error handling and logging"""
+        self.print_log(f"Loading model: {self.arg.model}")
+        
+        try:
+            model_class = self.import_class(self.arg.model)
+            model = model_class(**self.arg.model_args)
+            
+            # Initialize model with dummy input
+            acc_frames = self.arg.model_args.get('acc_frames', 64)
+            acc_coords = self.arg.model_args.get('acc_coords', 3)
+            if hasattr(self.arg, 'use_smv') and self.arg.use_smv:
+                acc_coords += 1  # Add one channel for SMV
+            
+            dummy_input = {'accelerometer': tf.zeros((1, acc_frames, acc_coords))}
+            
+            # Add skeleton input if needed
+            if hasattr(self.arg, 'dataset_args') and 'skeleton' in self.arg.dataset_args.get('modalities', []):
+                mocap_frames = self.arg.model_args.get('mocap_frames', 64)
+                num_joints = self.arg.model_args.get('num_joints', 32)
+                dummy_input['skeleton'] = tf.zeros((1, mocap_frames, num_joints, 3))
+            
+            # Initialize model
+            _ = model(dummy_input, training=False)
+            
+            self.print_log(f"Model loaded successfully with {self.count_parameters()} parameters")
+            return model
+            
+        except Exception as e:
+            self.print_log(f"Error loading model: {e}")
+            raise
     
     def calculate_class_weights(self, labels):
+        """Calculate class weights for imbalanced datasets with logging"""
         from collections import Counter
         counter = Counter(labels)
-        if 0 not in counter:
-            counter[0] = 1
-        if 1 not in counter:
-            counter[1] = 1
+        
+        self.print_log(f"Label distribution: {dict(counter)}")
+        
+        if 0 not in counter or 1 not in counter:
+            self.print_log("Warning: Not all classes present in training data!")
+            return tf.constant(1.0, dtype=tf.float32)
+        
         pos_weight = counter[0] / counter[1]
-        self.print_log(f'Class distribution - 0: {counter[0]}, 1: {counter[1]}, pos_weight: {pos_weight:.4f}')
+        self.print_log(f'Class weights - neg: {counter[0]}, pos: {counter[1]}, pos_weight: {pos_weight:.4f}')
+        
         return tf.constant(pos_weight, dtype=tf.float32)
     
     def load_optimizer(self):
+        """Load optimizer with logging"""
         base_lr = self.arg.base_lr
-        # Create new optimizer for each fold to avoid TF Variable issues
-        tf.keras.backend.clear_session()
+        
+        self.print_log(f"Loading optimizer: {self.arg.optimizer} with lr={base_lr}")
+        
         if self.arg.optimizer.lower() == "adam":
             self.optimizer = tf.keras.optimizers.Adam(learning_rate=base_lr)
         elif self.arg.optimizer.lower() == "adamw":
-            self.optimizer = tf.keras.optimizers.AdamW(learning_rate=base_lr, weight_decay=self.arg.weight_decay)
+            self.optimizer = tf.keras.optimizers.AdamW(
+                learning_rate=base_lr, 
+                weight_decay=self.arg.weight_decay
+            )
         elif self.arg.optimizer.lower() == "sgd":
             self.optimizer = tf.keras.optimizers.SGD(learning_rate=base_lr, momentum=0.9)
+        else:
+            raise ValueError(f"Unknown optimizer: {self.arg.optimizer}")
     
     def load_loss(self):
+        """Load loss function with class weights"""
         self.pos_weights = getattr(self, 'pos_weights', tf.constant(1.0))
+        
+        self.print_log(f"Loading loss function with pos_weight: {self.pos_weights.numpy()}")
+        
         def weighted_bce(y_true, y_pred):
             y_true = tf.cast(y_true, tf.float32)
             y_pred = tf.squeeze(y_pred)
             y_true = tf.squeeze(y_true)
-            loss = tf.nn.weighted_cross_entropy_with_logits(labels=y_true, logits=y_pred, pos_weight=self.pos_weights)
-            return tf.reduce_mean(loss)
+            bce = tf.nn.weighted_cross_entropy_with_logits(
+                labels=y_true,
+                logits=y_pred,
+                pos_weight=self.pos_weights
+            )
+            return tf.reduce_mean(bce)
+        
         self.criterion = weighted_bce
     
     def load_data(self):
+        """Load data for current fold with extensive debugging"""
         from utils.dataset_tf import prepare_smartfallmm_tf, split_by_subjects_tf
-        Feeder = self.import_class(self.arg.feeder)
-        builder = prepare_smartfallmm_tf(self.arg)
-        if self.arg.phase == 'train':
-            self.print_log(f'Loading data for train: {self.train_subjects}, val: {self.val_subject}, test: {self.test_subject}')
-
-            # Important: Get all data first to compute global statistics for normalization
-            self.print_log('Computing global normalization statistics for consistent preprocessing...')
-            all_data = split_by_subjects_tf(builder, self.train_subjects + self.val_subject + self.test_subject, True, compute_stats_only=True)
-
-            # Store global stats to ensure consistent normalization across splits
-            self.acc_mean = all_data.get('acc_mean', None)
-            self.acc_std = all_data.get('acc_std', None)
-            self.skl_mean = all_data.get('skl_mean', None)
-            self.skl_std = all_data.get('skl_std', None)
-
-            # Now split with consistent normalization
-            self.norm_train = split_by_subjects_tf(builder, self.train_subjects, False,
-                                                 acc_mean=self.acc_mean, acc_std=self.acc_std,
-                                                 skl_mean=self.skl_mean, skl_std=self.skl_std)
-            self.norm_val = split_by_subjects_tf(builder, self.val_subject, False,
-                                               acc_mean=self.acc_mean, acc_std=self.acc_std,
-                                               skl_mean=self.skl_mean, skl_std=self.skl_std)
-            self.norm_test = split_by_subjects_tf(builder, self.test_subject, False,
-                                               acc_mean=self.acc_mean, acc_std=self.acc_std,
-                                               skl_mean=self.skl_mean, skl_std=self.skl_std)
-
-            # Data validation checks
-            if not self.norm_train or 'labels' not in self.norm_train or len(self.norm_train['labels']) == 0:
-                self.print_log(f'No training data for subjects {self.train_subjects}')
-                return False
-            if not self.norm_val or 'labels' not in self.norm_val or len(self.norm_val['labels']) == 0:
-                self.print_log(f'No validation data for subjects {self.val_subject}')
-                return False
-            if not self.norm_test or 'labels' not in self.norm_test or len(self.norm_test['labels']) == 0:
-                self.print_log(f'No test data for subject {self.test_subject}')
-                return False
-
-            # Log data distribution
-            train_size = len(self.norm_train.get('labels', []))
-            val_size = len(self.norm_val.get('labels', []))
-            test_size = len(self.norm_test.get('labels', []))
-            self.print_log(f'Data sizes - Train: {train_size}, Val: {val_size}, Test: {test_size}')
-
-            # Log class distribution
-            train_pos = sum(1 for l in self.norm_train['labels'] if l == 1)
-            train_neg = train_size - train_pos
-            val_pos = sum(1 for l in self.norm_val['labels'] if l == 1)
-            val_neg = val_size - val_pos
-            test_pos = sum(1 for l in self.norm_test['labels'] if l == 1)
-            test_neg = test_size - test_pos
-
-            self.print_log(f'Class distribution:')
-            self.print_log(f'Train - Positive: {train_pos} ({train_pos/train_size:.2%}), Negative: {train_neg} ({train_neg/train_size:.2%})')
-            self.print_log(f'Val - Positive: {val_pos} ({val_pos/val_size:.2%}), Negative: {val_neg} ({val_neg/val_size:.2%})')
-            self.print_log(f'Test - Positive: {test_pos} ({test_pos/test_size:.2%}), Negative: {test_neg} ({test_neg/test_size:.2%})')
-
-            # Calculate class weights
-            self.pos_weights = self.calculate_class_weights(self.norm_train['labels'])
-
-            # Create data loaders
-            use_smv = getattr(self.arg, 'use_smv', False)
-            window_size = self.arg.dataset_args.get('max_length', 64)
-            self.data_loader['train'] = Feeder(dataset=self.norm_train, batch_size=self.arg.batch_size, use_smv=use_smv, window_size=window_size)
-            self.data_loader['val'] = Feeder(dataset=self.norm_val, batch_size=self.arg.val_batch_size, use_smv=use_smv, window_size=window_size)
-            self.data_loader['test'] = Feeder(dataset=self.norm_test, batch_size=self.arg.test_batch_size, use_smv=use_smv, window_size=window_size)
-            self.print_log(f'Batches - Train: {len(self.data_loader["train"])}, Val: {len(self.data_loader["val"])}, Test: {len(self.data_loader["test"])}')
-            return True
+        
+        self.print_log("=== Loading Data ===")
+        self.print_log(f"Train subjects: {self.train_subjects}")
+        self.print_log(f"Val subjects: {self.val_subject}")
+        self.print_log(f"Test subjects: {self.test_subject}")
+        
+        try:
+            # Load data loader class
+            Feeder = self.import_class(self.arg.feeder)
+            
+            # Prepare dataset
+            if self.arg.dataset == 'smartfallmm':
+                builder = prepare_smartfallmm_tf(self.arg)
+            else:
+                raise ValueError(f"Unsupported dataset: {self.arg.dataset}")
+            
+            if self.arg.phase == 'train':
+                # Get global normalization statistics
+                all_subjects = self.train_subjects + self.val_subject + self.test_subject
+                self.print_log(f"Computing global statistics from {len(all_subjects)} subjects")
+                
+                all_data = split_by_subjects_tf(builder, all_subjects, False, compute_stats_only=True)
+                
+                # Store global stats
+                self.acc_mean = all_data.get('acc_mean')
+                self.acc_std = all_data.get('acc_std')
+                self.skl_mean = all_data.get('skl_mean')
+                self.skl_std = all_data.get('skl_std')
+                
+                # Split data with consistent normalization
+                self.norm_train = split_by_subjects_tf(
+                    builder, self.train_subjects, False,
+                    acc_mean=self.acc_mean, acc_std=self.acc_std,
+                    skl_mean=self.skl_mean, skl_std=self.skl_std
+                )
+                
+                # Validate training data
+                if not self.norm_train or 'labels' not in self.norm_train or len(self.norm_train['labels']) == 0:
+                    self.print_log(f'ERROR: No training data for subjects {self.train_subjects}')
+                    return False
+                
+                self.print_log(f"Training data loaded: {len(self.norm_train['labels'])} samples")
+                
+                # Load validation data
+                self.norm_val = split_by_subjects_tf(
+                    builder, self.val_subject, False,
+                    acc_mean=self.acc_mean, acc_std=self.acc_std,
+                    skl_mean=self.skl_mean, skl_std=self.skl_std
+                )
+                
+                if not self.norm_val or 'labels' not in self.norm_val or len(self.norm_val['labels']) == 0:
+                    self.print_log(f'ERROR: No validation data for subjects {self.val_subject}')
+                    return False
+                
+                self.print_log(f"Validation data loaded: {len(self.norm_val['labels'])} samples")
+                
+                # Load test data
+                self.norm_test = split_by_subjects_tf(
+                    builder, self.test_subject, False,
+                    acc_mean=self.acc_mean, acc_std=self.acc_std,
+                    skl_mean=self.skl_mean, skl_std=self.skl_std
+                )
+                
+                if not self.norm_test or 'labels' not in self.norm_test or len(self.norm_test['labels']) == 0:
+                    self.print_log(f'ERROR: No test data for subject {self.test_subject}')
+                    return False
+                
+                self.print_log(f"Test data loaded: {len(self.norm_test['labels'])} samples")
+                
+                # Calculate class weights
+                self.pos_weights = self.calculate_class_weights(self.norm_train['labels'])
+                
+                # Create data loaders
+                use_smv = getattr(self.arg, 'use_smv', False)
+                window_size = self.arg.dataset_args.get('max_length', 64)
+                
+                self.print_log(f"Creating data loaders with batch_size={self.arg.batch_size}, "
+                             f"use_smv={use_smv}, window_size={window_size}")
+                
+                self.data_loader['train'] = Feeder(
+                    dataset=self.norm_train, 
+                    batch_size=self.arg.batch_size,
+                    use_smv=use_smv, 
+                    window_size=window_size
+                )
+                
+                self.data_loader['val'] = Feeder(
+                    dataset=self.norm_val, 
+                    batch_size=self.arg.val_batch_size,
+                    use_smv=use_smv, 
+                    window_size=window_size
+                )
+                
+                self.data_loader['test'] = Feeder(
+                    dataset=self.norm_test, 
+                    batch_size=self.arg.test_batch_size,
+                    use_smv=use_smv, 
+                    window_size=window_size
+                )
+                
+                # Log data loader statistics
+                self.print_log(f"Train batches: {len(self.data_loader['train'])}")
+                self.print_log(f"Val batches: {len(self.data_loader['val'])}")
+                self.print_log(f"Test batches: {len(self.data_loader['test'])}")
+                
+                # Generate distribution visualizations
+                self.distribution_viz(self.norm_train['labels'], self.arg.work_dir, f'train_s{self.test_subject[0]}')
+                self.distribution_viz(self.norm_val['labels'], self.arg.work_dir, f'val_s{self.test_subject[0]}')
+                self.distribution_viz(self.norm_test['labels'], self.arg.work_dir, f'test_s{self.test_subject[0]}')
+                
+                self.print_log("=== Data Loading Complete ===")
+                return True
+                
+        except Exception as e:
+            self.print_log(f"ERROR in load_data: {e}")
+            import traceback
+            self.print_log(traceback.format_exc())
+            return False
+    
+    def distribution_viz(self, labels, work_dir, mode):
+        """Visualize label distribution with enhanced plots"""
+        vis_dir = os.path.join(work_dir, 'visualizations')
+        os.makedirs(vis_dir, exist_ok=True)
+        
+        unique, counts = np.unique(labels, return_counts=True)
+        
+        # Create two plots: bar chart and pie chart
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+        
+        # Bar chart
+        bars = ax1.bar(unique, counts, color=['blue', 'red'])
+        ax1.set_xlabel('Labels')
+        ax1.set_ylabel('Count')
+        ax1.set_title(f'{mode} Label Distribution')
+        ax1.set_xticks(unique)
+        
+        # Add value labels on bars
+        for bar, count in zip(bars, counts):
+            height = bar.get_height()
+            ax1.text(bar.get_x() + bar.get_width()/2., height,
+                    f'{count} ({count/sum(counts)*100:.1f}%)',
+                    ha='center', va='bottom')
+        
+        # Pie chart
+        ax2.pie(counts, labels=unique, autopct='%1.1f%%', colors=['blue', 'red'])
+        ax2.set_title(f'{mode} Label Proportion')
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(vis_dir, f'{mode}_label_distribution.png'), dpi=300)
+        plt.close()
+        
+        # Save distribution statistics
+        stats_path = os.path.join(vis_dir, f'{mode}_distribution_stats.txt')
+        with open(stats_path, 'w') as f:
+            f.write(f"Distribution statistics for {mode}:\n")
+            f.write(f"Total samples: {sum(counts)}\n")
+            for label, count in zip(unique, counts):
+                f.write(f"Label {label}: {count} ({count/sum(counts)*100:.2f}%)\n")
     
     def calculate_metrics(self, targets, predictions, probabilities=None):
-        """Calculate performance metrics with improved handling of edge cases.
-
-        Args:
-            targets: Ground truth labels (0/1)
-            predictions: Binary predictions after thresholding
-            probabilities: Probability scores before thresholding (for AUC)
-
-        Returns:
-            tuple: (accuracy, f1, recall, precision, auc)
-        """
-        # Convert to numpy arrays and flatten
+        """Calculate performance metrics with detailed logging"""
         targets = np.array(targets).flatten()
         predictions = np.array(predictions).flatten()
-
-        # Ensure binary targets/predictions (avoid double thresholding)
-        # Only threshold if values aren't already binary (0/1)
-        if not np.all(np.isin(targets, [0, 1])):
-            targets = (targets > 0.5).astype(int)
-        if not np.all(np.isin(predictions, [0, 1])):
-            predictions = (predictions > 0.5).astype(int)
-
-        # Handle edge cases: if all predictions are the same class
-        if len(np.unique(predictions)) == 1:
-            self.print_log(f"WARNING: All predictions are the same class ({predictions[0]}). This may indicate a problem.")
-
-        # Calculate metrics with proper error handling
+        
+        # Log basic statistics
+        self.print_log(f"Calculating metrics for {len(targets)} samples")
+        self.print_log(f"Predictions - 0: {np.sum(predictions == 0)}, 1: {np.sum(predictions == 1)}")
+        self.print_log(f"Targets - 0: {np.sum(targets == 0)}, 1: {np.sum(targets == 1)}")
+        
+        accuracy = accuracy_score(targets, predictions) * 100
+        f1 = f1_score(targets, predictions, zero_division=0) * 100
+        precision = precision_score(targets, predictions, zero_division=0) * 100
+        recall = recall_score(targets, predictions, zero_division=0) * 100
+        
+        # Calculate AUC
         try:
-            accuracy = accuracy_score(targets, predictions) * 100
-        except Exception as e:
-            self.print_log(f"Error calculating accuracy: {e}")
-            accuracy = 0.0
-
-        try:
-            f1 = f1_score(targets, predictions, average='binary', zero_division=0) * 100
-        except Exception as e:
-            self.print_log(f"Error calculating F1: {e}")
-            f1 = 0.0
-
-        try:
-            precision = precision_score(targets, predictions, average='binary', zero_division=0) * 100
-        except Exception as e:
-            self.print_log(f"Error calculating precision: {e}")
-            precision = 0.0
-
-        try:
-            recall = recall_score(targets, predictions, average='binary', zero_division=0) * 100
-        except Exception as e:
-            self.print_log(f"Error calculating recall: {e}")
-            recall = 0.0
-
-        # Calculate AUC with proper error handling
-        auc = 0.0
-        try:
-            if probabilities is not None:
-                probabilities = np.array(probabilities).flatten()
-                # Check if we have multiple classes in targets (AUC requires both classes)
-                if len(np.unique(targets)) > 1:
-                    auc = roc_auc_score(targets, probabilities) * 100
-                else:
-                    self.print_log("WARNING: Only one class in targets, AUC can't be calculated")
+            if probabilities is not None and len(np.unique(targets)) > 1:
+                auc = roc_auc_score(targets, probabilities) * 100
             else:
-                if len(np.unique(targets)) > 1:
-                    auc = roc_auc_score(targets, predictions) * 100
-                else:
-                    self.print_log("WARNING: Only one class in targets, AUC can't be calculated")
+                if len(np.unique(targets)) == 1:
+                    self.print_log("Warning: Only one class in targets, AUC cannot be calculated")
+                auc = 0.0
         except Exception as e:
-            self.print_log(f"Error calculating AUC: {e}")
-
-        # Generate and log confusion matrix for detailed analysis
-        try:
-            cm = confusion_matrix(targets, predictions)
+            self.print_log(f"Warning: AUC calculation failed: {e}")
+            auc = 0.0
+        
+        # Calculate confusion matrix
+        cm = confusion_matrix(targets, predictions)
+        self.print_log(f"Confusion Matrix:\n{cm}")
+        
+        if cm.size == 4:  # Binary classification
             tn, fp, fn, tp = cm.ravel()
-            self.print_log(f"Confusion Matrix: TN={tn}, FP={fp}, FN={fn}, TP={tp}")
-        except Exception as e:
-            self.print_log(f"Error calculating confusion matrix: {e}")
-
+            self.print_log(f"TN: {tn}, FP: {fp}, FN: {fn}, TP: {tp}")
+        
         return accuracy, f1, recall, precision, auc
     
-    # Remove tf.function decorator to fix optimizer variable creation error
     def train_step(self, inputs, targets):
-        with tf.GradientTape() as tape:
-            outputs = self.model(inputs, training=True)
-            if isinstance(outputs, tuple):
-                logits = outputs[0]
-            else:
-                logits = outputs
-            loss = self.criterion(targets, logits)
-        gradients = tape.gradient(loss, self.model.trainable_variables)
-        self.optimizer.apply_gradients(zip(gradients, self.model.trainable_variables))
-        return loss, logits
+        """Single training step with error handling"""
+        try:
+            with tf.GradientTape() as tape:
+                outputs = self.model(inputs, training=True)
+                if isinstance(outputs, tuple):
+                    logits = outputs[0]
+                else:
+                    logits = outputs
+                loss = self.criterion(targets, logits)
+            
+            gradients = tape.gradient(loss, self.model.trainable_variables)
+            self.optimizer.apply_gradients(zip(gradients, self.model.trainable_variables))
+            
+            return loss, logits
+            
+        except Exception as e:
+            self.print_log(f"Error in train_step: {e}")
+            raise
     
     def train(self, epoch):
-        # Print start of epoch message with more visibility
-        total_batches = len(self.data_loader['train'])
-        epoch_header = f'Epoch: {epoch+1} - Starting training ({total_batches} batches)'
-        self.print_log(epoch_header)
-
-        # Make training start more visible in console
-        print("\n" + "="*len(epoch_header))
-        print(epoch_header)
-        print("="*len(epoch_header))
-
-        # Set up print interval for progress updates
-        print_interval = max(1, min(10, total_batches // 10))  # Dynamic interval based on batch count
-
+        """Train for one epoch with comprehensive logging"""
+        self.print_log(f'Starting Epoch: {epoch+1}/{self.arg.num_epoch}')
         loader = self.data_loader['train']
         train_loss = 0.0
         all_labels = []
@@ -305,571 +499,517 @@ class Trainer:
         all_probs = []
         steps = 0
         start_time = time.time()
-
-        # Training loop
-        for batch_idx in range(len(loader)):
-            inputs, targets, _ = loader[batch_idx]
-            targets = tf.cast(targets, tf.float32)
-
-            # Forward and backward pass
-            loss, logits = self.train_step(inputs, targets)
-            probabilities = tf.sigmoid(logits)
-            predictions = tf.cast(probabilities > 0.5, tf.int32)
-
-            # Update metrics
-            train_loss += loss.numpy()
-            all_labels.extend(targets.numpy().flatten())
-            all_preds.extend(predictions.numpy().flatten())
-            all_probs.extend(probabilities.numpy().flatten())
-            steps += 1
-
-            # Log progress more frequently with percentage complete
-            if batch_idx % print_interval == 0 or batch_idx == len(loader) - 1:
-                percent_complete = (batch_idx + 1) / len(loader) * 100
-                progress_msg = f'Epoch {epoch+1}, Batch {batch_idx+1}/{len(loader)} ({percent_complete:.1f}%), Loss: {loss:.4f}'
-                print(progress_msg)
-                self.print_log(progress_msg)
-
-        # Calculate average loss and metrics
-        train_loss /= steps
-        train_time = time.time() - start_time
-
-        # Calculate and log all metrics
-        accuracy, f1, recall, precision, auc_score = self.calculate_metrics(all_labels, all_preds, all_probs)
-        self.train_loss_summary.append(float(train_loss))
-
-        # Print detailed training results
-        results_msg = f'\tTraining Loss: {train_loss:.4f}, Acc: {accuracy:.2f}%, F1: {f1:.2f}%, Precision: {precision:.2f}%, Recall: {recall:.2f}%, AUC: {auc_score:.2f}%'
-        time_msg = f'\tTime: {train_time:.2f}s'
-
-        print(results_msg)
-        print(time_msg)
-        self.print_log(results_msg)
-        self.print_log(time_msg)
-
-        # Evaluate on validation set
+        
+        # Progress bar
+        from tqdm import tqdm
+        progress = tqdm(range(len(loader)), ncols=80, desc=f'Train epoch {epoch+1}')
+        
+        for batch_idx in progress:
+            try:
+                inputs, targets, _ = loader[batch_idx]
+                targets = tf.cast(targets, tf.float32)
+                
+                # Training step
+                loss, logits = self.train_step(inputs, targets)
+                probabilities = tf.sigmoid(logits)
+                predictions = tf.cast(probabilities > 0.5, tf.int32)
+                
+                # Update metrics
+                train_loss += loss.numpy()
+                all_labels.extend(targets.numpy().flatten())
+                all_preds.extend(predictions.numpy().flatten())
+                all_probs.extend(probabilities.numpy().flatten())
+                steps += 1
+                
+                # Update progress bar
+                progress.set_postfix({'loss': f'{loss.numpy():.4f}'})
+                
+            except Exception as e:
+                self.print_log(f"Error in training batch {batch_idx}: {e}")
+                continue
+        
+        # Calculate epoch metrics
+        if steps > 0:
+            train_loss /= steps
+            train_time = time.time() - start_time
+            accuracy, f1, recall, precision, auc_score = self.calculate_metrics(all_labels, all_preds, all_probs)
+            
+            self.train_loss_summary.append(float(train_loss))
+            
+            # Log detailed results
+            self.print_log(f'Epoch {epoch+1} Training Results:')
+            self.print_log(f'  Loss: {train_loss:.4f}')
+            self.print_log(f'  Accuracy: {accuracy:.2f}%')
+            self.print_log(f'  F1 Score: {f1:.2f}%')
+            self.print_log(f'  Precision: {precision:.2f}%')
+            self.print_log(f'  Recall: {recall:.2f}%')
+            self.print_log(f'  AUC: {auc_score:.2f}%')
+            self.print_log(f'  Time: {train_time:.2f}s')
+            self.print_log(f'  Batches: {steps}/{len(loader)}')
+        else:
+            self.print_log("Warning: No valid training batches!")
+            return True
+        
+        # Validate
         val_loss = self.eval(epoch, loader_name='val')
         self.val_loss_summary.append(float(val_loss))
-
+        
         # Check early stopping
-        if self.early_stop(val_loss):
-            self.print_log("Early stopping triggered")
-            print("Early stopping triggered")
+        self.early_stop(val_loss)
+        if self.early_stop.early_stop:
+            self.print_log(f"Early stopping triggered at epoch {epoch+1}")
             return True
-
+            
         return False
     
-    # Remove tf.function decorator to fix consistency with train_step
-    def eval_step(self, inputs, targets):
-        outputs = self.model(inputs, training=False)
-        if isinstance(outputs, tuple):
-            logits = outputs[0]
-        else:
-            logits = outputs
-        loss = self.criterion(targets, logits)
-        return loss, logits
-    
-    def eval(self, epoch, loader_name='val'):
-        """Evaluate the model on validation or test data with detailed logging.
-
-        Args:
-            epoch: Current training epoch
-            loader_name: Dataset to evaluate on ('val' or 'test')
-
-        Returns:
-            float: Average evaluation loss
-        """
-        # Print start of evaluation with more visibility
-        total_batches = len(self.data_loader[loader_name])
-        eval_header = f"\n{'='*20} {loader_name.upper()} EVALUATION {'='*20}"
-        self.print_log(eval_header)
-        print(eval_header)
-
-        # Make start of evaluation more prominent in console
-        eval_start_banner = f"STARTING {loader_name.upper()} EVALUATION - EPOCH {epoch+1}"
-        print("\n" + "="*len(eval_start_banner))
-        print(eval_start_banner)
-        print("="*len(eval_start_banner))
-
-        start_msg = f"Evaluating on {total_batches} batches..."
-        self.print_log(start_msg)
-        print(start_msg)
-
-        # Load data and initialize metrics
+    def eval(self, epoch, loader_name='val', result_file=None):
+        """Evaluate model with detailed logging"""
+        self.print_log(f'Evaluating {loader_name} at epoch {epoch+1}')
         loader = self.data_loader[loader_name]
         eval_loss = 0.0
         all_labels = []
         all_preds = []
         all_probs = []
-        all_ids = []  # Track sample IDs for per-sample analysis
         steps = 0
-
-        # Print progress indicator every few batches
-        print_interval = max(1, min(5, total_batches // 10))  # Dynamic interval based on batch count
-
-        # Start timing
-        start_time = time.time()
-
-        # Gather predictions
-        for batch_idx in range(len(loader)):
-            inputs, targets, sample_ids = loader[batch_idx]
-            targets = tf.cast(targets, tf.float32)
-
-            # Get predictions and loss
-            loss, logits = self.eval_step(inputs, targets)
-            probabilities = tf.sigmoid(logits)
-            predictions = tf.cast(probabilities > 0.5, tf.int32)
-
-            # Accumulate results
-            eval_loss += loss.numpy()
-            all_labels.extend(targets.numpy().flatten())
-            all_preds.extend(predictions.numpy().flatten())
-            all_probs.extend(probabilities.numpy().flatten())
-            if sample_ids is not None:
-                # Check if sample_ids is already a numpy array or a tensor
-                if isinstance(sample_ids, np.ndarray):
-                    all_ids.extend(sample_ids.flatten())
-                else:
-                    all_ids.extend(sample_ids.numpy().flatten())
-            steps += 1
-
-            # Print progress more frequently with percentage complete
-            if batch_idx % print_interval == 0 or batch_idx == total_batches - 1:
-                percent_complete = (batch_idx + 1) / total_batches * 100
-                progress_msg = f"Batch {batch_idx+1}/{total_batches} ({percent_complete:.1f}%), Loss: {loss.numpy():.4f}"
-                print(progress_msg)
-                self.print_log(progress_msg)
-
-        # Return early if no data
-        if steps == 0:
-            warning_msg = f"WARNING: No batches to evaluate in {loader_name} loader!"
-            print(warning_msg)
-            self.print_log(warning_msg)
-            return float('inf')
-
-        # Calculate average loss and evaluation time
-        eval_loss /= steps
-        eval_time = time.time() - start_time
-
-        # Calculate and log all metrics
-        accuracy, f1, recall, precision, auc_score = self.calculate_metrics(all_labels, all_preds, all_probs)
-
-        # Format a detailed report
-        report_header = f"EPOCH {epoch+1} - {loader_name.upper()} METRICS:"
-        eval_metrics = [
-            f"Loss: {eval_loss:.4f}",
-            f"Accuracy: {accuracy:.2f}%",
-            f"F1 Score: {f1:.2f}%",
-            f"Precision: {precision:.2f}%",
-            f"Recall: {recall:.2f}%",
-            f"AUC: {auc_score:.2f}%",
-            f"Time: {eval_time:.2f}s"
-        ]
-
-        # Print detailed evaluation report - more visibly
-        separator = "="*70
-        results_banner = f"RESULTS SUMMARY - {loader_name.upper()} - EPOCH {epoch+1}"
-
-        # Make results highly visible in console output
-        print("\n" + separator)
-        print(results_banner)
-        print(separator)
-        for metric in eval_metrics:
-            print(f"  {metric}")
-        print(separator)
-
-        # Also log to file
-        self.print_log("\n" + separator)
-        self.print_log(results_banner)
-        self.print_log(separator)
-        for metric in eval_metrics:
-            self.print_log(f"  {metric}")
-        self.print_log(separator)
-
-        # Save per-sample predictions to CSV for error analysis
-        if hasattr(self.arg, 'save_predictions') and self.arg.save_predictions:
+        
+        # Progress bar
+        from tqdm import tqdm
+        progress = tqdm(range(len(loader)), ncols=80, desc=f'{loader_name.capitalize()}')
+        
+        for batch_idx in progress:
             try:
-                import pandas as pd
-                preds_df = pd.DataFrame({
-                    'sample_id': all_ids if all_ids else range(len(all_labels)),
-                    'true_label': all_labels,
-                    'prediction': all_preds,
-                    'probability': all_probs
-                })
-                pred_path = os.path.join(self.arg.work_dir, f'{loader_name}_predictions_epoch{epoch+1}_subj{self.test_subject[0]}.csv')
-                preds_df.to_csv(pred_path, index=False)
-                saved_msg = f"Saved detailed predictions to {pred_path}"
-                print(saved_msg)
-                self.print_log(saved_msg)
+                inputs, targets, _ = loader[batch_idx]
+                targets = tf.cast(targets, tf.float32)
+                
+                # Forward pass
+                outputs = self.model(inputs, training=False)
+                if isinstance(outputs, tuple):
+                    logits = outputs[0]
+                else:
+                    logits = outputs
+                
+                loss = self.criterion(targets, logits)
+                probabilities = tf.sigmoid(logits)
+                predictions = tf.cast(probabilities > 0.5, tf.int32)
+                
+                # Update metrics
+                eval_loss += loss.numpy()
+                all_labels.extend(targets.numpy().flatten())
+                all_preds.extend(predictions.numpy().flatten())
+                all_probs.extend(probabilities.numpy().flatten())
+                steps += 1
+                
+                # Update progress bar
+                progress.set_postfix({'loss': f'{loss.numpy():.4f}'})
+                
             except Exception as e:
-                error_msg = f"Failed to save predictions to CSV: {e}"
-                print(error_msg)
-                self.print_log(error_msg)
-
-        # Handle model saving
-        if loader_name == 'val':
-            # Save model if validation improves
-            if eval_loss < self.best_loss:
-                prev_best = self.best_loss
-                self.best_loss = eval_loss
-                self.save_model()
-                improved_msg = f'Model saved! Validation loss improved: {prev_best:.4f} → {eval_loss:.4f}'
-                print(improved_msg)
-                self.print_log(improved_msg)
-
-                # Save validation metrics for best model
-                self.best_val_metrics = {
-                    'epoch': epoch + 1,
-                    'loss': eval_loss,
-                    'accuracy': accuracy,
-                    'f1': f1,
-                    'precision': precision,
-                    'recall': recall,
-                    'auc': auc_score
-                }
-            else:
-                no_improve_msg = f'Validation loss did not improve. Best: {self.best_loss:.4f}, Current: {eval_loss:.4f}'
-                print(no_improve_msg)
-                self.print_log(no_improve_msg)
-
-        # Store test metrics for final reporting
-        elif loader_name == 'test':
+                self.print_log(f"Error in evaluation batch {batch_idx}: {e}")
+                continue
+        
+        # Calculate metrics
+        if steps > 0:
+            eval_loss /= steps
+            accuracy, f1, recall, precision, auc_score = self.calculate_metrics(all_labels, all_preds, all_probs)
+            
+            # Log results
+            self.print_log(f'{loader_name.capitalize()} Results:')
+            self.print_log(f'  Loss: {eval_loss:.4f}')
+            self.print_log(f'  Accuracy: {accuracy:.2f}%')
+            self.print_log(f'  F1 Score: {f1:.2f}%')
+            self.print_log(f'  Precision: {precision:.2f}%')
+            self.print_log(f'  Recall: {recall:.2f}%')
+            self.print_log(f'  AUC: {auc_score:.2f}%')
+            self.print_log(f'  Batches: {steps}/{len(loader)}')
+        else:
+            self.print_log(f"Warning: No valid {loader_name} batches!")
+            return float('inf')
+        
+        # Save detailed results
+        if result_file is not None:
+            with open(result_file, 'w') as f:
+                f.write(f"Predictions for {loader_name} epoch {epoch+1}\n")
+                f.write("true,predicted,probability\n")
+                for true, pred, prob in zip(all_labels, all_preds, all_probs):
+                    f.write(f'{true},{pred},{prob:.4f}\n')
+        
+        # Model saving logic for validation
+        if loader_name == 'val' and eval_loss < self.best_loss:
+            self.best_loss = eval_loss
+            self.save_model()
+            self.print_log(f'New best model saved with loss: {eval_loss:.4f}')
+        
+        # Store test metrics
+        if loader_name == 'test':
             self.test_accuracy = accuracy
             self.test_f1 = f1
             self.test_recall = recall
             self.test_precision = precision
             self.test_auc = auc_score
-            self.test_loss = eval_loss
-
-            # Save test metrics for current epoch
-            test_metrics_path = os.path.join(self.arg.work_dir, f'test_metrics_subject{self.test_subject[0]}.csv')
-            try:
-                import pandas as pd
-                # Check if file exists
-                if os.path.exists(test_metrics_path):
-                    metrics_df = pd.read_csv(test_metrics_path)
-                else:
-                    metrics_df = pd.DataFrame()
-
-                # Append new metrics
-                new_metrics = pd.DataFrame({
-                    'epoch': [epoch + 1],
-                    'subject': [self.test_subject[0]],
-                    'loss': [eval_loss],
-                    'accuracy': [accuracy],
-                    'f1': [f1],
-                    'precision': [precision],
-                    'recall': [recall],
-                    'auc': [auc_score]
-                })
-                metrics_df = pd.concat([metrics_df, new_metrics], ignore_index=True)
-                metrics_df.to_csv(test_metrics_path, index=False)
-                saved_metrics_msg = f"Saved test metrics to {test_metrics_path}"
-                print(saved_metrics_msg)
-                self.print_log(saved_metrics_msg)
-            except Exception as e:
-                metrics_error_msg = f"Failed to save test metrics to CSV: {e}"
-                print(metrics_error_msg)
-                self.print_log(metrics_error_msg)
-
+            
+            # Save confusion matrix visualization
+            self.cm_viz(all_preds, all_labels)
+        
         return eval_loss
     
     def save_model(self):
-        self.model.save_weights(f'{self.model_path}_{self.test_subject[0]}.weights.h5')
+        """Save model weights with validation"""
+        try:
+            weight_path = f'{self.model_path}_{self.test_subject[0]}.weights.h5'
+            self.model.save_weights(weight_path)
+            self.print_log(f"Model saved to: {weight_path}")
+            
+            # Verify the save
+            file_size = os.path.getsize(weight_path)
+            self.print_log(f"Saved model size: {file_size/1024/1024:.2f} MB")
+        except Exception as e:
+            self.print_log(f"Error saving model: {e}")
+    
+    def load_weights(self):
+        """Load model weights with validation"""
+        weight_path = f'{self.model_path}_{self.test_subject[0]}.weights.h5'
+        
+        if os.path.exists(weight_path):
+            try:
+                self.model.load_weights(weight_path)
+                self.print_log(f"Weights loaded from: {weight_path}")
+            except Exception as e:
+                self.print_log(f"Error loading weights: {e}")
+                raise
+        else:
+            self.print_log(f"Warning: Weight file not found: {weight_path}")
     
     def loss_viz(self, train_loss, val_loss):
+        """Visualize training curves with enhanced plots"""
+        if not train_loss or not val_loss:
+            self.print_log("Warning: No loss data to visualize")
+            return
+        
         epochs = range(1, len(train_loss) + 1)
-        plt.figure(figsize=(10, 6))
-        plt.plot(epochs, train_loss, 'b-', label='Training Loss')
-        plt.plot(epochs, val_loss, 'r-', label='Validation Loss')
+        
+        plt.figure(figsize=(12, 8))
+        
+        # Main plot
+        plt.subplot(2, 1, 1)
+        plt.plot(epochs, train_loss, 'b-', label='Training Loss', linewidth=2)
+        plt.plot(epochs, val_loss, 'r-', label='Validation Loss', linewidth=2)
         plt.title(f'Training vs Validation Loss - Subject {self.test_subject[0]}')
         plt.xlabel('Epochs')
         plt.ylabel('Loss')
         plt.legend()
-        plt.grid(True)
-        plt.savefig(os.path.join(self.arg.work_dir, f'loss_curves_subject_{self.test_subject[0]}.png'))
+        plt.grid(True, alpha=0.3)
+        
+        # Difference plot
+        plt.subplot(2, 1, 2)
+        loss_diff = np.array(val_loss) - np.array(train_loss)
+        plt.plot(epochs, loss_diff, 'g-', label='Val-Train Difference', linewidth=2)
+        plt.axhline(y=0, color='k', linestyle='--', alpha=0.5)
+        plt.title('Validation-Training Loss Difference')
+        plt.xlabel('Epochs')
+        plt.ylabel('Loss Difference')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        vis_path = os.path.join(self.arg.work_dir, 'visualizations', f'loss_curves_s{self.test_subject[0]}.png')
+        plt.savefig(vis_path, dpi=300)
+        plt.close()
+        
+        # Save loss data
+        loss_data = pd.DataFrame({
+            'epoch': epochs,
+            'train_loss': train_loss,
+            'val_loss': val_loss
+        })
+        loss_data.to_csv(os.path.join(self.arg.work_dir, 'visualizations', f'loss_data_s{self.test_subject[0]}.csv'), index=False)
+    
+    def cm_viz(self, y_pred, y_true):
+        """Enhanced confusion matrix visualization"""
+        cm = confusion_matrix(y_true, y_pred)
+        
+        plt.figure(figsize=(10, 8))
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', cbar_kws={'label': 'Count'})
+        plt.title(f'Confusion Matrix - Subject {self.test_subject[0]}')
+        plt.xlabel('Predicted Label')
+        plt.ylabel('True Label')
+        
+        # Add percentages
+        cm_norm = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+        for i in range(cm.shape[0]):
+            for j in range(cm.shape[1]):
+                plt.text(j+0.5, i+0.7, f'{cm_norm[i,j]:.1%}', 
+                        ha='center', va='center', color='red', fontsize=10)
+        
+        vis_path = os.path.join(self.arg.work_dir, 'visualizations', f'confusion_matrix_s{self.test_subject[0]}.png')
+        plt.savefig(vis_path, dpi=300, bbox_inches='tight')
         plt.close()
     
     def print_log(self, message):
-        print(message)
-        with open(os.path.join(self.arg.work_dir, 'log.txt'), 'a') as f:
-            print(message, file=f)
+        """Print and log message with timestamp"""
+        timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        full_message = f"[{timestamp}] {message}"
+        
+        print(full_message)
+        
+        log_file = os.path.join(self.arg.work_dir, 'training.log')
+        with open(log_file, 'a') as f:
+            f.write(full_message + '\n')
+        
+        # Also log to logger
+        logger.info(message)
     
     def start(self):
+        """Main training loop with comprehensive logging and error handling"""
         if self.arg.phase == 'train':
-            self.print_log('Parameters:\n{}\n'.format(str(vars(self.arg))))
+            self.print_log('=== Starting Training ===')
+            self.print_log('Configuration:')
+            self.print_log(yaml.dump(vars(self.arg), default_flow_style=False))
+            
             results = []
-            fixed_train_subjects = [45, 36, 29]
-            fixed_val_subjects = [38, 46]
-            test_eligible_subjects = [32, 39, 30, 31, 33, 34, 35, 37, 43, 44]
-            total_subjects = len(test_eligible_subjects)
-
-            # Print overall training plan upfront
-            overall_plan = f'''
-======================================================
-TRAINING PLAN: LEAVE-ONE-SUBJECT-OUT CROSS-VALIDATION
-======================================================
-Total test subjects: {total_subjects}
-Fixed validation subjects: {fixed_val_subjects}
-Fixed train subjects: {fixed_train_subjects}
-Test eligible subjects: {test_eligible_subjects}
-======================================================
-'''
-            print(overall_plan)
-            self.print_log(overall_plan)
-
-            for i, test_subject in enumerate(test_eligible_subjects):
-                self.print_log(f'\n----------- Test Subject {test_subject} ({i+1}/{total_subjects}) -----------')
+            
+            # LOSO Cross-validation
+            for fold_idx, test_subject in enumerate(self.test_eligible_subjects):
+                fold_start_time = time.time()
+                
+                # Reset for new fold
                 self.train_loss_summary = []
                 self.val_loss_summary = []
                 self.best_loss = float('inf')
                 self.test_subject = [test_subject]
-                self.val_subject = fixed_val_subjects
-                remaining_test_subjects = [s for s in test_eligible_subjects if s != test_subject]
-                self.train_subjects = fixed_train_subjects + remaining_test_subjects
-                tf.keras.backend.clear_session()
-                self.model = self.load_model()
-                if not self.load_data():
-                    self.print_log(f"Failed to load data for subject {test_subject}")
+                self.val_subject = self.fixed_val_subjects
+                
+                # Create train subjects
+                remaining_eligible = [s for s in self.test_eligible_subjects if s != test_subject]
+                self.train_subjects = self.fixed_train_subjects + remaining_eligible
+                
+                self.print_log(f'\n{"="*60}')
+                self.print_log(f'FOLD {fold_idx+1}/{self.total_folds}: Test Subject {test_subject}')
+                self.print_log(f'Train: {self.train_subjects}')
+                self.print_log(f'Val: {self.val_subject}')
+                self.print_log(f'Test: {self.test_subject}')
+                self.print_log(f'{"="*60}')
+                
+                try:
+                    # Load model fresh for each fold
+                    tf.keras.backend.clear_session()
+                    self.model = self.load_model()
+                    self.print_log(f'Model Parameters: {self.count_parameters()}')
+                    
+                    # Load data for this fold
+                    if not self.load_data():
+                        self.print_log(f"Failed to load data for subject {test_subject}")
+                        continue
+                    
+                    # Initialize optimizer and loss
+                    self.load_optimizer()
+                    self.load_loss()
+                    
+                    # Reset early stopping
+                    self.early_stop.reset()
+                    
+                    # Training loop
+                    for epoch in range(self.arg.num_epoch):
+                        if self.train(epoch):
+                            break
+                    
+                    # Load best model and test
+                    self.model = self.load_model()
+                    self.load_weights()
+                    self.print_log(f'\n=== Testing Subject {self.test_subject[0]} ===')
+                    self.eval(epoch=0, loader_name='test')
+                    
+                    # Generate visualizations
+                    self.loss_viz(self.train_loss_summary, self.val_loss_summary)
+                    
+                    # Store results
+                    subject_result = {
+                        'test_subject': str(self.test_subject[0]),
+                        'accuracy': round(self.test_accuracy, 2),
+                        'f1_score': round(self.test_f1, 2),
+                        'precision': round(self.test_precision, 2),
+                        'recall': round(self.test_recall, 2),
+                        'auc': round(self.test_auc, 2),
+                        'fold_time': round(time.time() - fold_start_time, 2)
+                    }
+                    results.append(subject_result)
+                    
+                    # Save intermediate results
+                    pd.DataFrame(results).to_csv(
+                        os.path.join(self.arg.work_dir, 'interim_results.csv'), 
+                        index=False
+                    )
+                    
+                    self.print_log(f'\nFold {fold_idx+1} completed in {subject_result["fold_time"]:.2f}s')
+                    self.print_log(f'Results: Acc={self.test_accuracy:.2f}%, F1={self.test_f1:.2f}%')
+                    
+                except Exception as e:
+                    self.print_log(f"Error in fold {fold_idx+1}: {e}")
+                    import traceback
+                    self.print_log(traceback.format_exc())
                     continue
-                self.load_optimizer()
-                self.load_loss()
-                self.early_stop.reset()
-                best_epoch = 0
-                for epoch in range(self.arg.num_epoch):
-                    # Print progress update before training each epoch
-                    epoch_progress = f"Subject {test_subject} - Training epoch {epoch+1}/{self.arg.num_epoch}"
-                    print("="*len(epoch_progress))
-                    print(epoch_progress)
-                    print("="*len(epoch_progress))
-
-                    if self.train(epoch):
-                        self.print_log(f'Early stopping triggered at epoch {epoch+1}')
-                        best_epoch = epoch
-                        break
-                    best_epoch = epoch
-                self.model.load_weights(f'{self.model_path}_{test_subject}.weights.h5')
-                self.print_log(f'\n---------- Test Results for Subject {test_subject} ----------')
-                test_loss = self.eval(epoch=best_epoch, loader_name='test')
-                self.loss_viz(self.train_loss_summary, self.val_loss_summary)
-
-                # Get final train metrics for this fold
-                train_loss = self.train_loss_summary[-1] if self.train_loss_summary else float('nan')
-                val_loss = self.val_loss_summary[-1] if self.val_loss_summary else float('nan')
-
-                # Create a comprehensive result dictionary with all metrics
-                result = {
-                    'test_subject': str(test_subject),
-                    # Train metrics
-                    'train_loss': round(train_loss, 4),
-                    # Validation metrics
-                    'val_loss': round(val_loss, 4),
-                    # Test metrics
-                    'test_loss': round(test_loss, 4),
-                    'accuracy': round(self.test_accuracy, 2),
-                    'f1_score': round(self.test_f1, 2),
-                    'precision': round(self.test_precision, 2),
-                    'recall': round(self.test_recall, 2),
-                    'auc': round(self.test_auc, 2) if self.test_auc is not None else None
-                }
-                results.append(result)
-
-                # Print current results table after each fold completes
-                current_df = pd.DataFrame(results)
-                if len(current_df) > 1:  # Only calculate averages if we have more than one fold
-                    current_avg = current_df.mean(numeric_only=True).round(2)
-                    current_avg['test_subject'] = 'Running Avg'
-                    current_df = pd.concat([current_df, pd.DataFrame([current_avg])], ignore_index=True)
-
-                self.print_log("\n========== Current Results Summary ==========")
-                self.print_log(current_df.to_string(index=False))
-                self.print_log(f"\nCompleted {i+1}/{total_subjects} test subjects\n")
-
-                # Save comprehensive metrics for this fold to a dedicated file
-                fold_metrics_path = os.path.join(self.arg.work_dir, f'metrics_subject{test_subject}.csv')
-                fold_metrics = {
-                    'epoch': list(range(1, len(self.train_loss_summary) + 1)),
-                    'train_loss': self.train_loss_summary,
-                    'val_loss': self.val_loss_summary
-                }
-                # Add final test metrics to the last row
-                fold_metrics_df = pd.DataFrame(fold_metrics)
-                last_row = len(fold_metrics_df) - 1
-                if last_row >= 0:
-                    fold_metrics_df.loc[last_row, 'test_loss'] = test_loss
-                    fold_metrics_df.loc[last_row, 'test_accuracy'] = self.test_accuracy
-                    fold_metrics_df.loc[last_row, 'test_f1'] = self.test_f1
-                    fold_metrics_df.loc[last_row, 'test_precision'] = self.test_precision
-                    fold_metrics_df.loc[last_row, 'test_recall'] = self.test_recall
-                    fold_metrics_df.loc[last_row, 'test_auc'] = self.test_auc
-                fold_metrics_df.to_csv(fold_metrics_path, index=False)
-                self.print_log(f"Saved detailed fold metrics to {fold_metrics_path}")
-
-                # Also save intermediate results
-                current_df.to_csv(os.path.join(self.arg.work_dir, 'current_scores.csv'), index=False)
-
-                # Save all metrics across all folds in a single file
-                all_metrics_path = os.path.join(self.arg.work_dir, 'all_fold_metrics.csv')
-                if os.path.exists(all_metrics_path):
-                    all_metrics_df = pd.read_csv(all_metrics_path)
-                else:
-                    all_metrics_df = pd.DataFrame()
-
-                # Add this fold's metrics
-                new_row = pd.DataFrame([{
-                    'fold': i+1,
-                    'test_subject': test_subject,
-                    'epochs': len(self.train_loss_summary),
-                    'final_train_loss': train_loss,
-                    'final_val_loss': val_loss,
-                    'final_test_loss': test_loss,
-                    'test_accuracy': self.test_accuracy,
-                    'test_f1': self.test_f1,
-                    'test_precision': self.test_precision,
-                    'test_recall': self.test_recall,
-                    'test_auc': self.test_auc
-                }])
-                all_metrics_df = pd.concat([all_metrics_df, new_row], ignore_index=True)
-                all_metrics_df.to_csv(all_metrics_path, index=False)
-                self.print_log(f"Updated all fold metrics in {all_metrics_path}")
-
-                # Print fold summary to be extra visible in terminal output
-                fold_summary = f'''
-==========================================
-COMPLETED FOLD {i+1}/{total_subjects}: Subject {test_subject}
-Accuracy: {self.test_accuracy:.2f}%
-F1 Score: {self.test_f1:.2f}%
-Precision: {self.test_precision:.2f}%
-Recall: {self.test_recall:.2f}%
-AUC: {self.test_auc:.2f}%
-==========================================
-'''
-                print(fold_summary)
-                self.print_log(fold_summary)
-
-            # Final results processing with enhanced reporting
-            if results:  # Check if we have any results before creating DataFrame
+            
+            # Finalize results
+            if results:
                 df_results = pd.DataFrame(results)
-
-                # Calculate average row with more descriptive statistics
+                
+                # Calculate statistics
+                stats = df_results.describe().round(2)
                 avg_row = df_results.mean(numeric_only=True).round(2)
                 avg_row['test_subject'] = 'Average'
-
-                # Calculate standard deviation for uncertainty estimation
-                std_row = df_results.std(numeric_only=True).round(2)
-                std_row['test_subject'] = 'Std Dev'
-
-                # Calculate min/max for range reporting
-                min_row = df_results.min(numeric_only=True).round(2)
-                min_row['test_subject'] = 'Min'
-
-                max_row = df_results.max(numeric_only=True).round(2)
-                max_row['test_subject'] = 'Max'
+                
+                df_results = pd.concat([df_results, pd.DataFrame([avg_row])], ignore_index=True)
+                
+                # Save final results
+                df_results.to_csv(os.path.join(self.arg.work_dir, 'final_results.csv'), index=False)
+                stats.to_csv(os.path.join(self.arg.work_dir, 'results_statistics.csv'))
+                
+                self.print_log("\n" + "="*60)
+                self.print_log("FINAL RESULTS SUMMARY")
+                self.print_log("="*60)
+                self.print_log(df_results.to_string(index=False))
+                self.print_log("\nStatistics:")
+                self.print_log(stats.to_string())
+                self.print_log("="*60)
+                
+                # Create overall visualization
+                self.create_overall_visualization(df_results)
+                
+                # Save summary report
+                self.create_summary_report(df_results, stats)
             else:
-                self.print_log("Warning: No results collected for final processing")
-                return
+                self.print_log("Warning: No results collected!")
+        
+        else:
+            self.print_log(f"Phase {self.arg.phase} not implemented")
+    
+    def create_overall_visualization(self, results_df):
+        """Create overall results visualization"""
+        # Remove average row for visualization
+        plot_df = results_df[results_df['test_subject'] != 'Average'].copy()
+        
+        fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+        fig.suptitle('Cross-Validation Results Overview', fontsize=16)
+        
+        metrics = ['accuracy', 'f1_score', 'precision', 'recall', 'auc']
+        
+        for idx, metric in enumerate(metrics):
+            ax = axes[idx // 3, idx % 3]
+            
+            # Bar plot
+            bars = ax.bar(plot_df['test_subject'], plot_df[metric])
+            ax.axhline(y=plot_df[metric].mean(), color='r', linestyle='--', label='Mean')
+            ax.set_xlabel('Test Subject')
+            ax.set_ylabel(f'{metric} (%)')
+            ax.set_title(f'{metric.replace("_", " ").title()} by Subject')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            
+            # Add value labels
+            for bar, value in zip(bars, plot_df[metric]):
+                ax.text(bar.get_x() + bar.get_width()/2., bar.get_height(),
+                       f'{value:.1f}%', ha='center', va='bottom')
+        
+        # Fold time plot
+        ax = axes[1, 2]
+        ax.bar(plot_df['test_subject'], plot_df['fold_time'])
+        ax.set_xlabel('Test Subject')
+        ax.set_ylabel('Time (seconds)')
+        ax.set_title('Fold Processing Time')
+        ax.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.savefig(
+            os.path.join(self.arg.work_dir, 'visualizations', 'overall_results.png'), 
+            dpi=300, 
+            bbox_inches='tight'
+        )
+        plt.close()
+    
+    def create_summary_report(self, results_df, stats):
+        """Create a comprehensive summary report"""
+        report_path = os.path.join(self.arg.work_dir, 'summary_report.txt')
+        
+        with open(report_path, 'w') as f:
+            f.write("LIGHTHEART-TF TRAINING SUMMARY REPORT\n")
+            f.write("="*50 + "\n\n")
+            
+            # Configuration
+            f.write("CONFIGURATION:\n")
+            f.write("-"*30 + "\n")
+            config_items = {
+                'Model': self.arg.model,
+                'Dataset': self.arg.dataset,
+                'Optimizer': self.arg.optimizer,
+                'Learning Rate': self.arg.base_lr,
+                'Batch Size': self.arg.batch_size,
+                'Epochs': self.arg.num_epoch,
+                'Window Size': self.arg.dataset_args.get('max_length', 'N/A'),
+                'Task': self.arg.dataset_args.get('task', 'N/A')
+            }
+            for key, value in config_items.items():
+                f.write(f"{key}: {value}\n")
+            
+            # Cross-validation setup
+            f.write("\nCROSS-VALIDATION SETUP:\n")
+            f.write("-"*30 + "\n")
+            f.write(f"Total Subjects: {len(self.arg.subjects)}\n")
+            f.write(f"Fixed Train: {self.fixed_train_subjects}\n")
+            f.write(f"Fixed Val: {self.fixed_val_subjects}\n")
+            f.write(f"Test Eligible: {self.test_eligible_subjects}\n")
+            f.write(f"Total Folds: {self.total_folds}\n")
+            
+            # Results
+            f.write("\nRESULTS:\n")
+            f.write("-"*30 + "\n")
+            f.write(results_df.to_string(index=False))
+            
+            # Statistics
+            f.write("\n\nSTATISTICS:\n")
+            f.write("-"*30 + "\n")
+            f.write(stats.to_string())
+            
+            # Best/Worst performance
+            f.write("\n\nPERFORMANCE ANALYSIS:\n")
+            f.write("-"*30 + "\n")
+            
+            # Remove average row for analysis
+            analysis_df = results_df[results_df['test_subject'] != 'Average'].copy()
+            
+            for metric in ['accuracy', 'f1_score', 'auc']:
+                best_idx = analysis_df[metric].idxmax()
+                worst_idx = analysis_df[metric].idxmin()
+                
+                f.write(f"\n{metric.upper()}:\n")
+                f.write(f"  Best: Subject {analysis_df.loc[best_idx, 'test_subject']} "
+                       f"({analysis_df.loc[best_idx, metric]:.2f}%)\n")
+                f.write(f"  Worst: Subject {analysis_df.loc[worst_idx, 'test_subject']} "
+                       f"({analysis_df.loc[worst_idx, metric]:.2f}%)\n")
+                f.write(f"  Range: {analysis_df[metric].max() - analysis_df[metric].min():.2f}%\n")
+                f.write(f"  Std Dev: {analysis_df[metric].std():.2f}%\n")
+            
+            # Timing information
+            f.write("\nTIMING:\n")
+            f.write("-"*30 + "\n")
+            total_time = analysis_df['fold_time'].sum()
+            avg_time = analysis_df['fold_time'].mean()
+            f.write(f"Total Training Time: {total_time:.2f}s ({total_time/3600:.2f} hours)\n")
+            f.write(f"Average Fold Time: {avg_time:.2f}s\n")
+            
+            # Generated files
+            f.write("\nGENERATED FILES:\n")
+            f.write("-"*30 + "\n")
+            f.write(f"Working Directory: {self.arg.work_dir}\n")
+            f.write("- final_results.csv\n")
+            f.write("- results_statistics.csv\n")
+            f.write("- training.log\n")
+            f.write("- visualizations/\n")
+            f.write("- models/\n")
+            
+            f.write("\n" + "="*50 + "\n")
+            f.write(f"Report generated on: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
 
-            # Add all summary statistics to the results
-            summary_rows = pd.DataFrame([avg_row, std_row, min_row, max_row])
-            df_results = pd.concat([df_results, summary_rows], ignore_index=True)
-
-            # Save complete results
-            df_results.to_csv(os.path.join(self.arg.work_dir, 'final_scores.csv'), index=False)
-
-            # Create a more detailed final report with separate tables
-            final_report_path = os.path.join(self.arg.work_dir, 'final_report.txt')
-            with open(final_report_path, 'w') as f:
-                # Header
-                header = "="*80 + "\n" + "FINAL CROSS-VALIDATION RESULTS REPORT\n" + "="*80 + "\n"
-                f.write(header)
-
-                # Summary statistics table
-                f.write("\nSUMMARY STATISTICS:\n")
-                f.write("-"*80 + "\n")
-                summary_df = pd.DataFrame([avg_row, std_row, min_row, max_row])
-                f.write(summary_df.to_string(index=False))
-
-                # Per-subject results
-                f.write("\n\nPER-SUBJECT RESULTS:\n")
-                f.write("-"*80 + "\n")
-                per_subject_df = df_results[df_results['test_subject'].apply(lambda x: x not in ['Average', 'Std Dev', 'Min', 'Max'])]
-                f.write(per_subject_df.to_string(index=False))
-
-                # Training/Validation vs Test Loss Comparison
-                f.write("\n\nTRAINING/VALIDATION/TEST LOSS COMPARISON:\n")
-                f.write("-"*80 + "\n")
-                loss_df = per_subject_df[['test_subject', 'train_loss', 'val_loss', 'test_loss']]
-                f.write(loss_df.to_string(index=False))
-
-                # Accuracy Metrics Comparison
-                f.write("\n\nACCURACY METRICS COMPARISON:\n")
-                f.write("-"*80 + "\n")
-                metrics_df = per_subject_df[['test_subject', 'accuracy', 'f1_score', 'precision', 'recall', 'auc']]
-                f.write(metrics_df.to_string(index=False))
-
-                # Footer with timestamp
-                f.write(f"\n\nReport generated: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-
-            # Print final results summary to console and log
-            self.print_log("\n========== Final Results Summary ==========")
-            self.print_log(df_results.to_string(index=False))
-            self.print_log(f"\nDetailed final report saved to: {final_report_path}")
-
-            # Also generate a plots directory with visualizations
-            plots_dir = os.path.join(self.arg.work_dir, 'summary_plots')
-            os.makedirs(plots_dir, exist_ok=True)
-
-            try:
-                # Load the all_fold_metrics.csv which has data for all folds
-                all_metrics_path = os.path.join(self.arg.work_dir, 'all_fold_metrics.csv')
-                if os.path.exists(all_metrics_path):
-                    all_metrics = pd.read_csv(all_metrics_path)
-
-                    # Generate bar chart of test accuracy across subjects
-                    plt.figure(figsize=(12, 6))
-                    plt.bar(all_metrics['test_subject'].astype(str), all_metrics['test_accuracy'])
-                    plt.axhline(y=all_metrics['test_accuracy'].mean(), color='r', linestyle='--', label=f'Mean: {all_metrics["test_accuracy"].mean():.2f}%')
-                    plt.title('Test Accuracy Across Subjects')
-                    plt.xlabel('Subject ID')
-                    plt.ylabel('Accuracy (%)')
-                    plt.grid(axis='y', linestyle='--', alpha=0.7)
-                    plt.legend()
-                    plt.savefig(os.path.join(plots_dir, 'test_accuracy_by_subject.png'))
-                    plt.close()
-
-                    # Generate another chart for F1 scores
-                    plt.figure(figsize=(12, 6))
-                    plt.bar(all_metrics['test_subject'].astype(str), all_metrics['test_f1'])
-                    plt.axhline(y=all_metrics['test_f1'].mean(), color='r', linestyle='--', label=f'Mean: {all_metrics["test_f1"].mean():.2f}%')
-                    plt.title('F1 Score Across Subjects')
-                    plt.xlabel('Subject ID')
-                    plt.ylabel('F1 Score (%)')
-                    plt.grid(axis='y', linestyle='--', alpha=0.7)
-                    plt.legend()
-                    plt.savefig(os.path.join(plots_dir, 'f1_score_by_subject.png'))
-                    plt.close()
-
-                    # Generate loss comparison plot
-                    plt.figure(figsize=(12, 6))
-                    x = all_metrics['test_subject'].astype(str)
-                    width = 0.25
-                    plt.bar(x, all_metrics['final_train_loss'], width, label='Train Loss')
-                    plt.bar([p + width for p in range(len(x))], all_metrics['final_val_loss'], width, label='Validation Loss')
-                    plt.bar([p + width*2 for p in range(len(x))], all_metrics['final_test_loss'], width, label='Test Loss')
-                    plt.xticks([p + width for p in range(len(x))], x)
-                    plt.title('Loss Comparison Across Subjects')
-                    plt.xlabel('Subject ID')
-                    plt.ylabel('Loss')
-                    plt.legend()
-                    plt.grid(axis='y', linestyle='--', alpha=0.7)
-                    plt.savefig(os.path.join(plots_dir, 'loss_comparison_by_subject.png'))
-                    plt.close()
-
-                    self.print_log(f"Generated summary plots in {plots_dir}")
-            except Exception as e:
-                self.print_log(f"Error generating summary plots: {e}")
 
 def str2bool(v):
+    """String to boolean converter"""
     if isinstance(v, bool):
         return v
     if v.lower() in ('yes', 'true', 't', 'y', '1'):
@@ -878,6 +1018,7 @@ def str2bool(v):
         return False
     else:
         raise argparse.ArgumentTypeError('Boolean value expected.')
+
 
 def get_args():
     parser = argparse.ArgumentParser(description='LightHART-TF Training')
@@ -901,41 +1042,58 @@ def get_args():
     parser.add_argument('--dataset-args', default=None, type=str)
     parser.add_argument('--subjects', nargs='+', type=int)
     parser.add_argument('--feeder', default=None)
-    parser.add_argument('--train-feeder-args', default=None, type=str)
-    parser.add_argument('--val-feeder-args', default=None, type=str)
-    parser.add_argument('--test-feeder-args', default=None, type=str)
-    parser.add_argument('--include-val', type=str2bool, default=True)
     parser.add_argument('--seed', type=int, default=2)
-    parser.add_argument('--log-interval', type=int, default=10)
     parser.add_argument('--work-dir', type=str, default='simple')
     parser.add_argument('--print-log', type=str2bool, default=True)
     parser.add_argument('--phase', type=str, default='train')
     parser.add_argument('--num-worker', type=int, default=0)
     parser.add_argument('--result-file', type=str)
     parser.add_argument('--use-smv', type=str2bool, default=False)
+    
+    # Add fixed subject arguments
+    parser.add_argument('--train-subjects-fixed', nargs='+', type=int)
+    parser.add_argument('--val-subjects-fixed', nargs='+', type=int)
+    parser.add_argument('--test-eligible-subjects', nargs='+', type=int)
+    
     return parser
+
 
 def main():
     parser = get_args()
     p = parser.parse_args()
+    
+    # Load config file if provided
     if p.config is not None:
         with open(p.config, 'r', encoding='utf-8') as f:
             default_arg = yaml.safe_load(f)
-        key = vars(p).keys()
-        for k in default_arg.keys():
-            if k not in key:
-                print('WRONG ARG: {}'.format(k))
-                assert (k in key)
+        
+        # Allow config values that aren't in the parser
         parser.set_defaults(**default_arg)
+    
     arg = parser.parse_args()
+    
+    # Set GPU
     os.environ['CUDA_VISIBLE_DEVICES'] = str(arg.device[0])
+    
+    # Configure TensorFlow
     if tf.config.list_physical_devices('GPU'):
         for gpu in tf.config.list_physical_devices('GPU'):
             tf.config.experimental.set_memory_growth(gpu, True)
+    
+    # Set seeds for reproducibility
     np.random.seed(arg.seed)
     tf.random.set_seed(arg.seed)
-    trainer = Trainer(arg)
-    trainer.start()
+    
+    try:
+        # Start training
+        trainer = Trainer(arg)
+        trainer.start()
+    except Exception as e:
+        logger.error(f"Fatal error: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise
+
 
 if __name__ == "__main__":
     main()

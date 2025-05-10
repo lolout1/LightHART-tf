@@ -7,7 +7,7 @@ set -euo pipefail
 # Configuration
 CONFIG_FILE="config/smartfallmm/teacher.yaml"
 TIMESTAMP=$(date +%Y-%m-%d_%H-%M-%S)
-WORK_DIR="../experiments/teacher_${TIMESTAMP}"
+WORK_DIR="modelsKD"
 MODEL_NAME="teacher_model"
 GPU_ID=0
 LEARNING_RATE=0.0001
