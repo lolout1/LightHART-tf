@@ -1,4 +1,3 @@
-# src/distiller.py
 import os
 import numpy as np
 import pandas as pd
@@ -9,7 +8,6 @@ import yaml
 import time
 from train import Trainer, str2bool
 from utils.loss import DistillationLoss
-
 logger = logging.getLogger('distiller')
 
 class Distiller(Trainer):
@@ -17,14 +15,10 @@ class Distiller(Trainer):
         super().__init__(arg)
         self.teacher_model = None
         self.distillation_loss = None
-        
     def load_teacher_model(self):
         teacher_class = self.import_class(self.arg.teacher_model)
         teacher_model = teacher_class(**self.arg.teacher_args)
-        dummy_input = {
-            'accelerometer': tf.zeros((1, self.arg.teacher_args['acc_frames'], self.arg.teacher_args['acc_coords'])),
-            'skeleton': tf.zeros((1, self.arg.teacher_args['mocap_frames'], self.arg.teacher_args['num_joints'], 3))
-        }
+        dummy_input = {'accelerometer': tf.zeros((1, self.arg.teacher_args['acc_frames'], self.arg.teacher_args['acc_coords'])), 'skeleton': tf.zeros((1, self.arg.teacher_args['mocap_frames'], self.arg.teacher_args['num_joints'], 3))}
         _ = teacher_model(dummy_input, training=False)
         subject_id = self.test_subject[0] if hasattr(self, 'test_subject') and self.test_subject else None
         if subject_id:
@@ -41,13 +35,11 @@ class Distiller(Trainer):
                     logger.warning(f"Teacher weights not found: {weight_path}")
         teacher_model.trainable = False
         return teacher_model
-    
     def load_distillation_loss(self):
         temperature = getattr(self.arg, 'temperature', 4.5)
         alpha = getattr(self.arg, 'alpha', 0.6)
         pos_weight = self.pos_weights if hasattr(self, 'pos_weights') else None
         self.distillation_loss = DistillationLoss(temperature=temperature, alpha=alpha, pos_weight=pos_weight)
-        
     @tf.function
     def distill_step(self, inputs, targets):
         with tf.GradientTape() as tape:
@@ -63,14 +55,10 @@ class Distiller(Trainer):
             else:
                 student_logits = student_outputs
                 student_features = None
-            loss = self.distillation_loss(
-                student_logits, teacher_logits, targets,
-                teacher_features, student_features
-            )
+            loss = self.distillation_loss(student_logits, teacher_logits, targets, teacher_features, student_features)
         gradients = tape.gradient(loss, self.model.trainable_variables)
         self.optimizer.apply_gradients(zip(gradients, self.model.trainable_variables))
         return loss, student_logits
-    
     def train(self, epoch):
         loader = self.data_loader['train']
         train_loss = 0.0
@@ -100,7 +88,6 @@ class Distiller(Trainer):
         if self.early_stop(val_loss):
             return True
         return False
-    
     def start(self):
         if self.arg.phase in ['distill', 'train']:
             results = []
@@ -134,14 +121,7 @@ class Distiller(Trainer):
                 self.model.load_weights(f'{self.model_path}_{test_subject}.weights.h5')
                 self.eval(epoch=best_epoch, loader_name='test')
                 self.loss_viz(self.train_loss_summary, self.val_loss_summary)
-                result = {
-                    'test_subject': str(test_subject),
-                    'accuracy': round(self.test_accuracy, 2),
-                    'f1_score': round(self.test_f1, 2),
-                    'precision': round(self.test_precision, 2),
-                    'recall': round(self.test_recall, 2),
-                    'auc': round(self.test_auc, 2)
-                }
+                result = {'test_subject': str(test_subject), 'accuracy': round(self.test_accuracy, 2), 'f1_score': round(self.test_f1, 2), 'precision': round(self.test_precision, 2), 'recall': round(self.test_recall, 2), 'auc': round(self.test_auc, 2)}
                 results.append(result)
                 self.print_log(f'Subject {test_subject} Results: Acc={self.test_accuracy:.2f}%, F1={self.test_f1:.2f}%, Precision={self.test_precision:.2f}%, Recall={self.test_recall:.2f}%, AUC={self.test_auc:.2f}%')
             df_results = pd.DataFrame(results)
