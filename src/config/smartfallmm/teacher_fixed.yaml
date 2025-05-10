@@ -1,0 +1,43 @@
+# config/smartfallmm/teacher_fixed.yaml
+model: models.mm_transformer.MMTransformer
+dataset: smartfallmm
+subjects: [32, 39, 30, 31, 33, 34, 35, 37, 43, 44, 45, 36, 29]
+model_args:
+  acc_frames: 64
+  mocap_frames: 64
+  num_joints: 32
+  in_chans: 3
+  spatial_embed: 32
+  tdepth: 2
+  num_heads: 2
+  mlp_ratio: 2.0
+  drop_rate: 0.2
+  attn_drop_rate: 0.2
+  drop_path_rate: 0.2
+  num_classes: 1
+dataset_args:
+  mode: 'selective_window'
+  max_length: 64
+  task: 'fd'
+  modalities: ['skeleton', 'accelerometer']
+  age_group: ['young']
+  sensors: ['watch']
+  use_dtw: true
+  verbose: true
+  fall_height: 1.4
+  fall_distance: 50
+  non_fall_height: 1.2
+  non_fall_distance: 100
+batch_size: 16
+test_batch_size: 16
+val_batch_size: 16
+num_epoch: 80
+feeder: utils.dataset_tf.UTD_MM_TF
+optimizer: adamw
+base_lr: 0.001
+weight_decay: 0.0004
+seed: 2
+# Removed these conflicting parameters:
+# train_subjects_fixed: [45, 36, 29]
+# val_subjects_fixed: [38, 46]
+# test_eligible_subjects: [32, 39, 30, 31, 33, 34, 35, 37, 43, 44]

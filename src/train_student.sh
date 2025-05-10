@@ -129,7 +129,7 @@ python train.py \
   --model-saved-name "${MODEL_NAME}" \
   --device "${GPU_ID}" \
   --num-worker "${NUM_WORKERS}" \
-  --use-smv "${USE_SMV}" \
+  $(${USE_SMV} && echo "--use-smv true" || echo "--use-smv false") \
   --phase "train"
 
 # Check training status
