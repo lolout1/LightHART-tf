@@ -19,9 +19,8 @@ TEMPERATURE=4.5
 ALPHA=0.6
 USE_SMV=false
 
-# Override default teacher weights path
-# Use the actual path from your directory listing
-TEACHER_WEIGHTS="../experiments/teacher_2025-05-09_21-04-16/models/teacher_model_20250509_210419"
+# Correct teacher weights path - no "teacher_model" prefix in actual files
+TEACHER_WEIGHTS="modelsKD_20250510_080932/models/teacher_model"
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -231,8 +230,8 @@ if [ ${DISTILL_STATUS} -eq 0 ]; then
   ls -la "${WORK_DIR}/models/" || echo "No models found"
   
   echo "Results:"
-  if [ -f "${WORK_DIR}/distillation_scores.csv" ]; then
-    cat "${WORK_DIR}/distillation_scores.csv"
+  if [ -f "${WORK_DIR}/distillation_results.csv" ]; then
+    cat "${WORK_DIR}/distillation_results.csv"
   else
     echo "No scores file found"
   fi

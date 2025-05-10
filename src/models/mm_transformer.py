@@ -5,8 +5,8 @@ import numpy as np
 class MMTransformer(Model):
     def __init__(
         self,
-        mocap_frames=128,
-        acc_frames=128,
+        mocap_frames=64,
+        acc_frames=64,
         num_joints=32,
         in_chans=3,
         num_patch=2,
