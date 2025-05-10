@@ -19,7 +19,7 @@ dataset_args:
   modalities: ['accelerometer', 'skeleton']
   age_group: ['young']
   sensors: ['watch']
-  use_dtw: false 
+  use_dtw: true 
   verbose: true
   fall_height: 1.4
   fall_distance: 50
