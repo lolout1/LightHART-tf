@@ -10,10 +10,14 @@ from utils.processor_tf import butterworth_filter, pad_sequence_tf, align_sequen
 
 logger = logging.getLogger(__name__)
 
+# utils/processor_tf.py (updated csvloader function)
 def csvloader(file_path, **kwargs):
     try:
         file_data = pd.read_csv(file_path, index_col=False, header=0).dropna().bfill()
-        cols = 96 if 'skeleton' in file_path else 3
+        if 'skeleton' in file_path:
+            cols = 96
+        else:
+            cols = 3
         activity_data = file_data.iloc[2:, -cols:].to_numpy(dtype=np.float32)
         if activity_data.shape[0] < 10:
             logger.warning(f"File too small: {file_path} has only {activity_data.shape[0]} samples")
@@ -23,7 +27,6 @@ def csvloader(file_path, **kwargs):
     except Exception as e:
         logger.error(f"Error loading CSV file {file_path}: {e}")
         return None
-
 def matloader(file_path, **kwargs):
     try:
         from scipy.io import loadmat
@@ -38,6 +41,11 @@ def matloader(file_path, **kwargs):
 
 LOADER_MAP = {'csv': csvloader, 'mat': matloader}
 
+
+# feeder/make_dataset_tf.py
+import tensorflow as tf
+import numpy as np
+
 class UTD_MM_TF(tf.keras.utils.Sequence):
     def __init__(self, dataset, batch_size, use_smv=False):
         self.dataset = dataset
@@ -48,51 +56,87 @@ class UTD_MM_TF(tf.keras.utils.Sequence):
         self.labels = dataset.get('labels')
         self._validate_data()
         self.indices = np.arange(self.num_samples)
+    
     def _validate_data(self):
         if self.acc_data is None or len(self.acc_data) == 0:
-            logger.warning("Missing or empty accelerometer data, creating dummy data")
-            self.acc_data = np.zeros((1, 128, 3), dtype=np.float32)
+            self.acc_data = np.zeros((1, 64, 3), dtype=np.float32)
             self.num_samples = 1
         else:
             self.num_samples = len(self.acc_data)
+        
         if self.skl_data is not None and len(self.skl_data) > 0:
-            self.skl_seq, self.skl_length, self.skl_features = self.skl_data.shape
-            if self.skl_features % 3 == 0:
-                joints = self.skl_features // 3
-                self.skl_data = self.skl_data.reshape(self.skl_seq, self.skl_length, joints, 3)
+            if len(self.skl_data.shape) == 3:
+                self.skl_seq, self.skl_length, self.skl_features = self.skl_data.shape
+                if self.skl_features == 96:  # 32 joints * 3 coords
+                    self.skl_data = self.skl_data.reshape(self.skl_seq, self.skl_length, 32, 3)
+                elif self.skl_features % 3 == 0:
+                    joints = self.skl_features // 3
+                    self.skl_data = self.skl_data.reshape(self.skl_seq, self.skl_length, joints, 3)
+            elif len(self.skl_data.shape) != 4:
+                self.skl_data = np.zeros((self.num_samples, 64, 32, 3), dtype=np.float32)
         else:
-            logger.warning("Missing or empty skeleton data, creating dummy data")
-            self.skl_data = np.zeros((self.num_samples, 128, 32, 3), dtype=np.float32)
+            self.skl_data = np.zeros((self.num_samples, 64, 32, 3), dtype=np.float32)
+        
         if self.labels is None:
-            logger.warning("Missing labels, creating dummy labels")
             self.labels = np.zeros(self.num_samples, dtype=np.int32)
+            
+        # Input validation - ensure no empty arrays
+        if len(self.acc_data) == 0:
+            raise ValueError("Accelerometer data is empty")
+        if len(self.skl_data) == 0:
+            raise ValueError("Skeleton data is empty")
+        if len(self.labels) == 0:
+            raise ValueError("Labels are empty")
+            
+        # Convert to tensors with validation
         self.acc_data = tf.convert_to_tensor(self.acc_data, dtype=tf.float32)
         self.skl_data = tf.convert_to_tensor(self.skl_data, dtype=tf.float32)
         self.labels = tf.convert_to_tensor(self.labels, dtype=tf.int32)
+    
     def cal_smv(self, sample):
         mean = tf.reduce_mean(sample, axis=-2, keepdims=True)
         zero_mean = sample - mean
         sum_squared = tf.reduce_sum(tf.square(zero_mean), axis=-1, keepdims=True)
-        return tf.sqrt(sum_squared)
+        return tf.sqrt(sum_squared + 1e-8)  # Add epsilon for numerical stability
+    
     def __len__(self):
-        return (self.num_samples + self.batch_size - 1) // self.batch_size
+        return max(1, (self.num_samples + self.batch_size - 1) // self.batch_size)
+    
     def __getitem__(self, idx):
         start_idx = idx * self.batch_size
         end_idx = min(start_idx + self.batch_size, self.num_samples)
         batch_indices = self.indices[start_idx:end_idx]
+        
+        # Ensure we have at least one sample
+        if len(batch_indices) == 0:
+            batch_indices = [0]
+        
         batch_data = {}
         batch_acc = tf.gather(self.acc_data, batch_indices)
+        
+        # Validate batch data
+        if tf.reduce_any(tf.math.is_nan(batch_acc)):
+            batch_acc = tf.where(tf.math.is_nan(batch_acc), tf.zeros_like(batch_acc), batch_acc)
+        
         if self.use_smv:
             batch_smv = self.cal_smv(batch_acc)
             batch_data['accelerometer'] = tf.concat([batch_smv, batch_acc], axis=-1)
         else:
             batch_data['accelerometer'] = batch_acc
+        
         batch_data['skeleton'] = tf.gather(self.skl_data, batch_indices)
+        
+        # Validate skeleton data
+        if tf.reduce_any(tf.math.is_nan(batch_data['skeleton'])):
+            batch_data['skeleton'] = tf.where(tf.math.is_nan(batch_data['skeleton']), 
+                                            tf.zeros_like(batch_data['skeleton']), 
+                                            batch_data['skeleton'])
+        
         batch_labels = tf.gather(self.labels, batch_indices)
         return batch_data, batch_labels, batch_indices
+    
     def on_epoch_end(self):
         np.random.shuffle(self.indices)
-
 class ModalityFile:
     def __init__(self, subject_id, action_id, sequence_number, file_path):
         self.subject_id = subject_id
