@@ -71,6 +71,7 @@ class Trainer:
         self.model = None
         self.print_log("Trainer initialized successfully")
         self.print_log(f"Working directory: {self.arg.work_dir}")
+    
     def setup_logging(self):
         log_file = os.path.join(self.arg.work_dir, 'training.log')
         file_handler = logging.FileHandler(log_file)
@@ -78,6 +79,54 @@ class Trainer:
         formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
         file_handler.setFormatter(formatter)
         logger.addHandler(file_handler)
+    
+    def get_valid_older_subjects(self):
+        """Check which older subjects (1-28) have valid accelerometer and skeleton data"""
+        valid_older_subjects = []
+        from utils.dataset_sf import SmartFallMM
+        root_paths = [os.path.join(os.getcwd(), 'data/smartfallmm'), os.path.join(os.path.dirname(os.getcwd()), 'data/smartfallmm'), 
+                     '/mmfs1/home/sww35/data/smartfallmm', '/path/to/data/smartfallmm']
+        data_dir = None
+        for path in root_paths:
+            if os.path.exists(path):
+                data_dir = path
+                break
+        if data_dir is None:
+            self.print_log("Warning: Could not find data directory to validate older subjects")
+            return list(range(1, 20))
+        self.print_log("=== Checking Older Subjects (1-28) for Valid Data ===")
+        try:
+            sm_dataset = SmartFallMM(root_dir=data_dir)
+            sm_dataset.pipeline(age_group=['old'], modalities=['accelerometer', 'skeleton'], sensors=['watch'])
+            for subject_id in range(1, 29):
+                has_valid_data = False
+                sample_count = 0
+                for trial in sm_dataset.matched_trials:
+                    if trial.subject_id == subject_id:
+                        has_acc = 'accelerometer' in trial.files
+                        has_skl = 'skeleton' in trial.files
+                        if has_acc and has_skl:
+                            acc_exists = os.path.exists(trial.files['accelerometer'])
+                            skl_exists = os.path.exists(trial.files['skeleton'])
+                            if acc_exists and skl_exists:
+                                acc_size = os.path.getsize(trial.files['accelerometer'])
+                                skl_size = os.path.getsize(trial.files['skeleton'])
+                                if acc_size > 100 and skl_size > 100:
+                                    has_valid_data = True
+                                    sample_count += 1
+                if has_valid_data:
+                    valid_older_subjects.append(subject_id)
+                    self.print_log(f"  Subject {subject_id}: ✓ Valid data found ({sample_count} trials)")
+                else:
+                    self.print_log(f"  Subject {subject_id}: ✗ No valid accelerometer+skeleton data")
+        except Exception as e:
+            self.print_log(f"Error checking older subjects: {e}")
+            valid_older_subjects = list(range(1, 22))
+            self.print_log(f"Using fallback list of older subjects: {valid_older_subjects}")
+        self.print_log(f"Total valid older subjects found: {len(valid_older_subjects)}")
+        self.print_log(f"Valid older subject IDs: {valid_older_subjects}")
+        return valid_older_subjects
+    
     def setup_cross_validation(self):
         if hasattr(self.arg, 'subjects') and self.arg.subjects is not None:
             self.fixed_val_subjects = getattr(self.arg, 'val_subjects_fixed', None) or [38, 46]
@@ -86,14 +135,32 @@ class Trainer:
                 self.fixed_val_subjects = [38, 46]
             if self.fixed_train_subjects is None:
                 self.fixed_train_subjects = [45, 36, 29]
-            self.test_eligible_subjects = [s for s in self.arg.subjects if s not in self.fixed_val_subjects and s not in self.fixed_train_subjects]
+            include_older = getattr(self.arg, 'include_older_subjects', True)
+            if include_older:
+                valid_older_subjects = self.get_valid_older_subjects()
+                if not isinstance(self.fixed_train_subjects, list):
+                    self.fixed_train_subjects = list(self.fixed_train_subjects)
+                for subject in valid_older_subjects:
+                    if subject not in self.fixed_train_subjects:
+                        self.fixed_train_subjects.append(subject)
+                self.fixed_val_subjects = [s for s in self.fixed_val_subjects if s >= 29]
+                self.fixed_train_subjects.sort()
+            self.test_eligible_subjects = [s for s in self.arg.subjects if s >= 29 and s not in self.fixed_val_subjects and s not in self.fixed_train_subjects]
             self.total_folds = len(self.test_eligible_subjects)
             self.print_log("=== Cross-Validation Setup ===")
-            self.print_log(f"Total subjects: {self.arg.subjects}")
+            self.print_log(f"Total subjects in config: {self.arg.subjects}")
+            self.print_log(f"Include older subjects: {include_older}")
             self.print_log(f"Fixed validation subjects: {self.fixed_val_subjects}")
-            self.print_log(f"Fixed training subjects: {self.fixed_train_subjects}")
-            self.print_log(f"Test eligible subjects: {self.test_eligible_subjects}")
+            self.print_log(f"Fixed training subjects (including older): {self.fixed_train_subjects}")
+            self.print_log(f"  - Younger fixed train (29+): {[s for s in self.fixed_train_subjects if s >= 29]}")
+            self.print_log(f"  - Older fixed train (1-28): {[s for s in self.fixed_train_subjects if s < 29]}")
+            self.print_log(f"Test eligible subjects (younger only): {self.test_eligible_subjects}")
             self.print_log(f"Total folds: {self.total_folds}")
+            if any(s < 29 for s in self.fixed_val_subjects):
+                self.print_log("WARNING: Older subjects found in validation set! This should not happen.")
+            if any(s < 29 for s in self.test_eligible_subjects):
+                self.print_log("ERROR: Older subjects found in test eligible set! This should not happen.")
+                raise ValueError("Older subjects cannot be used for testing")
             self.print_log("============================")
         else:
             self.total_folds = 1
@@ -101,6 +168,140 @@ class Trainer:
             self.fixed_train_subjects = []
             self.test_eligible_subjects = []
             self.print_log("No cross-validation setup (subjects not specified)")
+    
+    def analyze_age_group_differences(self, train_data, val_data=None, test_data=None):
+        """Analyze statistical differences between older (1-28) and younger (29+) subjects"""
+        self.print_log("\n=== Age Group Statistical Analysis ===")
+        all_data = {}
+        all_labels = {}
+        if train_data and 'accelerometer' in train_data:
+            all_data['train'] = train_data
+            all_labels['train'] = train_data.get('labels', [])
+        if val_data and 'accelerometer' in val_data:
+            all_data['val'] = val_data
+            all_labels['val'] = val_data.get('labels', [])
+        if test_data and 'accelerometer' in test_data:
+            all_data['test'] = test_data
+            all_labels['test'] = test_data.get('labels', [])
+        older_acc_data = []
+        younger_acc_data = []
+        older_labels = []
+        younger_labels = []
+        for split_name, subjects in [('train', self.train_subjects), ('val', self.val_subject if self.val_subject else []), ('test', self.test_subject if self.test_subject else [])]:
+            if split_name in all_data:
+                data = all_data[split_name]
+                labels = all_labels[split_name]
+                older_subjects_in_split = [s for s in subjects if s < 29]
+                younger_subjects_in_split = [s for s in subjects if s >= 29]
+                if older_subjects_in_split and younger_subjects_in_split:
+                    total_subjects = len(older_subjects_in_split) + len(younger_subjects_in_split)
+                    older_ratio = len(older_subjects_in_split) / total_subjects
+                    if 'accelerometer' in data and len(data['accelerometer']) > 0:
+                        n_samples = len(data['accelerometer'])
+                        older_n = int(n_samples * older_ratio)
+                        older_acc_data.append(data['accelerometer'][:older_n])
+                        younger_acc_data.append(data['accelerometer'][older_n:])
+                        if len(labels) == n_samples:
+                            older_labels.extend(labels[:older_n])
+                            younger_labels.extend(labels[older_n:])
+                elif older_subjects_in_split:
+                    if 'accelerometer' in data and len(data['accelerometer']) > 0:
+                        older_acc_data.append(data['accelerometer'])
+                        older_labels.extend(labels)
+                elif younger_subjects_in_split:
+                    if 'accelerometer' in data and len(data['accelerometer']) > 0:
+                        younger_acc_data.append(data['accelerometer'])
+                        younger_labels.extend(labels)
+        if older_acc_data and younger_acc_data:
+            older_acc = np.concatenate(older_acc_data, axis=0) if older_acc_data else np.array([])
+            younger_acc = np.concatenate(younger_acc_data, axis=0) if younger_acc_data else np.array([])
+            self.print_log(f"Older subjects data shape: {older_acc.shape}")
+            self.print_log(f"Younger subjects data shape: {younger_acc.shape}")
+            if older_acc.shape[0] > 0 and younger_acc.shape[0] > 0:
+                older_magnitude = np.sqrt(np.sum(older_acc**2, axis=-1))
+                younger_magnitude = np.sqrt(np.sum(younger_acc**2, axis=-1))
+                self.print_log("\n1. Signal Magnitude Analysis:")
+                self.print_log(f"  Older - Mean: {np.mean(older_magnitude):.4f}, Std: {np.std(older_magnitude):.4f}")
+                self.print_log(f"  Younger - Mean: {np.mean(younger_magnitude):.4f}, Std: {np.std(younger_magnitude):.4f}")
+                self.print_log("\n2. Activity Distribution (ADL only):")
+                older_label_counts = Counter(older_labels)
+                younger_label_counts = Counter(younger_labels)
+                self.print_log("  Older subjects:")
+                for label, count in sorted(older_label_counts.items()):
+                    if label == 0:
+                        self.print_log(f"    ADL activities: {count} ({count/len(older_labels)*100:.1f}%)")
+                self.print_log("  Younger subjects:")
+                for label, count in sorted(younger_label_counts.items()):
+                    self.print_log(f"    Label {label}: {count} ({count/len(younger_labels)*100:.1f}%)")
+                self.print_log("\n3. Movement Intensity Analysis:")
+                if older_acc.shape[1] > 1:
+                    older_var = np.var(older_acc, axis=1)
+                    younger_var = np.var(younger_acc, axis=1)
+                    self.print_log(f"  Older - Temporal variance: {np.mean(older_var):.4f}")
+                    self.print_log(f"  Younger - Temporal variance: {np.mean(younger_var):.4f}")
+                    from scipy import stats
+                    t_stat, p_value = stats.ttest_ind(np.mean(older_var, axis=-1), np.mean(younger_var, axis=-1), equal_var=False)
+                    self.print_log(f"  T-test: t={t_stat:.4f}, p={p_value:.4f}")
+                    if p_value < 0.05:
+                        self.print_log("  ✓ Significant difference in movement patterns between age groups")
+                    else:
+                        self.print_log("  ✗ No significant difference in movement patterns")
+                self.print_log("\n4. Peak Acceleration Analysis:")
+                older_peaks = np.max(older_magnitude.reshape(-1, older_magnitude.shape[-1]), axis=-1)
+                younger_peaks = np.max(younger_magnitude.reshape(-1, younger_magnitude.shape[-1]), axis=-1)
+                self.print_log(f"  Older - Mean peak: {np.mean(older_peaks):.4f}")
+                self.print_log(f"  Younger - Mean peak: {np.mean(younger_peaks):.4f}")
+                self.visualize_age_group_differences(older_magnitude, younger_magnitude, older_var if 'older_var' in locals() else None, younger_var if 'younger_var' in locals() else None)
+        else:
+            self.print_log("Insufficient data for age group comparison")
+        self.print_log("=====================================\n")
+    
+    def visualize_age_group_differences(self, older_mag, younger_mag, older_var=None, younger_var=None):
+        """Create visualizations comparing older and younger subjects"""
+        vis_dir = os.path.join(self.arg.work_dir, 'visualizations')
+        os.makedirs(vis_dir, exist_ok=True)
+        fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+        ax = axes[0, 0]
+        ax.hist(older_mag.flatten(), bins=50, alpha=0.5, label='Older (1-28)', density=True, color='blue')
+        ax.hist(younger_mag.flatten(), bins=50, alpha=0.5, label='Younger (29+)', density=True, color='red')
+        ax.set_xlabel('Signal Magnitude')
+        ax.set_ylabel('Density')
+        ax.set_title('Signal Magnitude Distribution by Age Group')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        ax = axes[0, 1]
+        data_to_plot = [older_mag.flatten(), younger_mag.flatten()]
+        box = ax.boxplot(data_to_plot, labels=['Older', 'Younger'], patch_artist=True)
+        box['boxes'][0].set_facecolor('lightblue')
+        box['boxes'][1].set_facecolor('lightcoral')
+        ax.set_ylabel('Signal Magnitude')
+        ax.set_title('Signal Magnitude Comparison')
+        ax.grid(True, alpha=0.3)
+        if older_var is not None and younger_var is not None:
+            ax = axes[1, 0]
+            ax.scatter(np.mean(older_var, axis=-1), np.std(older_var, axis=-1), alpha=0.5, label='Older', color='blue')
+            ax.scatter(np.mean(younger_var, axis=-1), np.std(younger_var, axis=-1), alpha=0.5, label='Younger', color='red')
+            ax.set_xlabel('Mean Variance')
+            ax.set_ylabel('Std Variance')
+            ax.set_title('Movement Variability Scatter')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+        ax = axes[1, 1]
+        ax.axis('off')
+        stats_text = "Summary Statistics\n" + "="*30 + "\n\n"
+        stats_text += f"Older Subjects (1-28):\n"
+        stats_text += f"  Mean magnitude: {np.mean(older_mag):.4f}\n"
+        stats_text += f"  Std magnitude: {np.std(older_mag):.4f}\n"
+        stats_text += f"  Max magnitude: {np.max(older_mag):.4f}\n\n"
+        stats_text += f"Younger Subjects (29+):\n"
+        stats_text += f"  Mean magnitude: {np.mean(younger_mag):.4f}\n"
+        stats_text += f"  Std magnitude: {np.std(younger_mag):.4f}\n"
+        stats_text += f"  Max magnitude: {np.max(younger_mag):.4f}\n"
+        ax.text(0.1, 0.9, stats_text, transform=ax.transAxes, fontsize=10, verticalalignment='top', fontfamily='monospace')
+        plt.tight_layout()
+        plt.savefig(os.path.join(vis_dir, 'age_group_comparison.png'), dpi=300, bbox_inches='tight')
+        plt.close()
+    
     def save_config(self, src_path, dest_path):
         config_dest = os.path.join(dest_path, 'config')
         os.makedirs(config_dest, exist_ok=True)
@@ -116,10 +317,12 @@ class Trainer:
                 self.print_log(f"Config already exists at destination: {dest_file}")
         else:
             self.print_log(f"Warning: Config file not found: {src_path}")
+    
     def count_parameters(self):
         if self.model is None:
             return 0
         return sum(np.prod(v.shape.as_list()) for v in self.model.trainable_variables)
+    
     def import_class(self, import_str):
         mod_str, _, class_str = import_str.rpartition('.')
         import importlib
@@ -129,6 +332,7 @@ class Trainer:
         except Exception as e:
             self.print_log(f"Error importing class {import_str}: {e}")
             raise
+    
     def load_model(self):
         self.print_log(f"Loading model: {self.arg.model}")
         try:
@@ -149,6 +353,7 @@ class Trainer:
         except Exception as e:
             self.print_log(f"Error loading model: {e}")
             raise
+    
     def calculate_class_weights(self, labels):
         from collections import Counter
         counter = Counter(labels)
@@ -159,6 +364,7 @@ class Trainer:
         pos_weight = counter[0] / counter[1]
         self.print_log(f'Class weights - neg: {counter[0]}, pos: {counter[1]}, pos_weight: {pos_weight:.4f}')
         return tf.constant(pos_weight, dtype=tf.float32)
+    
     def load_optimizer(self):
         base_lr = self.arg.base_lr
         self.print_log(f"Loading optimizer: {self.arg.optimizer} with lr={base_lr}")
@@ -170,11 +376,13 @@ class Trainer:
             self.optimizer = tf.keras.optimizers.SGD(learning_rate=base_lr, momentum=0.9)
         else:
             raise ValueError(f"Unknown optimizer: {self.arg.optimizer}")
+    
     def load_loss(self):
         from utils.loss import BinaryFocalLoss
         self.pos_weights = getattr(self, 'pos_weights', tf.constant(1.0))
         self.print_log(f"Loading loss function with pos_weight: {self.pos_weights.numpy()}")
         self.criterion = BinaryFocalLoss(alpha=0.75, gamma=2.0)
+    
     def load_data(self):
         from utils.dataset_tf import prepare_smartfallmm_tf, split_by_subjects_tf
         self.print_log("=== Loading Data ===")
@@ -210,6 +418,7 @@ class Trainer:
                     self.print_log(f'ERROR: No test data for subject {self.test_subject}')
                     return False
                 self.print_log(f"Test data loaded: {len(self.norm_test['labels'])} samples")
+                self.analyze_age_group_differences(self.norm_train, self.norm_val, self.norm_test)
                 self.pos_weights = self.calculate_class_weights(self.norm_train['labels'])
                 use_smv = getattr(self.arg, 'use_smv', False)
                 window_size = self.arg.dataset_args.get('max_length', 64)
@@ -230,6 +439,7 @@ class Trainer:
             import traceback
             self.print_log(traceback.format_exc())
             return False
+    
     def distribution_viz(self, labels, work_dir, mode):
         vis_dir = os.path.join(work_dir, 'visualizations')
         os.makedirs(vis_dir, exist_ok=True)
@@ -254,6 +464,7 @@ class Trainer:
             f.write(f"Total samples: {sum(counts)}\n")
             for label, count in zip(unique, counts):
                 f.write(f"Label {label}: {count} ({count/sum(counts)*100:.2f}%)\n")
+    
     def calculate_metrics(self, targets, predictions, probabilities=None):
         targets = np.array(targets).flatten()
         predictions = np.array(predictions).flatten()
@@ -280,6 +491,7 @@ class Trainer:
             tn, fp, fn, tp = cm.ravel()
             self.print_log(f"TN: {tn}, FP: {fp}, FN: {fn}, TP: {tp}")
         return accuracy, f1, recall, precision, auc
+    
     def train_step(self, inputs, targets):
         try:
             with tf.GradientTape() as tape:
@@ -295,6 +507,7 @@ class Trainer:
         except Exception as e:
             self.print_log(f"Error in train_step: {e}")
             raise
+    
     def train(self, epoch):
         self.print_log(f'Starting Epoch: {epoch+1}/{self.arg.num_epoch}')
         loader = self.data_loader['train']
@@ -346,6 +559,7 @@ class Trainer:
             self.print_log(f"Early stopping triggered at epoch {epoch+1}")
             return True
         return False
+    
     def eval(self, epoch, loader_name='val', result_file=None):
         self.print_log(f'Evaluating {loader_name} at epoch {epoch+1}')
         loader = self.data_loader[loader_name]
@@ -409,6 +623,7 @@ class Trainer:
             self.test_auc = auc_score
             self.cm_viz(all_preds, all_labels)
         return eval_loss
+    
     def save_model(self):
         try:
             weight_path = f'{self.model_path}_{self.test_subject[0]}.weights.h5'
@@ -418,6 +633,7 @@ class Trainer:
             self.print_log(f"Saved model size: {file_size/1024/1024:.2f} MB")
         except Exception as e:
             self.print_log(f"Error saving model: {e}")
+    
     def load_weights(self):
         weight_path = f'{self.model_path}_{self.test_subject[0]}.weights.h5'
         if os.path.exists(weight_path):
@@ -429,6 +645,7 @@ class Trainer:
                 raise
         else:
             self.print_log(f"Warning: Weight file not found: {weight_path}")
+    
     def loss_viz(self, train_loss, val_loss):
         if not train_loss or not val_loss:
             self.print_log("Warning: No loss data to visualize")
@@ -458,6 +675,7 @@ class Trainer:
         plt.close()
         loss_data = pd.DataFrame({'epoch': epochs, 'train_loss': train_loss, 'val_loss': val_loss})
         loss_data.to_csv(os.path.join(self.arg.work_dir, 'visualizations', f'loss_data_s{self.test_subject[0]}.csv'), index=False)
+    
     def cm_viz(self, y_pred, y_true):
         cm = confusion_matrix(y_true, y_pred)
         plt.figure(figsize=(10, 8))
@@ -472,6 +690,7 @@ class Trainer:
         vis_path = os.path.join(self.arg.work_dir, 'visualizations', f'confusion_matrix_s{self.test_subject[0]}.png')
         plt.savefig(vis_path, dpi=300, bbox_inches='tight')
         plt.close()
+    
     def print_log(self, message):
         timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         full_message = f"[{timestamp}] {message}"
@@ -480,13 +699,26 @@ class Trainer:
         with open(log_file, 'a') as f:
             f.write(full_message + '\n')
         logger.info(message)
+    
     def start(self):
         if self.arg.phase == 'train':
             self.print_log('=== Starting Training ===')
             self.print_log('Configuration:')
             self.print_log(yaml.dump(vars(self.arg), default_flow_style=False))
+            if hasattr(self, 'test_eligible_subjects'):
+                older_in_test = [s for s in self.test_eligible_subjects if s < 29]
+                if older_in_test:
+                    raise ValueError(f"ERROR: Older subjects {older_in_test} found in test eligible set!")
+            if hasattr(self, 'fixed_val_subjects'):
+                older_in_val = [s for s in self.fixed_val_subjects if s < 29]
+                if older_in_val:
+                    self.print_log(f"WARNING: Removing older subjects {older_in_val} from validation set")
+                    self.fixed_val_subjects = [s for s in self.fixed_val_subjects if s >= 29]
             results = []
             for fold_idx, test_subject in enumerate(self.test_eligible_subjects):
+                if test_subject < 29:
+                    self.print_log(f"ERROR: Attempting to test on older subject {test_subject}")
+                    continue
                 fold_start_time = time.time()
                 self.train_loss_summary = []
                 self.val_loss_summary = []
@@ -497,10 +729,20 @@ class Trainer:
                 self.train_subjects = self.fixed_train_subjects + remaining_eligible
                 self.print_log(f'\n{"="*60}')
                 self.print_log(f'FOLD {fold_idx+1}/{self.total_folds}: Test Subject {test_subject}')
-                self.print_log(f'Train: {self.train_subjects}')
-                self.print_log(f'Val: {self.val_subject}')
-                self.print_log(f'Test: {self.test_subject}')
                 self.print_log(f'{"="*60}')
+                self.print_log(f'\n📊 SUBJECT ALLOCATION FOR FOLD {fold_idx+1}:')
+                self.print_log(f'───────────────────────────────────────')
+                self.print_log(f'TRAIN SUBJECTS ({len(self.train_subjects)} total):')
+                older_train = sorted([s for s in self.train_subjects if s < 29])
+                younger_train = sorted([s for s in self.train_subjects if s >= 29])
+                if older_train:
+                    self.print_log(f'  Older (1-28): {older_train} ({len(older_train)} subjects)')
+                self.print_log(f'  Younger (29+): {younger_train} ({len(younger_train)} subjects)')
+                self.print_log(f'\nVAL SUBJECTS ({len(self.val_subject)} total):')
+                self.print_log(f'  {sorted(self.val_subject)}')
+                self.print_log(f'\nTEST SUBJECTS ({len(self.test_subject)} total):')
+                self.print_log(f'  {self.test_subject}')
+                self.print_log(f'───────────────────────────────────────\n')
                 try:
                     tf.keras.backend.clear_session()
                     self.model = self.load_model()
@@ -550,6 +792,7 @@ class Trainer:
                 self.print_log("Warning: No results collected!")
         else:
             self.print_log(f"Phase {self.arg.phase} not implemented")
+    
     def create_overall_visualization(self, results_df):
         plot_df = results_df[results_df['test_subject'] != 'Average'].copy()
         fig, axes = plt.subplots(2, 3, figsize=(18, 12))
@@ -575,6 +818,7 @@ class Trainer:
         plt.tight_layout()
         plt.savefig(os.path.join(self.arg.work_dir, 'visualizations', 'overall_results.png'), dpi=300, bbox_inches='tight')
         plt.close()
+    
     def create_summary_report(self, results_df, stats):
         report_path = os.path.join(self.arg.work_dir, 'summary_report.txt')
         with open(report_path, 'w') as f:
@@ -589,6 +833,8 @@ class Trainer:
             f.write("-"*30 + "\n")
             f.write(f"Total Subjects: {len(self.arg.subjects)}\n")
             f.write(f"Fixed Train: {self.fixed_train_subjects}\n")
+            f.write(f"  - Older (1-28): {[s for s in self.fixed_train_subjects if s < 29]}\n")
+            f.write(f"  - Younger (29+): {[s for s in self.fixed_train_subjects if s >= 29]}\n")
             f.write(f"Fixed Val: {self.fixed_val_subjects}\n")
             f.write(f"Test Eligible: {self.test_eligible_subjects}\n")
             f.write(f"Total Folds: {self.total_folds}\n")
@@ -668,6 +914,7 @@ def get_args():
     parser.add_argument('--train-subjects-fixed', nargs='+', type=int)
     parser.add_argument('--val-subjects-fixed', nargs='+', type=int)
     parser.add_argument('--test-eligible-subjects', nargs='+', type=int)
+    parser.add_argument('--include-older-subjects', type=str2bool, default=True)
     return parser
 
 def main():
