@@ -14,10 +14,10 @@ val_subjects_fixed: [38, 46]        # Validation subjects (younger only)
 # Test eligible: remaining younger subjects not in fixed sets
 
 # Whether to include older subjects (1-28) in training
-include_older_subjects: true  # Set to false to use only younger subjects
+include_older_subjects: false # Set to false to use only younger subjects
 
 model_args:
-  acc_frames: 64
+  acc_frames: 128
   num_classes: 1
   num_heads: 4
   acc_coords: 3
@@ -29,7 +29,7 @@ model_args:
 
 dataset_args:
   mode: 'selective_window'
-  max_length: 64
+  max_length: 128
   task: 'fd'
   modalities: ['accelerometer', 'skeleton']
   age_group: ['young', 'old']  # Include both age groups for training
@@ -47,7 +47,7 @@ test_batch_size: 16
 val_batch_size: 16
 num_epoch: 80
 optimizer: adamw
-base_lr: 0.001
+base_lr: 0.0005
 weight_decay: 0.0004
 use_smv: false
 seed: 2

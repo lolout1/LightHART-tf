@@ -23,7 +23,6 @@ class Distiller(Trainer):
         self.teacher_model = None
         self.cross_aligner = None
         self.distillation_loss = None
-        # Initialize standard loss for evaluation
         self.criterion = None
         self.print_log("Distiller initialized successfully")
     
@@ -45,7 +44,6 @@ class Distiller(Trainer):
                 raise ValueError(f"Unsupported dataset: {self.arg.dataset}")
             
             if self.arg.phase in ['train', 'distill']:
-                # Compute global statistics from all subjects
                 all_subjects = self.train_subjects + self.val_subject + self.test_subject
                 self.print_log(f"Computing global statistics from {len(all_subjects)} subjects")
                 
@@ -55,7 +53,6 @@ class Distiller(Trainer):
                 self.skl_mean = all_data.get('skl_mean')
                 self.skl_std = all_data.get('skl_std')
                 
-                # Load training data
                 self.norm_train = split_by_subjects_tf(builder, self.train_subjects, False, 
                                                       acc_mean=self.acc_mean, acc_std=self.acc_std,
                                                       skl_mean=self.skl_mean, skl_std=self.skl_std)
@@ -66,7 +63,6 @@ class Distiller(Trainer):
                 
                 self.print_log(f"Training data loaded: {len(self.norm_train['labels'])} samples")
                 
-                # Load validation data
                 self.norm_val = split_by_subjects_tf(builder, self.val_subject, False,
                                                     acc_mean=self.acc_mean, acc_std=self.acc_std,
                                                     skl_mean=self.skl_mean, skl_std=self.skl_std)
@@ -77,7 +73,6 @@ class Distiller(Trainer):
                 
                 self.print_log(f"Validation data loaded: {len(self.norm_val['labels'])} samples")
                 
-                # Load test data
                 self.norm_test = split_by_subjects_tf(builder, self.test_subject, False,
                                                      acc_mean=self.acc_mean, acc_std=self.acc_std,
                                                      skl_mean=self.skl_mean, skl_std=self.skl_std)
@@ -88,10 +83,11 @@ class Distiller(Trainer):
                 
                 self.print_log(f"Test data loaded: {len(self.norm_test['labels'])} samples")
                 
-                # Calculate class weights
+                # Analyze age group differences (inherited from parent)
+                self.analyze_age_group_differences(self.norm_train, self.norm_val, self.norm_test)
+                
                 self.pos_weights = self.calculate_class_weights(self.norm_train['labels'])
                 
-                # Create data loaders
                 use_smv = getattr(self.arg, 'use_smv', False)
                 window_size = self.arg.dataset_args.get('max_length', 64)
                 
@@ -108,7 +104,6 @@ class Distiller(Trainer):
                 self.print_log(f"Val batches: {len(self.data_loader['val'])}")
                 self.print_log(f"Test batches: {len(self.data_loader['test'])}")
                 
-                # Create visualizations
                 self.distribution_viz(self.norm_train['labels'], self.arg.work_dir, f'train_s{self.test_subject[0]}')
                 self.distribution_viz(self.norm_val['labels'], self.arg.work_dir, f'val_s{self.test_subject[0]}')
                 self.distribution_viz(self.norm_test['labels'], self.arg.work_dir, f'test_s{self.test_subject[0]}')
@@ -124,13 +119,10 @@ class Distiller(Trainer):
     
     def load_loss(self):
         """Override to load both standard loss and distillation loss"""
-        # Load standard criterion for evaluation (from parent class)
         from utils.loss import BinaryFocalLoss
         self.pos_weights = getattr(self, 'pos_weights', tf.constant(1.0))
         self.criterion = BinaryFocalLoss(alpha=0.75, gamma=2.0)
         self.print_log(f"Loaded standard loss with pos_weight: {self.pos_weights.numpy()}")
-        
-        # Load distillation loss for training
         self.load_distillation_loss()
     
     def load_distillation_loss(self):
@@ -154,7 +146,6 @@ class Distiller(Trainer):
         teacher_class = self.import_class(self.arg.teacher_model)
         teacher_model = teacher_class(**self.arg.teacher_args)
         
-        # Build model with dummy input
         acc_frames = self.arg.teacher_args.get('acc_frames', 64)
         acc_coords = self.arg.teacher_args.get('acc_coords', 3)
         mocap_frames = self.arg.teacher_args.get('mocap_frames', 64)
@@ -166,11 +157,9 @@ class Distiller(Trainer):
         }
         _ = teacher_model(dummy_input, training=False)
         
-        # Load weights for specific subject
         subject_id = self.test_subject[0] if hasattr(self, 'test_subject') and self.test_subject else None
         
         if subject_id:
-            # Try different weight file paths
             weight_paths = [
                 f"{self.arg.teacher_weight}_{subject_id}.weights.h5",
                 f"{self.arg.teacher_weight}_{subject_id}.keras",
@@ -195,7 +184,6 @@ class Distiller(Trainer):
             if not loaded:
                 logger.error(f"No teacher weights found for subject {subject_id}")
         
-        # Set teacher to non-trainable
         teacher_model.trainable = False
         return teacher_model
     
@@ -210,7 +198,6 @@ class Distiller(Trainer):
     def viz_feature(self, teacher_features, student_features, epoch):
         """Visualize feature distributions - match PyTorch implementation"""
         try:
-            # Flatten features for visualization
             teacher_features = tf.reshape(teacher_features, (teacher_features.shape[0], -1))
             student_features = tf.reshape(student_features, (student_features.shape[0], -1))
             
@@ -220,11 +207,8 @@ class Distiller(Trainer):
             for i in range(num_samples):
                 plt.subplot(2, 4, i+1)
                 
-                # Teacher features
                 sns.kdeplot(teacher_features[i, :].numpy(), bw_adjust=0.5, 
                            color='blue', label='Teacher')
-                
-                # Student features  
                 sns.kdeplot(student_features[i, :].numpy(), bw_adjust=0.5,
                            color='red', label='Student')
                 
@@ -243,13 +227,9 @@ class Distiller(Trainer):
     def distill_step(self, inputs, targets):
         """Single distillation training step with gradient tape"""
         with tf.GradientTape() as tape:
-            # Get teacher predictions (no gradient)
             teacher_outputs = self.teacher_model(inputs, training=False)
-            
-            # Get student predictions  
             student_outputs = self.model(inputs, training=True)
             
-            # Extract logits and features
             if isinstance(teacher_outputs, tuple) and len(teacher_outputs) > 1:
                 teacher_logits, teacher_features = teacher_outputs
             else:
@@ -262,19 +242,16 @@ class Distiller(Trainer):
                 student_logits = student_outputs
                 student_features = None
             
-            # Cross-modal alignment if enabled
             if self.cross_aligner and teacher_features is not None and student_features is not None:
                 aligned_features = self.cross_aligner(student_features, teacher_features)
             else:
                 aligned_features = student_features
             
-            # Calculate distillation loss
             loss = self.distillation_loss(
                 student_logits, teacher_logits, targets,
                 teacher_features, aligned_features
             )
         
-        # Compute gradients and update student model
         gradients = tape.gradient(loss, self.model.trainable_variables)
         self.optimizer.apply_gradients(zip(gradients, self.model.trainable_variables))
         
@@ -301,14 +278,11 @@ class Distiller(Trainer):
                 inputs, targets, _ = loader[batch_idx]
                 targets = tf.cast(targets, tf.float32)
                 
-                # Perform distillation step
                 loss, student_logits = self.distill_step(inputs, targets)
                 
-                # Get predictions
                 probabilities = tf.sigmoid(student_logits)
                 predictions = tf.cast(probabilities > 0.5, tf.int32)
                 
-                # Accumulate metrics
                 train_loss += loss.numpy()
                 all_labels.extend(targets.numpy().flatten())
                 all_preds.extend(predictions.numpy().flatten())
@@ -317,7 +291,6 @@ class Distiller(Trainer):
                 
                 progress.set_postfix({'loss': f'{loss.numpy():.4f}'})
                 
-                # Visualize features periodically
                 if epoch % 10 == 0 and batch_idx == 0:
                     teacher_outputs = self.teacher_model(inputs, training=False)
                     student_outputs = self.model(inputs, training=False)
@@ -333,7 +306,6 @@ class Distiller(Trainer):
                 continue
         
         if steps > 0:
-            # Calculate epoch metrics
             train_loss /= steps
             train_time = time.time() - start_time
             
@@ -356,11 +328,9 @@ class Distiller(Trainer):
             self.print_log("Warning: No valid training batches!")
             return True
         
-        # Validation using standard loss
         val_loss = self.eval(epoch, loader_name='val')
         self.val_loss_summary.append(float(val_loss))
         
-        # Early stopping check
         self.early_stop(val_loss)
         if self.early_stop.early_stop:
             self.print_log(f"Early stopping triggered at epoch {epoch+1}")
@@ -368,22 +338,119 @@ class Distiller(Trainer):
         
         return False
     
+    def eval(self, epoch, loader_name='val', result_file=None):
+        """Override eval to ensure correct model saving based on lowest val loss"""
+        self.print_log(f'Evaluating {loader_name} at epoch {epoch+1}')
+        loader = self.data_loader[loader_name]
+        eval_loss = 0.0
+        all_labels = []
+        all_preds = []
+        all_probs = []
+        steps = 0
+        
+        from tqdm import tqdm
+        progress = tqdm(range(len(loader)), ncols=80, desc=f'{loader_name.capitalize()}')
+        
+        for batch_idx in progress:
+            try:
+                inputs, targets, _ = loader[batch_idx]
+                targets = tf.cast(targets, tf.float32)
+                
+                outputs = self.model(inputs, training=False)
+                if isinstance(outputs, tuple):
+                    logits = outputs[0]
+                else:
+                    logits = outputs
+                
+                loss = self.criterion(targets, logits)
+                probabilities = tf.sigmoid(logits)
+                predictions = tf.cast(probabilities > 0.5, tf.int32)
+                
+                eval_loss += loss.numpy()
+                all_labels.extend(targets.numpy().flatten())
+                all_preds.extend(predictions.numpy().flatten())
+                all_probs.extend(probabilities.numpy().flatten())
+                steps += 1
+                
+                progress.set_postfix({'loss': f'{loss.numpy():.4f}'})
+            except Exception as e:
+                self.print_log(f"Error in evaluation batch {batch_idx}: {e}")
+                continue
+        
+        if steps > 0:
+            eval_loss /= steps
+            accuracy, f1, recall, precision, auc_score = self.calculate_metrics(all_labels, all_preds, all_probs)
+            
+            self.print_log(f'{loader_name.capitalize()} Results:')
+            self.print_log(f'  Loss: {eval_loss:.4f}')
+            self.print_log(f'  Accuracy: {accuracy:.2f}%')
+            self.print_log(f'  F1 Score: {f1:.2f}%')
+            self.print_log(f'  Precision: {precision:.2f}%')
+            self.print_log(f'  Recall: {recall:.2f}%')
+            self.print_log(f'  AUC: {auc_score:.2f}%')
+            self.print_log(f'  Batches: {steps}/{len(loader)}')
+            
+            # Save model if validation loss improved
+            if loader_name == 'val':
+                if eval_loss < self.best_loss:
+                    self.print_log(f'New best validation loss: {eval_loss:.4f} (previous: {self.best_loss:.4f})')
+                    self.best_loss = eval_loss
+                    self.save_model()
+                    self.print_log(f'✓ Model saved with best validation loss: {eval_loss:.4f}')
+                else:
+                    self.print_log(f'Validation loss: {eval_loss:.4f} (best: {self.best_loss:.4f}) - not saving')
+        else:
+            self.print_log(f"Warning: No valid {loader_name} batches!")
+            return float('inf')
+        
+        if result_file is not None:
+            with open(result_file, 'w') as f:
+                f.write(f"Predictions for {loader_name} epoch {epoch+1}\n")
+                f.write("true,predicted,probability\n")
+                for true, pred, prob in zip(all_labels, all_preds, all_probs):
+                    f.write(f'{true},{pred},{prob:.4f}\n')
+        
+        if loader_name == 'test':
+            self.test_accuracy = accuracy
+            self.test_f1 = f1
+            self.test_recall = recall
+            self.test_precision = precision
+            self.test_auc = auc_score
+            self.cm_viz(all_preds, all_labels)
+        
+        return eval_loss
+    
     def start(self):
-        """Main distillation training loop - match train.py structure"""
+        """Main distillation training loop with older subjects integration"""
         if self.arg.phase in ['distill', 'train']:
             self.print_log('=== Starting Knowledge Distillation ===')
             self.print_log('Configuration:')
             self.print_log(yaml.dump(vars(self.arg), default_flow_style=False))
             
+            # Safety checks for older subjects
+            if hasattr(self, 'test_eligible_subjects'):
+                older_in_test = [s for s in self.test_eligible_subjects if s < 29]
+                if older_in_test:
+                    raise ValueError(f"ERROR: Older subjects {older_in_test} found in test eligible set!")
+            
+            if hasattr(self, 'fixed_val_subjects'):
+                older_in_val = [s for s in self.fixed_val_subjects if s < 29]
+                if older_in_val:
+                    self.print_log(f"WARNING: Removing older subjects {older_in_val} from validation set")
+                    self.fixed_val_subjects = [s for s in self.fixed_val_subjects if s >= 29]
+            
             results = []
             
-            # Cross-validation loop
             for fold_idx, test_subject in enumerate(self.test_eligible_subjects):
+                if test_subject < 29:
+                    self.print_log(f"ERROR: Attempting to test on older subject {test_subject}")
+                    continue
+                
                 fold_start_time = time.time()
                 
                 self.train_loss_summary = []
                 self.val_loss_summary = []
-                self.best_loss = float('inf')
+                self.best_loss = float('inf')  # Reset for each fold
                 
                 self.test_subject = [test_subject]
                 self.val_subject = self.fixed_val_subjects
@@ -392,52 +459,61 @@ class Distiller(Trainer):
                 
                 self.print_log(f'\n{"="*60}')
                 self.print_log(f'DISTILLATION FOLD {fold_idx+1}/{self.total_folds}: Test Subject {test_subject}')
-                self.print_log(f'Train: {self.train_subjects}')
-                self.print_log(f'Val: {self.val_subject}')
-                self.print_log(f'Test: {self.test_subject}')
                 self.print_log(f'{"="*60}')
                 
+                # Display subject allocation
+                self.print_log(f'\n📊 SUBJECT ALLOCATION FOR FOLD {fold_idx+1}:')
+                self.print_log(f'───────────────────────────────────────')
+                self.print_log(f'TRAIN SUBJECTS ({len(self.train_subjects)} total):')
+                older_train = sorted([s for s in self.train_subjects if s < 29])
+                younger_train = sorted([s for s in self.train_subjects if s >= 29])
+                if older_train:
+                    self.print_log(f'  Older (1-28): {older_train} ({len(older_train)} subjects)')
+                self.print_log(f'  Younger (29+): {younger_train} ({len(younger_train)} subjects)')
+                self.print_log(f'\nVAL SUBJECTS ({len(self.val_subject)} total):')
+                self.print_log(f'  {sorted(self.val_subject)}')
+                self.print_log(f'\nTEST SUBJECTS ({len(self.test_subject)} total):')
+                self.print_log(f'  {self.test_subject}')
+                self.print_log(f'───────────────────────────────────────\n')
+                
                 try:
-                    # Clear TF session
                     tf.keras.backend.clear_session()
                     
-                    # Load models
                     self.teacher_model = self.load_teacher_model()
                     self.model = self.load_model()
-                    self.print_log(f'Model Parameters: {self.count_parameters()}')
+                    self.print_log(f'Student Model Parameters: {self.count_parameters()}')
                     
-                    # Load cross-modal aligner if enabled
                     if hasattr(self.arg, 'use_cross_aligner') and self.arg.use_cross_aligner:
                         self.cross_aligner = self.load_cross_aligner()
                     
-                    # Load data
                     if not self.load_data():
                         self.print_log(f"Failed to load data for subject {test_subject}")
                         continue
                     
-                    # Setup optimization and losses
                     self.load_optimizer()
                     self.load_loss()
                     
-                    # Reset early stopping
                     self.early_stop.reset()
                     
                     # Training loop
+                    best_epoch = 0
                     for epoch in range(self.arg.num_epoch):
                         if self.train(epoch):
                             break
+                        if self.val_loss_summary[-1] == self.best_loss:
+                            best_epoch = epoch + 1
+                    
+                    self.print_log(f'\nTraining completed. Best model saved at epoch {best_epoch} with val_loss={self.best_loss:.4f}')
                     
                     # Reload best model and evaluate
                     self.model = self.load_model()
                     self.load_weights()
                     
-                    self.print_log(f'\n=== Testing Subject {self.test_subject[0]} ===')
+                    self.print_log(f'\n=== Testing Subject {self.test_subject[0]} with Best Model ===')
                     self.eval(epoch=0, loader_name='test')
                     
-                    # Visualize loss curves
                     self.loss_viz(self.train_loss_summary, self.val_loss_summary)
                     
-                    # Store results
                     subject_result = {
                         'test_subject': str(self.test_subject[0]),
                         'accuracy': round(self.test_accuracy, 2),
@@ -445,11 +521,12 @@ class Distiller(Trainer):
                         'precision': round(self.test_precision, 2),
                         'recall': round(self.test_recall, 2),
                         'auc': round(self.test_auc, 2),
+                        'best_val_loss': round(self.best_loss, 4),
+                        'best_epoch': best_epoch,
                         'fold_time': round(time.time() - fold_start_time, 2)
                     }
                     results.append(subject_result)
                     
-                    # Save interim results
                     pd.DataFrame(results).to_csv(
                         os.path.join(self.arg.work_dir, 'interim_distillation_results.csv'), 
                         index=False
@@ -468,15 +545,12 @@ class Distiller(Trainer):
             if results:
                 df_results = pd.DataFrame(results)
                 
-                # Calculate statistics
                 stats = df_results.describe().round(2)
                 
-                # Add average row
                 avg_row = df_results.mean(numeric_only=True).round(2)
                 avg_row['test_subject'] = 'Average'
                 df_results = pd.concat([df_results, pd.DataFrame([avg_row])], ignore_index=True)
                 
-                # Save results
                 df_results.to_csv(os.path.join(self.arg.work_dir, 'distillation_results.csv'), index=False)
                 stats.to_csv(os.path.join(self.arg.work_dir, 'distillation_statistics.csv'))
                 
@@ -488,16 +562,12 @@ class Distiller(Trainer):
                 self.print_log(stats.to_string())
                 self.print_log("="*60)
                 
-                # Create overall visualization
                 self.create_overall_visualization(df_results)
-                
-                # Create summary report
                 self.create_summary_report(df_results, stats)
             else:
                 self.print_log("Warning: No results collected!")
         else:
             self.print_log(f"Phase {self.arg.phase} not implemented")
-
 
 def get_distill_args():
     parser = argparse.ArgumentParser(description='Knowledge Distillation')
@@ -548,39 +618,32 @@ def get_distill_args():
     parser.add_argument('--train-subjects-fixed', nargs='+', type=int)
     parser.add_argument('--val-subjects-fixed', nargs='+', type=int)
     parser.add_argument('--test-eligible-subjects', nargs='+', type=int)
+    parser.add_argument('--include-older-subjects', type=str2bool, default=True)
     
     return parser
-
 
 def main():
     parser = get_distill_args()
     args = parser.parse_args()
     
-    # Load config if provided
     if args.config and os.path.exists(args.config):
         with open(args.config, 'r') as f:
             config = yaml.safe_load(f)
-            # Update args with config values
             for k, v in config.items():
                 if not hasattr(args, k) or getattr(args, k) is None:
                     setattr(args, k, v)
     
-    # Set GPU
     os.environ['CUDA_VISIBLE_DEVICES'] = str(args.device[0])
     
-    # Configure TensorFlow
     if tf.config.list_physical_devices('GPU'):
         for gpu in tf.config.list_physical_devices('GPU'):
             tf.config.experimental.set_memory_growth(gpu, True)
     
-    # Set seeds
     np.random.seed(args.seed)
     tf.random.set_seed(args.seed)
     
-    # Run distillation
     distiller = Distiller(args)
     distiller.start()
-
 
 if __name__ == "__main__":
     main()

@@ -45,6 +45,7 @@ class Trainer:
         self.train_loss_summary = []
         self.val_loss_summary = []
         self.best_loss = float('inf')
+        self.best_epoch = 0
         self.test_accuracy = 0
         self.test_f1 = 0
         self.test_precision = 0
@@ -561,6 +562,7 @@ class Trainer:
         return False
     
     def eval(self, epoch, loader_name='val', result_file=None):
+        """Fixed evaluation with proper model saving based on lowest validation loss"""
         self.print_log(f'Evaluating {loader_name} at epoch {epoch+1}')
         loader = self.data_loader[loader_name]
         eval_loss = 0.0
@@ -602,19 +604,40 @@ class Trainer:
             self.print_log(f'  Recall: {recall:.2f}%')
             self.print_log(f'  AUC: {auc_score:.2f}%')
             self.print_log(f'  Batches: {steps}/{len(loader)}')
+            
+            # FIXED MODEL SAVING LOGIC - Save when validation loss is lowest
+            if loader_name == 'val':
+                # Check if this is the best (lowest) validation loss
+                if eval_loss < self.best_loss:
+                    self.print_log(f'🎯 NEW BEST VALIDATION LOSS: {eval_loss:.4f} < {self.best_loss:.4f}')
+                    self.best_loss = eval_loss
+                    self.best_epoch = epoch + 1
+                    # Save the model
+                    self.save_model()
+                    self.print_log(f'✅ Model saved at epoch {epoch+1} with best val_loss: {eval_loss:.4f}')
+                    # Also save metrics for best model
+                    best_metrics_file = os.path.join(self.arg.work_dir, f'best_model_metrics_s{self.test_subject[0]}.txt')
+                    with open(best_metrics_file, 'w') as f:
+                        f.write(f"Best Model Metrics (Epoch {epoch+1}):\n")
+                        f.write(f"Validation Loss: {eval_loss:.4f}\n")
+                        f.write(f"Accuracy: {accuracy:.2f}%\n")
+                        f.write(f"F1 Score: {f1:.2f}%\n")
+                        f.write(f"Precision: {precision:.2f}%\n")
+                        f.write(f"Recall: {recall:.2f}%\n")
+                        f.write(f"AUC: {auc_score:.2f}%\n")
+                else:
+                    self.print_log(f'📈 Val loss: {eval_loss:.4f} (best: {self.best_loss:.4f} at epoch {self.best_epoch}) - not saving')
         else:
             self.print_log(f"Warning: No valid {loader_name} batches!")
             return float('inf')
+        
         if result_file is not None:
             with open(result_file, 'w') as f:
                 f.write(f"Predictions for {loader_name} epoch {epoch+1}\n")
                 f.write("true,predicted,probability\n")
                 for true, pred, prob in zip(all_labels, all_preds, all_probs):
                     f.write(f'{true},{pred},{prob:.4f}\n')
-        if loader_name == 'val' and eval_loss < self.best_loss:
-            self.best_loss = eval_loss
-            self.save_model()
-            self.print_log(f'New best model saved with loss: {eval_loss:.4f}')
+        
         if loader_name == 'test':
             self.test_accuracy = accuracy
             self.test_f1 = f1
@@ -622,29 +645,41 @@ class Trainer:
             self.test_precision = precision
             self.test_auc = auc_score
             self.cm_viz(all_preds, all_labels)
+        
         return eval_loss
     
     def save_model(self):
         try:
             weight_path = f'{self.model_path}_{self.test_subject[0]}.weights.h5'
             self.model.save_weights(weight_path)
-            self.print_log(f"Model saved to: {weight_path}")
+            self.print_log(f"💾 Model weights saved to: {weight_path}")
             file_size = os.path.getsize(weight_path)
-            self.print_log(f"Saved model size: {file_size/1024/1024:.2f} MB")
+            self.print_log(f"   File size: {file_size/1024/1024:.2f} MB")
+            # Also save a marker file indicating this is the best model
+            best_marker = f'{self.model_path}_{self.test_subject[0]}_best_epoch.txt'
+            with open(best_marker, 'w') as f:
+                f.write(f"Best model saved at epoch {self.best_epoch} with val_loss {self.best_loss:.4f}\n")
         except Exception as e:
-            self.print_log(f"Error saving model: {e}")
+            self.print_log(f"❌ Error saving model: {e}")
+            raise
     
     def load_weights(self):
         weight_path = f'{self.model_path}_{self.test_subject[0]}.weights.h5'
         if os.path.exists(weight_path):
             try:
                 self.model.load_weights(weight_path)
-                self.print_log(f"Weights loaded from: {weight_path}")
+                self.print_log(f"✅ Best model weights loaded from: {weight_path}")
+                # Check if we have best epoch info
+                best_marker = f'{self.model_path}_{self.test_subject[0]}_best_epoch.txt'
+                if os.path.exists(best_marker):
+                    with open(best_marker, 'r') as f:
+                        info = f.read().strip()
+                        self.print_log(f"   {info}")
             except Exception as e:
                 self.print_log(f"Error loading weights: {e}")
                 raise
         else:
-            self.print_log(f"Warning: Weight file not found: {weight_path}")
+            self.print_log(f"⚠️ Warning: Weight file not found: {weight_path}")
     
     def loss_viz(self, train_loss, val_loss):
         if not train_loss or not val_loss:
@@ -655,6 +690,10 @@ class Trainer:
         plt.subplot(2, 1, 1)
         plt.plot(epochs, train_loss, 'b-', label='Training Loss', linewidth=2)
         plt.plot(epochs, val_loss, 'r-', label='Validation Loss', linewidth=2)
+        # Mark best epoch
+        if self.best_epoch > 0 and self.best_epoch <= len(val_loss):
+            plt.scatter(self.best_epoch, val_loss[self.best_epoch-1], color='green', s=100, zorder=5, 
+                       label=f'Best Val Loss (Epoch {self.best_epoch})')
         plt.title(f'Training vs Validation Loss - Subject {self.test_subject[0]}')
         plt.xlabel('Epochs')
         plt.ylabel('Loss')
@@ -722,7 +761,8 @@ class Trainer:
                 fold_start_time = time.time()
                 self.train_loss_summary = []
                 self.val_loss_summary = []
-                self.best_loss = float('inf')
+                self.best_loss = float('inf')  # Reset best loss for each fold
+                self.best_epoch = 0  # Reset best epoch for each fold
                 self.test_subject = [test_subject]
                 self.val_subject = self.fixed_val_subjects
                 remaining_eligible = [s for s in self.test_eligible_subjects if s != test_subject]
@@ -753,15 +793,32 @@ class Trainer:
                     self.load_optimizer()
                     self.load_loss()
                     self.early_stop.reset()
+                    # Training loop - track when best model was saved
                     for epoch in range(self.arg.num_epoch):
                         if self.train(epoch):
                             break
+                    # Log training summary
+                    self.print_log(f'\n🏁 Training completed for fold {fold_idx+1}')
+                    self.print_log(f'   Best model saved at epoch {self.best_epoch} with val_loss={self.best_loss:.4f}')
+                    self.print_log(f'   Total epochs trained: {len(self.train_loss_summary)}')
+                    # Reload best model for testing
                     self.model = self.load_model()
                     self.load_weights()
-                    self.print_log(f'\n=== Testing Subject {self.test_subject[0]} ===')
+                    self.print_log(f'\n=== Testing Subject {self.test_subject[0]} with Best Model ===')
                     self.eval(epoch=0, loader_name='test')
                     self.loss_viz(self.train_loss_summary, self.val_loss_summary)
-                    subject_result = {'test_subject': str(self.test_subject[0]), 'accuracy': round(self.test_accuracy, 2), 'f1_score': round(self.test_f1, 2), 'precision': round(self.test_precision, 2), 'recall': round(self.test_recall, 2), 'auc': round(self.test_auc, 2), 'fold_time': round(time.time() - fold_start_time, 2)}
+                    subject_result = {
+                        'test_subject': str(self.test_subject[0]), 
+                        'accuracy': round(self.test_accuracy, 2), 
+                        'f1_score': round(self.test_f1, 2), 
+                        'precision': round(self.test_precision, 2), 
+                        'recall': round(self.test_recall, 2), 
+                        'auc': round(self.test_auc, 2),
+                        'best_val_loss': round(self.best_loss, 4),
+                        'best_epoch': self.best_epoch,
+                        'total_epochs': len(self.train_loss_summary),
+                        'fold_time': round(time.time() - fold_start_time, 2)
+                    }
                     results.append(subject_result)
                     pd.DataFrame(results).to_csv(os.path.join(self.arg.work_dir, 'interim_results.csv'), index=False)
                     self.print_log(f'\nFold {fold_idx+1} completed in {subject_result["fold_time"]:.2f}s')
@@ -855,6 +912,16 @@ class Trainer:
                 f.write(f"  Worst: Subject {analysis_df.loc[worst_idx, 'test_subject']} ({analysis_df.loc[worst_idx, metric]:.2f}%)\n")
                 f.write(f"  Range: {analysis_df[metric].max() - analysis_df[metric].min():.2f}%\n")
                 f.write(f"  Std Dev: {analysis_df[metric].std():.2f}%\n")
+            f.write("\nMODEL SAVING ANALYSIS:\n")
+            f.write("-"*30 + "\n")
+            if 'best_epoch' in analysis_df.columns:
+                f.write(f"Average best epoch: {analysis_df['best_epoch'].mean():.1f}\n")
+                f.write(f"Earliest best epoch: {analysis_df['best_epoch'].min()}\n")
+                f.write(f"Latest best epoch: {analysis_df['best_epoch'].max()}\n")
+            if 'best_val_loss' in analysis_df.columns:
+                f.write(f"Average best val loss: {analysis_df['best_val_loss'].mean():.4f}\n")
+                f.write(f"Best val loss overall: {analysis_df['best_val_loss'].min():.4f}\n")
+                f.write(f"Worst best val loss: {analysis_df['best_val_loss'].max():.4f}\n")
             f.write("\nTIMING:\n")
             f.write("-"*30 + "\n")
             total_time = analysis_df['fold_time'].sum()
