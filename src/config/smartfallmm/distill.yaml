@@ -1,11 +1,29 @@
-# config/smartfallmm/distill.yaml
 model: models.transformer_optimized.TransModel
 teacher_model: models.mm_transformer.MMTransformer
 dataset: smartfallmm
-
-# Subjects for fall detection
 subjects: [32, 39, 30, 31, 33, 34, 35, 37, 43, 44, 45, 36, 29]
-
+train_subjects_fixed: [45, 36, 29]
+val_subjects_fixed: [38, 46]
+include_older_subjects: true
+temperature: 3.5
+alpha: 0.3
+beta: 0.4
+gamma: 0.3
+use_attention_transfer: true
+use_hint_learning: true
+use_cross_aligner: true
+use_progressive_distillation: true
+older_subject_sample_ratio: 0.3
+use_balanced_sampling: true
+batch_size: 32
+test_batch_size: 32
+val_batch_size: 32
+num_epoch: 100
+base_lr: 0.0005
+weight_decay: 0.0004
+class_weights:
+  0: 1.0
+  1: 3.0
 model_args:
   acc_frames: 128
   num_classes: 1
@@ -14,61 +32,38 @@ model_args:
   embed_dim: 32
   num_layers: 2
   dropout: 0.5
-  activation: 'relu'
+  activation: relu
   norm_first: true
-
 teacher_args:
-  mocap_frames: 128
   acc_frames: 128
+  mocap_frames: 128
   num_joints: 32
   in_chans: 3
-  num_patch: 4
-  acc_coords: 3
-  spatial_embed: 16
-  sdepth: 4
-  adepth: 4
+  spatial_embed: 32
   tdepth: 2
   num_heads: 2
-  mlp_ratio: 2
-  qkv_bias: true
+  mlp_ratio: 2.0
   drop_rate: 0.2
   attn_drop_rate: 0.2
   drop_path_rate: 0.2
   num_classes: 1
-
-# Distillation parameters
-temperature: 4.5
-alpha: 0.6
-
-dataset_args: 
-  mode: 'selective_window'  # Changed from sliding_window
+dataset_args:
+  mode: selective_window
   max_length: 128
-  task: 'fd'
-  modalities: ['accelerometer', 'skeleton']
-  age_group: ['young']
-  sensors: ['watch']
+  task: fd
+  modalities: [accelerometer, skeleton]
+  age_group: [young, old]
+  sensors: [watch]
   use_dtw: true
   verbose: true
-  # Peak detection parameters
   fall_height: 1.4
   fall_distance: 50
   non_fall_height: 1.2
   non_fall_distance: 100
-
 feeder: utils.dataset_tf.UTD_MM_TF
-batch_size: 16
-test_batch_size: 16
-val_batch_size: 16
-num_epoch: 80
 optimizer: adamw
-base_lr: 0.001
-weight_decay: 0.0004
+seed: 2
+print_log: true
+phase: distill
+teacher_weight: modelsKD_20250510_080932/models/teacher_model
 use_smv: false
-
-# Cross-validation configuration
-train_subjects_fixed: [45, 36, 29]
-val_subjects_fixed: [38, 46]
-test_eligible_subjects: [32, 39, 30, 31, 33, 34, 35, 37, 43, 44]
-
-# Path to teacher model weights
-teacher_weight: "../experiments/teacher_2025-05-09_18-06-45/models/teacher_model_20250509_180648"

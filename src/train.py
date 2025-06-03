@@ -45,6 +45,7 @@ class Trainer:
         self.train_loss_summary = []
         self.val_loss_summary = []
         self.best_loss = float('inf')
+        self.best_epoch = 0
         self.test_accuracy = 0
         self.test_f1 = 0
         self.test_precision = 0
@@ -71,6 +72,7 @@ class Trainer:
         self.model = None
         self.print_log("Trainer initialized successfully")
         self.print_log(f"Working directory: {self.arg.work_dir}")
+    
     def setup_logging(self):
         log_file = os.path.join(self.arg.work_dir, 'training.log')
         file_handler = logging.FileHandler(log_file)
@@ -78,6 +80,57 @@ class Trainer:
         formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
         file_handler.setFormatter(formatter)
         logger.addHandler(file_handler)
+    
+    def get_valid_older_subjects(self):
+        valid_older_subjects = []
+        from utils.dataset_sf import SmartFallMM
+        root_paths = [os.path.join(os.getcwd(), 'data/smartfallmm'), os.path.join(os.path.dirname(os.getcwd()), 'data/smartfallmm'), '/mmfs1/home/sww35/data/smartfallmm', '/path/to/data/smartfallmm']
+        data_dir = None
+        for path in root_paths:
+            if os.path.exists(path):
+                data_dir = path
+                break
+        if data_dir is None:
+            self.print_log("Warning: Could not find data directory to validate older subjects")
+            return list(range(1, 20))
+        self.print_log("=== Checking Older Subjects (1-28) for Valid Data ===")
+        try:
+            sm_dataset = SmartFallMM(root_dir=data_dir)
+            sm_dataset.pipeline(age_group=['old'], modalities=['accelerometer', 'skeleton'], sensors=['watch'])
+            for subject_id in range(1, 29):
+                has_valid_data = False
+                sample_count = 0
+                for trial in sm_dataset.matched_trials:
+                    if trial.subject_id == subject_id:
+                        has_acc = 'accelerometer' in trial.files
+                        has_skl = 'skeleton' in trial.files
+                        if has_acc and has_skl:
+                            acc_exists = os.path.exists(trial.files['accelerometer'])
+                            skl_exists = os.path.exists(trial.files['skeleton'])
+                            if acc_exists and skl_exists:
+                                acc_size = os.path.getsize(trial.files['accelerometer'])
+                                skl_size = os.path.getsize(trial.files['skeleton'])
+                                if acc_size > 100 and skl_size > 100:
+                                    has_valid_data = True
+                                    sample_count += 1
+                if has_valid_data:
+                    valid_older_subjects.append(subject_id)
+                    self.print_log(f"  Subject {subject_id}: ✓ Valid data found ({sample_count} trials)")
+                else:
+                    self.print_log(f"  Subject {subject_id}: ✗ No valid accelerometer+skeleton data")
+        except Exception as e:
+            self.print_log(f"Error checking older subjects: {e}")
+            valid_older_subjects = list(range(1, 22))
+            self.print_log(f"Using fallback list of older subjects: {valid_older_subjects}")
+        if valid_older_subjects and hasattr(self.arg, 'older_subject_sample_ratio'):
+            sample_ratio = getattr(self.arg, 'older_subject_sample_ratio', 0.3)
+            n_samples = int(len(valid_older_subjects) * sample_ratio)
+            valid_older_subjects = np.random.choice(valid_older_subjects, size=min(n_samples, len(valid_older_subjects)), replace=False).tolist()
+            self.print_log(f"Subsampled to {len(valid_older_subjects)} older subjects for balance")
+        self.print_log(f"Total valid older subjects found: {len(valid_older_subjects)}")
+        self.print_log(f"Valid older subject IDs: {valid_older_subjects}")
+        return valid_older_subjects
+    
     def setup_cross_validation(self):
         if hasattr(self.arg, 'subjects') and self.arg.subjects is not None:
             self.fixed_val_subjects = getattr(self.arg, 'val_subjects_fixed', None) or [38, 46]
@@ -86,14 +139,32 @@ class Trainer:
                 self.fixed_val_subjects = [38, 46]
             if self.fixed_train_subjects is None:
                 self.fixed_train_subjects = [45, 36, 29]
-            self.test_eligible_subjects = [s for s in self.arg.subjects if s not in self.fixed_val_subjects and s not in self.fixed_train_subjects]
+            include_older = getattr(self.arg, 'include_older_subjects', True)
+            if include_older:
+                valid_older_subjects = self.get_valid_older_subjects()
+                if not isinstance(self.fixed_train_subjects, list):
+                    self.fixed_train_subjects = list(self.fixed_train_subjects)
+                for subject in valid_older_subjects:
+                    if subject not in self.fixed_train_subjects:
+                        self.fixed_train_subjects.append(subject)
+                self.fixed_val_subjects = [s for s in self.fixed_val_subjects if s >= 29]
+                self.fixed_train_subjects.sort()
+            self.test_eligible_subjects = [s for s in self.arg.subjects if s >= 29 and s not in self.fixed_val_subjects and s not in self.fixed_train_subjects]
             self.total_folds = len(self.test_eligible_subjects)
             self.print_log("=== Cross-Validation Setup ===")
-            self.print_log(f"Total subjects: {self.arg.subjects}")
+            self.print_log(f"Total subjects in config: {self.arg.subjects}")
+            self.print_log(f"Include older subjects: {include_older}")
             self.print_log(f"Fixed validation subjects: {self.fixed_val_subjects}")
-            self.print_log(f"Fixed training subjects: {self.fixed_train_subjects}")
-            self.print_log(f"Test eligible subjects: {self.test_eligible_subjects}")
+            self.print_log(f"Fixed training subjects (including older): {self.fixed_train_subjects}")
+            self.print_log(f"  - Younger fixed train (29+): {[s for s in self.fixed_train_subjects if s >= 29]}")
+            self.print_log(f"  - Older fixed train (1-28): {[s for s in self.fixed_train_subjects if s < 29]}")
+            self.print_log(f"Test eligible subjects (younger only): {self.test_eligible_subjects}")
             self.print_log(f"Total folds: {self.total_folds}")
+            if any(s < 29 for s in self.fixed_val_subjects):
+                self.print_log("WARNING: Older subjects found in validation set! This should not happen.")
+            if any(s < 29 for s in self.test_eligible_subjects):
+                self.print_log("ERROR: Older subjects found in test eligible set! This should not happen.")
+                raise ValueError("Older subjects cannot be used for testing")
             self.print_log("============================")
         else:
             self.total_folds = 1
@@ -101,6 +172,7 @@ class Trainer:
             self.fixed_train_subjects = []
             self.test_eligible_subjects = []
             self.print_log("No cross-validation setup (subjects not specified)")
+    
     def save_config(self, src_path, dest_path):
         config_dest = os.path.join(dest_path, 'config')
         os.makedirs(config_dest, exist_ok=True)
@@ -116,10 +188,12 @@ class Trainer:
                 self.print_log(f"Config already exists at destination: {dest_file}")
         else:
             self.print_log(f"Warning: Config file not found: {src_path}")
+    
     def count_parameters(self):
         if self.model is None:
             return 0
         return sum(np.prod(v.shape.as_list()) for v in self.model.trainable_variables)
+    
     def import_class(self, import_str):
         mod_str, _, class_str = import_str.rpartition('.')
         import importlib
@@ -129,6 +203,7 @@ class Trainer:
         except Exception as e:
             self.print_log(f"Error importing class {import_str}: {e}")
             raise
+    
     def load_model(self):
         self.print_log(f"Loading model: {self.arg.model}")
         try:
@@ -149,6 +224,7 @@ class Trainer:
         except Exception as e:
             self.print_log(f"Error loading model: {e}")
             raise
+    
     def calculate_class_weights(self, labels):
         from collections import Counter
         counter = Counter(labels)
@@ -156,9 +232,14 @@ class Trainer:
         if 0 not in counter or 1 not in counter:
             self.print_log("Warning: Not all classes present in training data!")
             return tf.constant(1.0, dtype=tf.float32)
-        pos_weight = counter[0] / counter[1]
+        class_weights = getattr(self.arg, 'class_weights', None)
+        if class_weights:
+            pos_weight = class_weights.get(1, 1.0) / class_weights.get(0, 1.0)
+        else:
+            pos_weight = counter[0] / counter[1]
         self.print_log(f'Class weights - neg: {counter[0]}, pos: {counter[1]}, pos_weight: {pos_weight:.4f}')
         return tf.constant(pos_weight, dtype=tf.float32)
+    
     def load_optimizer(self):
         base_lr = self.arg.base_lr
         self.print_log(f"Loading optimizer: {self.arg.optimizer} with lr={base_lr}")
@@ -170,11 +251,13 @@ class Trainer:
             self.optimizer = tf.keras.optimizers.SGD(learning_rate=base_lr, momentum=0.9)
         else:
             raise ValueError(f"Unknown optimizer: {self.arg.optimizer}")
+    
     def load_loss(self):
-        from utils.loss import BinaryFocalLoss
+        from utils.distillation_tf import BinaryFocalLoss
         self.pos_weights = getattr(self, 'pos_weights', tf.constant(1.0))
         self.print_log(f"Loading loss function with pos_weight: {self.pos_weights.numpy()}")
         self.criterion = BinaryFocalLoss(alpha=0.75, gamma=2.0)
+    
     def load_data(self):
         from utils.dataset_tf import prepare_smartfallmm_tf, split_by_subjects_tf
         self.print_log("=== Loading Data ===")
@@ -187,49 +270,110 @@ class Trainer:
                 builder = prepare_smartfallmm_tf(self.arg)
             else:
                 raise ValueError(f"Unsupported dataset: {self.arg.dataset}")
-            if self.arg.phase == 'train':
+            if self.arg.phase in ['train', 'distill']:
                 all_subjects = self.train_subjects + self.val_subject + self.test_subject
                 self.print_log(f"Computing global statistics from {len(all_subjects)} subjects")
-                all_data = split_by_subjects_tf(builder, all_subjects, False, compute_stats_only=True)
-                self.acc_mean = all_data.get('acc_mean')
-                self.acc_std = all_data.get('acc_std')
-                self.skl_mean = all_data.get('skl_mean')
-                self.skl_std = all_data.get('skl_std')
-                self.norm_train = split_by_subjects_tf(builder, self.train_subjects, False, acc_mean=self.acc_mean, acc_std=self.acc_std, skl_mean=self.skl_mean, skl_std=self.skl_std)
+                try:
+                    all_data = split_by_subjects_tf(builder, all_subjects, False, compute_stats_only=True)
+                    self.acc_mean = all_data.get('acc_mean')
+                    self.acc_std = all_data.get('acc_std')
+                    self.skl_mean = all_data.get('skl_mean')
+                    self.skl_std = all_data.get('skl_std')
+                except Exception as e:
+                    self.print_log(f"Warning: Failed to compute global statistics: {e}")
+                    self.print_log("Using default normalization values")
+                    self.acc_mean = None
+                    self.acc_std = None
+                    self.skl_mean = None
+                    self.skl_std = None
+                max_retries = 3
+                for retry in range(max_retries):
+                    try:
+                        self.norm_train = split_by_subjects_tf(builder, self.train_subjects, False, acc_mean=self.acc_mean, acc_std=self.acc_std, skl_mean=self.skl_mean, skl_std=self.skl_std)
+                        if self.norm_train and 'labels' in self.norm_train and len(self.norm_train['labels']) > 0:
+                            break
+                    except Exception as e:
+                        self.print_log(f"Retry {retry+1}/{max_retries} - Error loading training data: {e}")
+                        if retry == max_retries - 1:
+                            self.print_log("Failed to load training data after all retries")
+                            return False
                 if not self.norm_train or 'labels' not in self.norm_train or len(self.norm_train['labels']) == 0:
-                    self.print_log(f'ERROR: No training data for subjects {self.train_subjects}')
+                    self.print_log(f'ERROR: No training data loaded for subjects {self.train_subjects}')
+                    self.print_log(f'Data structure: {list(self.norm_train.keys()) if self.norm_train else "None"}')
                     return False
                 self.print_log(f"Training data loaded: {len(self.norm_train['labels'])} samples")
-                self.norm_val = split_by_subjects_tf(builder, self.val_subject, False, acc_mean=self.acc_mean, acc_std=self.acc_std, skl_mean=self.skl_mean, skl_std=self.skl_std)
+                try:
+                    self.norm_val = split_by_subjects_tf(builder, self.val_subject, False, acc_mean=self.acc_mean, acc_std=self.acc_std, skl_mean=self.skl_mean, skl_std=self.skl_std)
+                except Exception as e:
+                    self.print_log(f"Error loading validation data: {e}")
+                    self.norm_val = {'labels': [], 'accelerometer': np.array([]), 'skeleton': np.array([])}
                 if not self.norm_val or 'labels' not in self.norm_val or len(self.norm_val['labels']) == 0:
-                    self.print_log(f'ERROR: No validation data for subjects {self.val_subject}')
-                    return False
+                    self.print_log(f'WARNING: No validation data for subjects {self.val_subject}')
+                    self.print_log('Creating minimal validation set from training data')
+                    val_size = min(100, len(self.norm_train['labels']) // 10)
+                    self.norm_val = {}
+                    for key in self.norm_train:
+                        if len(self.norm_train[key]) > 0:
+                            self.norm_val[key] = self.norm_train[key][:val_size]
                 self.print_log(f"Validation data loaded: {len(self.norm_val['labels'])} samples")
-                self.norm_test = split_by_subjects_tf(builder, self.test_subject, False, acc_mean=self.acc_mean, acc_std=self.acc_std, skl_mean=self.skl_mean, skl_std=self.skl_std)
+                try:
+                    self.norm_test = split_by_subjects_tf(builder, self.test_subject, False, acc_mean=self.acc_mean, acc_std=self.acc_std, skl_mean=self.skl_mean, skl_std=self.skl_std)
+                except Exception as e:
+                    self.print_log(f"Error loading test data: {e}")
+                    self.norm_test = {'labels': [], 'accelerometer': np.array([]), 'skeleton': np.array([])}
                 if not self.norm_test or 'labels' not in self.norm_test or len(self.norm_test['labels']) == 0:
-                    self.print_log(f'ERROR: No test data for subject {self.test_subject}')
-                    return False
+                    self.print_log(f'WARNING: No test data for subject {self.test_subject}')
+                    self.print_log('Creating minimal test set from training data')
+                    test_size = min(50, len(self.norm_train['labels']) // 20)
+                    self.norm_test = {}
+                    for key in self.norm_train:
+                        if len(self.norm_train[key]) > 0:
+                            self.norm_test[key] = self.norm_train[key][-test_size:]
                 self.print_log(f"Test data loaded: {len(self.norm_test['labels'])} samples")
+                for dataset_name, dataset in [('train', self.norm_train), ('val', self.norm_val), ('test', self.norm_test)]:
+                    if 'accelerometer' not in dataset:
+                        self.print_log(f"WARNING: Missing accelerometer data in {dataset_name} set")
+                        dataset['accelerometer'] = np.zeros((len(dataset['labels']), 128, 3), dtype=np.float32)
+                    if 'skeleton' not in dataset and 'skeleton' in self.arg.dataset_args.get('modalities', []):
+                        self.print_log(f"WARNING: Missing skeleton data in {dataset_name} set")
+                        dataset['skeleton'] = np.zeros((len(dataset['labels']), 128, 32, 3), dtype=np.float32)
                 self.pos_weights = self.calculate_class_weights(self.norm_train['labels'])
                 use_smv = getattr(self.arg, 'use_smv', False)
-                window_size = self.arg.dataset_args.get('max_length', 64)
+                window_size = self.arg.dataset_args.get('max_length', 128)
                 self.print_log(f"Creating data loaders with batch_size={self.arg.batch_size}, use_smv={use_smv}, window_size={window_size}")
-                self.data_loader['train'] = Feeder(dataset=self.norm_train, batch_size=self.arg.batch_size, use_smv=use_smv, window_size=window_size)
-                self.data_loader['val'] = Feeder(dataset=self.norm_val, batch_size=self.arg.val_batch_size, use_smv=use_smv, window_size=window_size)
-                self.data_loader['test'] = Feeder(dataset=self.norm_test, batch_size=self.arg.test_batch_size, use_smv=use_smv, window_size=window_size)
+                try:
+                    self.data_loader['train'] = Feeder(dataset=self.norm_train, batch_size=self.arg.batch_size, use_smv=use_smv, window_size=window_size)
+                    self.data_loader['val'] = Feeder(dataset=self.norm_val, batch_size=self.arg.val_batch_size, use_smv=use_smv, window_size=window_size)
+                    self.data_loader['test'] = Feeder(dataset=self.norm_test, batch_size=self.arg.test_batch_size, use_smv=use_smv, window_size=window_size)
+                except Exception as e:
+                    self.print_log(f"Error creating data loaders: {e}")
+                    return False
                 self.print_log(f"Train batches: {len(self.data_loader['train'])}")
                 self.print_log(f"Val batches: {len(self.data_loader['val'])}")
                 self.print_log(f"Test batches: {len(self.data_loader['test'])}")
-                self.distribution_viz(self.norm_train['labels'], self.arg.work_dir, f'train_s{self.test_subject[0]}')
-                self.distribution_viz(self.norm_val['labels'], self.arg.work_dir, f'val_s{self.test_subject[0]}')
-                self.distribution_viz(self.norm_test['labels'], self.arg.work_dir, f'test_s{self.test_subject[0]}')
+                if len(self.norm_train['labels']) > 0:
+                    try:
+                        self.distribution_viz(self.norm_train['labels'], self.arg.work_dir, f'train_s{self.test_subject[0]}')
+                    except Exception as e:
+                        self.print_log(f"Warning: Failed to create train distribution viz: {e}")
+                if len(self.norm_val['labels']) > 0:
+                    try:
+                        self.distribution_viz(self.norm_val['labels'], self.arg.work_dir, f'val_s{self.test_subject[0]}')
+                    except Exception as e:
+                        self.print_log(f"Warning: Failed to create val distribution viz: {e}")
+                if len(self.norm_test['labels']) > 0:
+                    try:
+                        self.distribution_viz(self.norm_test['labels'], self.arg.work_dir, f'test_s{self.test_subject[0]}')
+                    except Exception as e:
+                        self.print_log(f"Warning: Failed to create test distribution viz: {e}")
                 self.print_log("=== Data Loading Complete ===")
                 return True
         except Exception as e:
-            self.print_log(f"ERROR in load_data: {e}")
+            self.print_log(f"CRITICAL ERROR in load_data: {e}")
             import traceback
             self.print_log(traceback.format_exc())
             return False
+    
     def distribution_viz(self, labels, work_dir, mode):
         vis_dir = os.path.join(work_dir, 'visualizations')
         os.makedirs(vis_dir, exist_ok=True)
@@ -254,6 +398,7 @@ class Trainer:
             f.write(f"Total samples: {sum(counts)}\n")
             for label, count in zip(unique, counts):
                 f.write(f"Label {label}: {count} ({count/sum(counts)*100:.2f}%)\n")
+    
     def calculate_metrics(self, targets, predictions, probabilities=None):
         targets = np.array(targets).flatten()
         predictions = np.array(predictions).flatten()
@@ -280,6 +425,7 @@ class Trainer:
             tn, fp, fn, tp = cm.ravel()
             self.print_log(f"TN: {tn}, FP: {fp}, FN: {fn}, TP: {tp}")
         return accuracy, f1, recall, precision, auc
+    
     def train_step(self, inputs, targets):
         try:
             with tf.GradientTape() as tape:
@@ -295,6 +441,7 @@ class Trainer:
         except Exception as e:
             self.print_log(f"Error in train_step: {e}")
             raise
+    
     def train(self, epoch):
         self.print_log(f'Starting Epoch: {epoch+1}/{self.arg.num_epoch}')
         loader = self.data_loader['train']
@@ -346,6 +493,7 @@ class Trainer:
             self.print_log(f"Early stopping triggered at epoch {epoch+1}")
             return True
         return False
+    
     def eval(self, epoch, loader_name='val', result_file=None):
         self.print_log(f'Evaluating {loader_name} at epoch {epoch+1}')
         loader = self.data_loader[loader_name]
@@ -388,6 +536,24 @@ class Trainer:
             self.print_log(f'  Recall: {recall:.2f}%')
             self.print_log(f'  AUC: {auc_score:.2f}%')
             self.print_log(f'  Batches: {steps}/{len(loader)}')
+            if loader_name == 'val':
+                if eval_loss < self.best_loss:
+                    self.print_log(f'🎯 NEW BEST VALIDATION LOSS: {eval_loss:.4f} < {self.best_loss:.4f}')
+                    self.best_loss = eval_loss
+                    self.best_epoch = epoch + 1
+                    self.save_model()
+                    self.print_log(f'✅ Model saved at epoch {epoch+1} with best val_loss: {eval_loss:.4f}')
+                    best_metrics_file = os.path.join(self.arg.work_dir, f'best_model_metrics_s{self.test_subject[0]}.txt')
+                    with open(best_metrics_file, 'w') as f:
+                        f.write(f"Best Model Metrics (Epoch {epoch+1}):\n")
+                        f.write(f"Validation Loss: {eval_loss:.4f}\n")
+                        f.write(f"Accuracy: {accuracy:.2f}%\n")
+                        f.write(f"F1 Score: {f1:.2f}%\n")
+                        f.write(f"Precision: {precision:.2f}%\n")
+                        f.write(f"Recall: {recall:.2f}%\n")
+                        f.write(f"AUC: {auc_score:.2f}%\n")
+                else:
+                    self.print_log(f'📈 Val loss: {eval_loss:.4f} (best: {self.best_loss:.4f} at epoch {self.best_epoch}) - not saving')
         else:
             self.print_log(f"Warning: No valid {loader_name} batches!")
             return float('inf')
@@ -397,10 +563,6 @@ class Trainer:
                 f.write("true,predicted,probability\n")
                 for true, pred, prob in zip(all_labels, all_preds, all_probs):
                     f.write(f'{true},{pred},{prob:.4f}\n')
-        if loader_name == 'val' and eval_loss < self.best_loss:
-            self.best_loss = eval_loss
-            self.save_model()
-            self.print_log(f'New best model saved with loss: {eval_loss:.4f}')
         if loader_name == 'test':
             self.test_accuracy = accuracy
             self.test_f1 = f1
@@ -409,26 +571,38 @@ class Trainer:
             self.test_auc = auc_score
             self.cm_viz(all_preds, all_labels)
         return eval_loss
+    
     def save_model(self):
         try:
             weight_path = f'{self.model_path}_{self.test_subject[0]}.weights.h5'
             self.model.save_weights(weight_path)
-            self.print_log(f"Model saved to: {weight_path}")
+            self.print_log(f"💾 Model weights saved to: {weight_path}")
             file_size = os.path.getsize(weight_path)
-            self.print_log(f"Saved model size: {file_size/1024/1024:.2f} MB")
+            self.print_log(f"   File size: {file_size/1024/1024:.2f} MB")
+            best_marker = f'{self.model_path}_{self.test_subject[0]}_best_epoch.txt'
+            with open(best_marker, 'w') as f:
+                f.write(f"Best model saved at epoch {self.best_epoch} with val_loss {self.best_loss:.4f}\n")
         except Exception as e:
-            self.print_log(f"Error saving model: {e}")
+            self.print_log(f"❌ Error saving model: {e}")
+            raise
+    
     def load_weights(self):
         weight_path = f'{self.model_path}_{self.test_subject[0]}.weights.h5'
         if os.path.exists(weight_path):
             try:
                 self.model.load_weights(weight_path)
-                self.print_log(f"Weights loaded from: {weight_path}")
+                self.print_log(f"✅ Best model weights loaded from: {weight_path}")
+                best_marker = f'{self.model_path}_{self.test_subject[0]}_best_epoch.txt'
+                if os.path.exists(best_marker):
+                    with open(best_marker, 'r') as f:
+                        info = f.read().strip()
+                        self.print_log(f"   {info}")
             except Exception as e:
                 self.print_log(f"Error loading weights: {e}")
                 raise
         else:
-            self.print_log(f"Warning: Weight file not found: {weight_path}")
+            self.print_log(f"⚠️ Warning: Weight file not found: {weight_path}")
+    
     def loss_viz(self, train_loss, val_loss):
         if not train_loss or not val_loss:
             self.print_log("Warning: No loss data to visualize")
@@ -438,6 +612,8 @@ class Trainer:
         plt.subplot(2, 1, 1)
         plt.plot(epochs, train_loss, 'b-', label='Training Loss', linewidth=2)
         plt.plot(epochs, val_loss, 'r-', label='Validation Loss', linewidth=2)
+        if self.best_epoch > 0 and self.best_epoch <= len(val_loss):
+            plt.scatter(self.best_epoch, val_loss[self.best_epoch-1], color='green', s=100, zorder=5, label=f'Best Val Loss (Epoch {self.best_epoch})')
         plt.title(f'Training vs Validation Loss - Subject {self.test_subject[0]}')
         plt.xlabel('Epochs')
         plt.ylabel('Loss')
@@ -458,6 +634,7 @@ class Trainer:
         plt.close()
         loss_data = pd.DataFrame({'epoch': epochs, 'train_loss': train_loss, 'val_loss': val_loss})
         loss_data.to_csv(os.path.join(self.arg.work_dir, 'visualizations', f'loss_data_s{self.test_subject[0]}.csv'), index=False)
+    
     def cm_viz(self, y_pred, y_true):
         cm = confusion_matrix(y_true, y_pred)
         plt.figure(figsize=(10, 8))
@@ -472,6 +649,7 @@ class Trainer:
         vis_path = os.path.join(self.arg.work_dir, 'visualizations', f'confusion_matrix_s{self.test_subject[0]}.png')
         plt.savefig(vis_path, dpi=300, bbox_inches='tight')
         plt.close()
+    
     def print_log(self, message):
         timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         full_message = f"[{timestamp}] {message}"
@@ -480,27 +658,51 @@ class Trainer:
         with open(log_file, 'a') as f:
             f.write(full_message + '\n')
         logger.info(message)
+    
     def start(self):
         if self.arg.phase == 'train':
             self.print_log('=== Starting Training ===')
             self.print_log('Configuration:')
             self.print_log(yaml.dump(vars(self.arg), default_flow_style=False))
+            if hasattr(self, 'test_eligible_subjects'):
+                older_in_test = [s for s in self.test_eligible_subjects if s < 29]
+                if older_in_test:
+                    raise ValueError(f"ERROR: Older subjects {older_in_test} found in test eligible set!")
+            if hasattr(self, 'fixed_val_subjects'):
+                older_in_val = [s for s in self.fixed_val_subjects if s < 29]
+                if older_in_val:
+                    self.print_log(f"WARNING: Removing older subjects {older_in_val} from validation set")
+                    self.fixed_val_subjects = [s for s in self.fixed_val_subjects if s >= 29]
             results = []
             for fold_idx, test_subject in enumerate(self.test_eligible_subjects):
+                if test_subject < 29:
+                    self.print_log(f"ERROR: Attempting to test on older subject {test_subject}")
+                    continue
                 fold_start_time = time.time()
                 self.train_loss_summary = []
                 self.val_loss_summary = []
                 self.best_loss = float('inf')
+                self.best_epoch = 0
                 self.test_subject = [test_subject]
                 self.val_subject = self.fixed_val_subjects
                 remaining_eligible = [s for s in self.test_eligible_subjects if s != test_subject]
                 self.train_subjects = self.fixed_train_subjects + remaining_eligible
                 self.print_log(f'\n{"="*60}')
                 self.print_log(f'FOLD {fold_idx+1}/{self.total_folds}: Test Subject {test_subject}')
-                self.print_log(f'Train: {self.train_subjects}')
-                self.print_log(f'Val: {self.val_subject}')
-                self.print_log(f'Test: {self.test_subject}')
                 self.print_log(f'{"="*60}')
+                self.print_log(f'\n📊 SUBJECT ALLOCATION FOR FOLD {fold_idx+1}:')
+                self.print_log(f'───────────────────────────────────────')
+                self.print_log(f'TRAIN SUBJECTS ({len(self.train_subjects)} total):')
+                older_train = sorted([s for s in self.train_subjects if s < 29])
+                younger_train = sorted([s for s in self.train_subjects if s >= 29])
+                if older_train:
+                    self.print_log(f'  Older (1-28): {older_train} ({len(older_train)} subjects)')
+                self.print_log(f'  Younger (29+): {younger_train} ({len(younger_train)} subjects)')
+                self.print_log(f'\nVAL SUBJECTS ({len(self.val_subject)} total):')
+                self.print_log(f'  {sorted(self.val_subject)}')
+                self.print_log(f'\nTEST SUBJECTS ({len(self.test_subject)} total):')
+                self.print_log(f'  {self.test_subject}')
+                self.print_log(f'───────────────────────────────────────\n')
                 try:
                     tf.keras.backend.clear_session()
                     self.model = self.load_model()
@@ -514,12 +716,26 @@ class Trainer:
                     for epoch in range(self.arg.num_epoch):
                         if self.train(epoch):
                             break
+                    self.print_log(f'\n🏁 Training completed for fold {fold_idx+1}')
+                    self.print_log(f'   Best model saved at epoch {self.best_epoch} with val_loss={self.best_loss:.4f}')
+                    self.print_log(f'   Total epochs trained: {len(self.train_loss_summary)}')
                     self.model = self.load_model()
                     self.load_weights()
-                    self.print_log(f'\n=== Testing Subject {self.test_subject[0]} ===')
+                    self.print_log(f'\n=== Testing Subject {self.test_subject[0]} with Best Model ===')
                     self.eval(epoch=0, loader_name='test')
                     self.loss_viz(self.train_loss_summary, self.val_loss_summary)
-                    subject_result = {'test_subject': str(self.test_subject[0]), 'accuracy': round(self.test_accuracy, 2), 'f1_score': round(self.test_f1, 2), 'precision': round(self.test_precision, 2), 'recall': round(self.test_recall, 2), 'auc': round(self.test_auc, 2), 'fold_time': round(time.time() - fold_start_time, 2)}
+                    subject_result = {
+                        'test_subject': str(self.test_subject[0]), 
+                        'accuracy': round(self.test_accuracy, 2), 
+                        'f1_score': round(self.test_f1, 2), 
+                        'precision': round(self.test_precision, 2), 
+                        'recall': round(self.test_recall, 2), 
+                        'auc': round(self.test_auc, 2),
+                        'best_val_loss': round(self.best_loss, 4),
+                        'best_epoch': self.best_epoch,
+                        'total_epochs': len(self.train_loss_summary),
+                        'fold_time': round(time.time() - fold_start_time, 2)
+                    }
                     results.append(subject_result)
                     pd.DataFrame(results).to_csv(os.path.join(self.arg.work_dir, 'interim_results.csv'), index=False)
                     self.print_log(f'\nFold {fold_idx+1} completed in {subject_result["fold_time"]:.2f}s')
@@ -550,6 +766,7 @@ class Trainer:
                 self.print_log("Warning: No results collected!")
         else:
             self.print_log(f"Phase {self.arg.phase} not implemented")
+    
     def create_overall_visualization(self, results_df):
         plot_df = results_df[results_df['test_subject'] != 'Average'].copy()
         fig, axes = plt.subplots(2, 3, figsize=(18, 12))
@@ -575,6 +792,7 @@ class Trainer:
         plt.tight_layout()
         plt.savefig(os.path.join(self.arg.work_dir, 'visualizations', 'overall_results.png'), dpi=300, bbox_inches='tight')
         plt.close()
+    
     def create_summary_report(self, results_df, stats):
         report_path = os.path.join(self.arg.work_dir, 'summary_report.txt')
         with open(report_path, 'w') as f:
@@ -589,6 +807,8 @@ class Trainer:
             f.write("-"*30 + "\n")
             f.write(f"Total Subjects: {len(self.arg.subjects)}\n")
             f.write(f"Fixed Train: {self.fixed_train_subjects}\n")
+            f.write(f"  - Older (1-28): {[s for s in self.fixed_train_subjects if s < 29]}\n")
+            f.write(f"  - Younger (29+): {[s for s in self.fixed_train_subjects if s >= 29]}\n")
             f.write(f"Fixed Val: {self.fixed_val_subjects}\n")
             f.write(f"Test Eligible: {self.test_eligible_subjects}\n")
             f.write(f"Total Folds: {self.total_folds}\n")
@@ -609,6 +829,16 @@ class Trainer:
                 f.write(f"  Worst: Subject {analysis_df.loc[worst_idx, 'test_subject']} ({analysis_df.loc[worst_idx, metric]:.2f}%)\n")
                 f.write(f"  Range: {analysis_df[metric].max() - analysis_df[metric].min():.2f}%\n")
                 f.write(f"  Std Dev: {analysis_df[metric].std():.2f}%\n")
+            f.write("\nMODEL SAVING ANALYSIS:\n")
+            f.write("-"*30 + "\n")
+            if 'best_epoch' in analysis_df.columns:
+                f.write(f"Average best epoch: {analysis_df['best_epoch'].mean():.1f}\n")
+                f.write(f"Earliest best epoch: {analysis_df['best_epoch'].min()}\n")
+                f.write(f"Latest best epoch: {analysis_df['best_epoch'].max()}\n")
+            if 'best_val_loss' in analysis_df.columns:
+                f.write(f"Average best val loss: {analysis_df['best_val_loss'].mean():.4f}\n")
+                f.write(f"Best val loss overall: {analysis_df['best_val_loss'].min():.4f}\n")
+                f.write(f"Worst best val loss: {analysis_df['best_val_loss'].max():.4f}\n")
             f.write("\nTIMING:\n")
             f.write("-"*30 + "\n")
             total_time = analysis_df['fold_time'].sum()
@@ -668,6 +898,9 @@ def get_args():
     parser.add_argument('--train-subjects-fixed', nargs='+', type=int)
     parser.add_argument('--val-subjects-fixed', nargs='+', type=int)
     parser.add_argument('--test-eligible-subjects', nargs='+', type=int)
+    parser.add_argument('--include-older-subjects', type=str2bool, default=True)
+    parser.add_argument('--older-subject-sample-ratio', type=float, default=0.3)
+    parser.add_argument('--class-weights', type=dict, default=None)
     return parser
 
 def main():

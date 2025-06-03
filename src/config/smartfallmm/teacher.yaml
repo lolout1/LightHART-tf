@@ -1,10 +1,24 @@
 # config/smartfallmm/teacher.yaml
 model: models.mm_transformer.MMTransformer
 dataset: smartfallmm
-subjects: [32, 39, 30, 31, 33, 34, 35, 37, 43, 44, 45, 36, 29]
+
+# Subjects configuration
+# Note: Subjects 1-28 (older participants with ADL data only) will be automatically 
+# added to fixed training set if they have valid accelerometer+skeleton data
+subjects: [32, 39, 30, 31, 33, 34, 35, 37, 43, 44, 45, 36, 29]  # Younger subjects only
+
+# Cross-validation setup
+# Older subjects (1-28) will be automatically added to train_subjects_fixed
+train_subjects_fixed: [45, 36, 29]  # Fixed younger subjects for training
+val_subjects_fixed: [38, 46]        # Validation subjects (younger only)
+# Test eligible: remaining younger subjects not in fixed sets
+
+# Whether to include older subjects (1-28) in training
+include_older_subjects: true  # Set to false to use only younger subjects
+
 model_args:
-  acc_frames: 64
-  mocap_frames: 64
+  acc_frames: 128
+  mocap_frames: 128
   num_joints: 32
   in_chans: 3
   spatial_embed: 32
@@ -15,12 +29,13 @@ model_args:
   attn_drop_rate: 0.2
   drop_path_rate: 0.2
   num_classes: 1
+
 dataset_args:
   mode: 'selective_window'
-  max_length: 64
+  max_length: 128
   task: 'fd'
   modalities: ['skeleton', 'accelerometer']
-  age_group: ['young']
+  age_group: ['young', 'old']  # Include both age groups for training
   sensors: ['watch']
   use_dtw: true
   verbose: true
@@ -28,6 +43,7 @@ dataset_args:
   fall_distance: 50
   non_fall_height: 1.2
   non_fall_distance: 100
+
 batch_size: 16
 test_batch_size: 16
 val_batch_size: 16
@@ -37,7 +53,3 @@ optimizer: adamw
 base_lr: 0.0001
 weight_decay: 0.0004
 seed: 2
-train_subjects_fixed: [45, 36, 29]
-val_subjects_fixed: [38, 46]
-test_eligible_subjects: [32, 39, 30, 31, 33, 34, 35, 37, 43, 44]
-
