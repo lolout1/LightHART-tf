@@ -1,24 +1,42 @@
-# config/smartfallmm/teacher.yaml
-model: models.mm_transformer.MMTransformer
+model: models.transformer_optimized.TransModel
+teacher_model: models.mm_transformer.MMTransformer
 dataset: smartfallmm
-
-# Subjects configuration
-# Note: Subjects 1-28 (older participants with ADL data only) will be automatically 
-# added to fixed training set if they have valid accelerometer+skeleton data
-subjects: [32, 39, 30, 31, 33, 34, 35, 37, 43, 44, 45, 36, 29]  # Younger subjects only
-
-# Cross-validation setup
-# Older subjects (1-28) will be automatically added to train_subjects_fixed
-train_subjects_fixed: [45, 36, 29]  # Fixed younger subjects for training
-val_subjects_fixed: [38, 46]        # Validation subjects (younger only)
-# Test eligible: remaining younger subjects not in fixed sets
-
-# Whether to include older subjects (1-28) in training
-include_older_subjects: true  # Set to false to use only younger subjects
-
+subjects: [32, 39, 30, 31, 33, 34, 35, 37, 43, 44, 45, 36, 29]
+train_subjects_fixed: [45, 36, 29]
+val_subjects_fixed: [38, 46]
+include_older_subjects: true
+temperature: 3.5
+alpha: 0.3
+beta: 0.4
+gamma: 0.3
+use_attention_transfer: true
+use_hint_learning: true
+use_cross_aligner: true
+use_progressive_distillation: true
+older_subject_sample_ratio: 0.3
+use_balanced_sampling: true
+batch_size: 32
+test_batch_size: 32
+val_batch_size: 32
+num_epoch: 100
+base_lr: 0.0005
+weight_decay: 0.0004
+class_weights:
+  0: 1.0
+  1: 3.0
 model_args:
-  acc_frames: 64
-  mocap_frames: 64
+  acc_frames: 128
+  num_classes: 1
+  num_heads: 4
+  acc_coords: 3
+  embed_dim: 32
+  num_layers: 2
+  dropout: 0.5
+  activation: relu
+  norm_first: true
+teacher_args:
+  acc_frames: 128
+  mocap_frames: 128
   num_joints: 32
   in_chans: 3
   spatial_embed: 32
@@ -29,27 +47,23 @@ model_args:
   attn_drop_rate: 0.2
   drop_path_rate: 0.2
   num_classes: 1
-
 dataset_args:
-  mode: 'selective_window'
-  max_length: 64
-  task: 'fd'
-  modalities: ['skeleton', 'accelerometer']
-  age_group: ['young', 'old']  # Include both age groups for training
-  sensors: ['watch']
+  mode: selective_window
+  max_length: 128
+  task: fd
+  modalities: [accelerometer, skeleton]
+  age_group: [young, old]
+  sensors: [watch]
   use_dtw: true
   verbose: true
   fall_height: 1.4
   fall_distance: 50
   non_fall_height: 1.2
   non_fall_distance: 100
-
-batch_size: 16
-test_batch_size: 16
-val_batch_size: 16
-num_epoch: 80
 feeder: utils.dataset_tf.UTD_MM_TF
 optimizer: adamw
-base_lr: 0.0001
-weight_decay: 0.0004
 seed: 2
+print_log: true
+phase: distill
+teacher_weight: modelsKD_20250510_080932/models/teacher_model
+use_smv: false

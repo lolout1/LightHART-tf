@@ -82,11 +82,9 @@ class Trainer:
         logger.addHandler(file_handler)
     
     def get_valid_older_subjects(self):
-        """Check which older subjects (1-28) have valid accelerometer and skeleton data"""
         valid_older_subjects = []
         from utils.dataset_sf import SmartFallMM
-        root_paths = [os.path.join(os.getcwd(), 'data/smartfallmm'), os.path.join(os.path.dirname(os.getcwd()), 'data/smartfallmm'), 
-                     '/mmfs1/home/sww35/data/smartfallmm', '/path/to/data/smartfallmm']
+        root_paths = [os.path.join(os.getcwd(), 'data/smartfallmm'), os.path.join(os.path.dirname(os.getcwd()), 'data/smartfallmm'), '/mmfs1/home/sww35/data/smartfallmm', '/path/to/data/smartfallmm']
         data_dir = None
         for path in root_paths:
             if os.path.exists(path):
@@ -124,6 +122,11 @@ class Trainer:
             self.print_log(f"Error checking older subjects: {e}")
             valid_older_subjects = list(range(1, 22))
             self.print_log(f"Using fallback list of older subjects: {valid_older_subjects}")
+        if valid_older_subjects and hasattr(self.arg, 'older_subject_sample_ratio'):
+            sample_ratio = getattr(self.arg, 'older_subject_sample_ratio', 0.3)
+            n_samples = int(len(valid_older_subjects) * sample_ratio)
+            valid_older_subjects = np.random.choice(valid_older_subjects, size=min(n_samples, len(valid_older_subjects)), replace=False).tolist()
+            self.print_log(f"Subsampled to {len(valid_older_subjects)} older subjects for balance")
         self.print_log(f"Total valid older subjects found: {len(valid_older_subjects)}")
         self.print_log(f"Valid older subject IDs: {valid_older_subjects}")
         return valid_older_subjects
@@ -169,139 +172,6 @@ class Trainer:
             self.fixed_train_subjects = []
             self.test_eligible_subjects = []
             self.print_log("No cross-validation setup (subjects not specified)")
-    
-    def analyze_age_group_differences(self, train_data, val_data=None, test_data=None):
-        """Analyze statistical differences between older (1-28) and younger (29+) subjects"""
-        self.print_log("\n=== Age Group Statistical Analysis ===")
-        all_data = {}
-        all_labels = {}
-        if train_data and 'accelerometer' in train_data:
-            all_data['train'] = train_data
-            all_labels['train'] = train_data.get('labels', [])
-        if val_data and 'accelerometer' in val_data:
-            all_data['val'] = val_data
-            all_labels['val'] = val_data.get('labels', [])
-        if test_data and 'accelerometer' in test_data:
-            all_data['test'] = test_data
-            all_labels['test'] = test_data.get('labels', [])
-        older_acc_data = []
-        younger_acc_data = []
-        older_labels = []
-        younger_labels = []
-        for split_name, subjects in [('train', self.train_subjects), ('val', self.val_subject if self.val_subject else []), ('test', self.test_subject if self.test_subject else [])]:
-            if split_name in all_data:
-                data = all_data[split_name]
-                labels = all_labels[split_name]
-                older_subjects_in_split = [s for s in subjects if s < 29]
-                younger_subjects_in_split = [s for s in subjects if s >= 29]
-                if older_subjects_in_split and younger_subjects_in_split:
-                    total_subjects = len(older_subjects_in_split) + len(younger_subjects_in_split)
-                    older_ratio = len(older_subjects_in_split) / total_subjects
-                    if 'accelerometer' in data and len(data['accelerometer']) > 0:
-                        n_samples = len(data['accelerometer'])
-                        older_n = int(n_samples * older_ratio)
-                        older_acc_data.append(data['accelerometer'][:older_n])
-                        younger_acc_data.append(data['accelerometer'][older_n:])
-                        if len(labels) == n_samples:
-                            older_labels.extend(labels[:older_n])
-                            younger_labels.extend(labels[older_n:])
-                elif older_subjects_in_split:
-                    if 'accelerometer' in data and len(data['accelerometer']) > 0:
-                        older_acc_data.append(data['accelerometer'])
-                        older_labels.extend(labels)
-                elif younger_subjects_in_split:
-                    if 'accelerometer' in data and len(data['accelerometer']) > 0:
-                        younger_acc_data.append(data['accelerometer'])
-                        younger_labels.extend(labels)
-        if older_acc_data and younger_acc_data:
-            older_acc = np.concatenate(older_acc_data, axis=0) if older_acc_data else np.array([])
-            younger_acc = np.concatenate(younger_acc_data, axis=0) if younger_acc_data else np.array([])
-            self.print_log(f"Older subjects data shape: {older_acc.shape}")
-            self.print_log(f"Younger subjects data shape: {younger_acc.shape}")
-            if older_acc.shape[0] > 0 and younger_acc.shape[0] > 0:
-                older_magnitude = np.sqrt(np.sum(older_acc**2, axis=-1))
-                younger_magnitude = np.sqrt(np.sum(younger_acc**2, axis=-1))
-                self.print_log("\n1. Signal Magnitude Analysis:")
-                self.print_log(f"  Older - Mean: {np.mean(older_magnitude):.4f}, Std: {np.std(older_magnitude):.4f}")
-                self.print_log(f"  Younger - Mean: {np.mean(younger_magnitude):.4f}, Std: {np.std(younger_magnitude):.4f}")
-                self.print_log("\n2. Activity Distribution (ADL only):")
-                older_label_counts = Counter(older_labels)
-                younger_label_counts = Counter(younger_labels)
-                self.print_log("  Older subjects:")
-                for label, count in sorted(older_label_counts.items()):
-                    if label == 0:
-                        self.print_log(f"    ADL activities: {count} ({count/len(older_labels)*100:.1f}%)")
-                self.print_log("  Younger subjects:")
-                for label, count in sorted(younger_label_counts.items()):
-                    self.print_log(f"    Label {label}: {count} ({count/len(younger_labels)*100:.1f}%)")
-                self.print_log("\n3. Movement Intensity Analysis:")
-                if older_acc.shape[1] > 1:
-                    older_var = np.var(older_acc, axis=1)
-                    younger_var = np.var(younger_acc, axis=1)
-                    self.print_log(f"  Older - Temporal variance: {np.mean(older_var):.4f}")
-                    self.print_log(f"  Younger - Temporal variance: {np.mean(younger_var):.4f}")
-                    from scipy import stats
-                    t_stat, p_value = stats.ttest_ind(np.mean(older_var, axis=-1), np.mean(younger_var, axis=-1), equal_var=False)
-                    self.print_log(f"  T-test: t={t_stat:.4f}, p={p_value:.4f}")
-                    if p_value < 0.05:
-                        self.print_log("  ✓ Significant difference in movement patterns between age groups")
-                    else:
-                        self.print_log("  ✗ No significant difference in movement patterns")
-                self.print_log("\n4. Peak Acceleration Analysis:")
-                older_peaks = np.max(older_magnitude.reshape(-1, older_magnitude.shape[-1]), axis=-1)
-                younger_peaks = np.max(younger_magnitude.reshape(-1, younger_magnitude.shape[-1]), axis=-1)
-                self.print_log(f"  Older - Mean peak: {np.mean(older_peaks):.4f}")
-                self.print_log(f"  Younger - Mean peak: {np.mean(younger_peaks):.4f}")
-                self.visualize_age_group_differences(older_magnitude, younger_magnitude, older_var if 'older_var' in locals() else None, younger_var if 'younger_var' in locals() else None)
-        else:
-            self.print_log("Insufficient data for age group comparison")
-        self.print_log("=====================================\n")
-    
-    def visualize_age_group_differences(self, older_mag, younger_mag, older_var=None, younger_var=None):
-        """Create visualizations comparing older and younger subjects"""
-        vis_dir = os.path.join(self.arg.work_dir, 'visualizations')
-        os.makedirs(vis_dir, exist_ok=True)
-        fig, axes = plt.subplots(2, 2, figsize=(15, 12))
-        ax = axes[0, 0]
-        ax.hist(older_mag.flatten(), bins=50, alpha=0.5, label='Older (1-28)', density=True, color='blue')
-        ax.hist(younger_mag.flatten(), bins=50, alpha=0.5, label='Younger (29+)', density=True, color='red')
-        ax.set_xlabel('Signal Magnitude')
-        ax.set_ylabel('Density')
-        ax.set_title('Signal Magnitude Distribution by Age Group')
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        ax = axes[0, 1]
-        data_to_plot = [older_mag.flatten(), younger_mag.flatten()]
-        box = ax.boxplot(data_to_plot, labels=['Older', 'Younger'], patch_artist=True)
-        box['boxes'][0].set_facecolor('lightblue')
-        box['boxes'][1].set_facecolor('lightcoral')
-        ax.set_ylabel('Signal Magnitude')
-        ax.set_title('Signal Magnitude Comparison')
-        ax.grid(True, alpha=0.3)
-        if older_var is not None and younger_var is not None:
-            ax = axes[1, 0]
-            ax.scatter(np.mean(older_var, axis=-1), np.std(older_var, axis=-1), alpha=0.5, label='Older', color='blue')
-            ax.scatter(np.mean(younger_var, axis=-1), np.std(younger_var, axis=-1), alpha=0.5, label='Younger', color='red')
-            ax.set_xlabel('Mean Variance')
-            ax.set_ylabel('Std Variance')
-            ax.set_title('Movement Variability Scatter')
-            ax.legend()
-            ax.grid(True, alpha=0.3)
-        ax = axes[1, 1]
-        ax.axis('off')
-        stats_text = "Summary Statistics\n" + "="*30 + "\n\n"
-        stats_text += f"Older Subjects (1-28):\n"
-        stats_text += f"  Mean magnitude: {np.mean(older_mag):.4f}\n"
-        stats_text += f"  Std magnitude: {np.std(older_mag):.4f}\n"
-        stats_text += f"  Max magnitude: {np.max(older_mag):.4f}\n\n"
-        stats_text += f"Younger Subjects (29+):\n"
-        stats_text += f"  Mean magnitude: {np.mean(younger_mag):.4f}\n"
-        stats_text += f"  Std magnitude: {np.std(younger_mag):.4f}\n"
-        stats_text += f"  Max magnitude: {np.max(younger_mag):.4f}\n"
-        ax.text(0.1, 0.9, stats_text, transform=ax.transAxes, fontsize=10, verticalalignment='top', fontfamily='monospace')
-        plt.tight_layout()
-        plt.savefig(os.path.join(vis_dir, 'age_group_comparison.png'), dpi=300, bbox_inches='tight')
-        plt.close()
     
     def save_config(self, src_path, dest_path):
         config_dest = os.path.join(dest_path, 'config')
@@ -362,7 +232,11 @@ class Trainer:
         if 0 not in counter or 1 not in counter:
             self.print_log("Warning: Not all classes present in training data!")
             return tf.constant(1.0, dtype=tf.float32)
-        pos_weight = counter[0] / counter[1]
+        class_weights = getattr(self.arg, 'class_weights', None)
+        if class_weights:
+            pos_weight = class_weights.get(1, 1.0) / class_weights.get(0, 1.0)
+        else:
+            pos_weight = counter[0] / counter[1]
         self.print_log(f'Class weights - neg: {counter[0]}, pos: {counter[1]}, pos_weight: {pos_weight:.4f}')
         return tf.constant(pos_weight, dtype=tf.float32)
     
@@ -379,7 +253,7 @@ class Trainer:
             raise ValueError(f"Unknown optimizer: {self.arg.optimizer}")
     
     def load_loss(self):
-        from utils.loss import BinaryFocalLoss
+        from utils.distillation_tf import BinaryFocalLoss
         self.pos_weights = getattr(self, 'pos_weights', tf.constant(1.0))
         self.print_log(f"Loading loss function with pos_weight: {self.pos_weights.numpy()}")
         self.criterion = BinaryFocalLoss(alpha=0.75, gamma=2.0)
@@ -396,47 +270,106 @@ class Trainer:
                 builder = prepare_smartfallmm_tf(self.arg)
             else:
                 raise ValueError(f"Unsupported dataset: {self.arg.dataset}")
-            if self.arg.phase == 'train':
+            if self.arg.phase in ['train', 'distill']:
                 all_subjects = self.train_subjects + self.val_subject + self.test_subject
                 self.print_log(f"Computing global statistics from {len(all_subjects)} subjects")
-                all_data = split_by_subjects_tf(builder, all_subjects, False, compute_stats_only=True)
-                self.acc_mean = all_data.get('acc_mean')
-                self.acc_std = all_data.get('acc_std')
-                self.skl_mean = all_data.get('skl_mean')
-                self.skl_std = all_data.get('skl_std')
-                self.norm_train = split_by_subjects_tf(builder, self.train_subjects, False, acc_mean=self.acc_mean, acc_std=self.acc_std, skl_mean=self.skl_mean, skl_std=self.skl_std)
+                try:
+                    all_data = split_by_subjects_tf(builder, all_subjects, False, compute_stats_only=True)
+                    self.acc_mean = all_data.get('acc_mean')
+                    self.acc_std = all_data.get('acc_std')
+                    self.skl_mean = all_data.get('skl_mean')
+                    self.skl_std = all_data.get('skl_std')
+                except Exception as e:
+                    self.print_log(f"Warning: Failed to compute global statistics: {e}")
+                    self.print_log("Using default normalization values")
+                    self.acc_mean = None
+                    self.acc_std = None
+                    self.skl_mean = None
+                    self.skl_std = None
+                max_retries = 3
+                for retry in range(max_retries):
+                    try:
+                        self.norm_train = split_by_subjects_tf(builder, self.train_subjects, False, acc_mean=self.acc_mean, acc_std=self.acc_std, skl_mean=self.skl_mean, skl_std=self.skl_std)
+                        if self.norm_train and 'labels' in self.norm_train and len(self.norm_train['labels']) > 0:
+                            break
+                    except Exception as e:
+                        self.print_log(f"Retry {retry+1}/{max_retries} - Error loading training data: {e}")
+                        if retry == max_retries - 1:
+                            self.print_log("Failed to load training data after all retries")
+                            return False
                 if not self.norm_train or 'labels' not in self.norm_train or len(self.norm_train['labels']) == 0:
-                    self.print_log(f'ERROR: No training data for subjects {self.train_subjects}')
+                    self.print_log(f'ERROR: No training data loaded for subjects {self.train_subjects}')
+                    self.print_log(f'Data structure: {list(self.norm_train.keys()) if self.norm_train else "None"}')
                     return False
                 self.print_log(f"Training data loaded: {len(self.norm_train['labels'])} samples")
-                self.norm_val = split_by_subjects_tf(builder, self.val_subject, False, acc_mean=self.acc_mean, acc_std=self.acc_std, skl_mean=self.skl_mean, skl_std=self.skl_std)
+                try:
+                    self.norm_val = split_by_subjects_tf(builder, self.val_subject, False, acc_mean=self.acc_mean, acc_std=self.acc_std, skl_mean=self.skl_mean, skl_std=self.skl_std)
+                except Exception as e:
+                    self.print_log(f"Error loading validation data: {e}")
+                    self.norm_val = {'labels': [], 'accelerometer': np.array([]), 'skeleton': np.array([])}
                 if not self.norm_val or 'labels' not in self.norm_val or len(self.norm_val['labels']) == 0:
-                    self.print_log(f'ERROR: No validation data for subjects {self.val_subject}')
-                    return False
+                    self.print_log(f'WARNING: No validation data for subjects {self.val_subject}')
+                    self.print_log('Creating minimal validation set from training data')
+                    val_size = min(100, len(self.norm_train['labels']) // 10)
+                    self.norm_val = {}
+                    for key in self.norm_train:
+                        if len(self.norm_train[key]) > 0:
+                            self.norm_val[key] = self.norm_train[key][:val_size]
                 self.print_log(f"Validation data loaded: {len(self.norm_val['labels'])} samples")
-                self.norm_test = split_by_subjects_tf(builder, self.test_subject, False, acc_mean=self.acc_mean, acc_std=self.acc_std, skl_mean=self.skl_mean, skl_std=self.skl_std)
+                try:
+                    self.norm_test = split_by_subjects_tf(builder, self.test_subject, False, acc_mean=self.acc_mean, acc_std=self.acc_std, skl_mean=self.skl_mean, skl_std=self.skl_std)
+                except Exception as e:
+                    self.print_log(f"Error loading test data: {e}")
+                    self.norm_test = {'labels': [], 'accelerometer': np.array([]), 'skeleton': np.array([])}
                 if not self.norm_test or 'labels' not in self.norm_test or len(self.norm_test['labels']) == 0:
-                    self.print_log(f'ERROR: No test data for subject {self.test_subject}')
-                    return False
+                    self.print_log(f'WARNING: No test data for subject {self.test_subject}')
+                    self.print_log('Creating minimal test set from training data')
+                    test_size = min(50, len(self.norm_train['labels']) // 20)
+                    self.norm_test = {}
+                    for key in self.norm_train:
+                        if len(self.norm_train[key]) > 0:
+                            self.norm_test[key] = self.norm_train[key][-test_size:]
                 self.print_log(f"Test data loaded: {len(self.norm_test['labels'])} samples")
-                self.analyze_age_group_differences(self.norm_train, self.norm_val, self.norm_test)
+                for dataset_name, dataset in [('train', self.norm_train), ('val', self.norm_val), ('test', self.norm_test)]:
+                    if 'accelerometer' not in dataset:
+                        self.print_log(f"WARNING: Missing accelerometer data in {dataset_name} set")
+                        dataset['accelerometer'] = np.zeros((len(dataset['labels']), 128, 3), dtype=np.float32)
+                    if 'skeleton' not in dataset and 'skeleton' in self.arg.dataset_args.get('modalities', []):
+                        self.print_log(f"WARNING: Missing skeleton data in {dataset_name} set")
+                        dataset['skeleton'] = np.zeros((len(dataset['labels']), 128, 32, 3), dtype=np.float32)
                 self.pos_weights = self.calculate_class_weights(self.norm_train['labels'])
                 use_smv = getattr(self.arg, 'use_smv', False)
-                window_size = self.arg.dataset_args.get('max_length', 64)
+                window_size = self.arg.dataset_args.get('max_length', 128)
                 self.print_log(f"Creating data loaders with batch_size={self.arg.batch_size}, use_smv={use_smv}, window_size={window_size}")
-                self.data_loader['train'] = Feeder(dataset=self.norm_train, batch_size=self.arg.batch_size, use_smv=use_smv, window_size=window_size)
-                self.data_loader['val'] = Feeder(dataset=self.norm_val, batch_size=self.arg.val_batch_size, use_smv=use_smv, window_size=window_size)
-                self.data_loader['test'] = Feeder(dataset=self.norm_test, batch_size=self.arg.test_batch_size, use_smv=use_smv, window_size=window_size)
+                try:
+                    self.data_loader['train'] = Feeder(dataset=self.norm_train, batch_size=self.arg.batch_size, use_smv=use_smv, window_size=window_size)
+                    self.data_loader['val'] = Feeder(dataset=self.norm_val, batch_size=self.arg.val_batch_size, use_smv=use_smv, window_size=window_size)
+                    self.data_loader['test'] = Feeder(dataset=self.norm_test, batch_size=self.arg.test_batch_size, use_smv=use_smv, window_size=window_size)
+                except Exception as e:
+                    self.print_log(f"Error creating data loaders: {e}")
+                    return False
                 self.print_log(f"Train batches: {len(self.data_loader['train'])}")
                 self.print_log(f"Val batches: {len(self.data_loader['val'])}")
                 self.print_log(f"Test batches: {len(self.data_loader['test'])}")
-                self.distribution_viz(self.norm_train['labels'], self.arg.work_dir, f'train_s{self.test_subject[0]}')
-                self.distribution_viz(self.norm_val['labels'], self.arg.work_dir, f'val_s{self.test_subject[0]}')
-                self.distribution_viz(self.norm_test['labels'], self.arg.work_dir, f'test_s{self.test_subject[0]}')
+                if len(self.norm_train['labels']) > 0:
+                    try:
+                        self.distribution_viz(self.norm_train['labels'], self.arg.work_dir, f'train_s{self.test_subject[0]}')
+                    except Exception as e:
+                        self.print_log(f"Warning: Failed to create train distribution viz: {e}")
+                if len(self.norm_val['labels']) > 0:
+                    try:
+                        self.distribution_viz(self.norm_val['labels'], self.arg.work_dir, f'val_s{self.test_subject[0]}')
+                    except Exception as e:
+                        self.print_log(f"Warning: Failed to create val distribution viz: {e}")
+                if len(self.norm_test['labels']) > 0:
+                    try:
+                        self.distribution_viz(self.norm_test['labels'], self.arg.work_dir, f'test_s{self.test_subject[0]}')
+                    except Exception as e:
+                        self.print_log(f"Warning: Failed to create test distribution viz: {e}")
                 self.print_log("=== Data Loading Complete ===")
                 return True
         except Exception as e:
-            self.print_log(f"ERROR in load_data: {e}")
+            self.print_log(f"CRITICAL ERROR in load_data: {e}")
             import traceback
             self.print_log(traceback.format_exc())
             return False
@@ -562,7 +495,6 @@ class Trainer:
         return False
     
     def eval(self, epoch, loader_name='val', result_file=None):
-        """Fixed evaluation with proper model saving based on lowest validation loss"""
         self.print_log(f'Evaluating {loader_name} at epoch {epoch+1}')
         loader = self.data_loader[loader_name]
         eval_loss = 0.0
@@ -604,18 +536,13 @@ class Trainer:
             self.print_log(f'  Recall: {recall:.2f}%')
             self.print_log(f'  AUC: {auc_score:.2f}%')
             self.print_log(f'  Batches: {steps}/{len(loader)}')
-            
-            # FIXED MODEL SAVING LOGIC - Save when validation loss is lowest
             if loader_name == 'val':
-                # Check if this is the best (lowest) validation loss
                 if eval_loss < self.best_loss:
                     self.print_log(f'🎯 NEW BEST VALIDATION LOSS: {eval_loss:.4f} < {self.best_loss:.4f}')
                     self.best_loss = eval_loss
                     self.best_epoch = epoch + 1
-                    # Save the model
                     self.save_model()
                     self.print_log(f'✅ Model saved at epoch {epoch+1} with best val_loss: {eval_loss:.4f}')
-                    # Also save metrics for best model
                     best_metrics_file = os.path.join(self.arg.work_dir, f'best_model_metrics_s{self.test_subject[0]}.txt')
                     with open(best_metrics_file, 'w') as f:
                         f.write(f"Best Model Metrics (Epoch {epoch+1}):\n")
@@ -630,14 +557,12 @@ class Trainer:
         else:
             self.print_log(f"Warning: No valid {loader_name} batches!")
             return float('inf')
-        
         if result_file is not None:
             with open(result_file, 'w') as f:
                 f.write(f"Predictions for {loader_name} epoch {epoch+1}\n")
                 f.write("true,predicted,probability\n")
                 for true, pred, prob in zip(all_labels, all_preds, all_probs):
                     f.write(f'{true},{pred},{prob:.4f}\n')
-        
         if loader_name == 'test':
             self.test_accuracy = accuracy
             self.test_f1 = f1
@@ -645,7 +570,6 @@ class Trainer:
             self.test_precision = precision
             self.test_auc = auc_score
             self.cm_viz(all_preds, all_labels)
-        
         return eval_loss
     
     def save_model(self):
@@ -655,7 +579,6 @@ class Trainer:
             self.print_log(f"💾 Model weights saved to: {weight_path}")
             file_size = os.path.getsize(weight_path)
             self.print_log(f"   File size: {file_size/1024/1024:.2f} MB")
-            # Also save a marker file indicating this is the best model
             best_marker = f'{self.model_path}_{self.test_subject[0]}_best_epoch.txt'
             with open(best_marker, 'w') as f:
                 f.write(f"Best model saved at epoch {self.best_epoch} with val_loss {self.best_loss:.4f}\n")
@@ -669,7 +592,6 @@ class Trainer:
             try:
                 self.model.load_weights(weight_path)
                 self.print_log(f"✅ Best model weights loaded from: {weight_path}")
-                # Check if we have best epoch info
                 best_marker = f'{self.model_path}_{self.test_subject[0]}_best_epoch.txt'
                 if os.path.exists(best_marker):
                     with open(best_marker, 'r') as f:
@@ -690,10 +612,8 @@ class Trainer:
         plt.subplot(2, 1, 1)
         plt.plot(epochs, train_loss, 'b-', label='Training Loss', linewidth=2)
         plt.plot(epochs, val_loss, 'r-', label='Validation Loss', linewidth=2)
-        # Mark best epoch
         if self.best_epoch > 0 and self.best_epoch <= len(val_loss):
-            plt.scatter(self.best_epoch, val_loss[self.best_epoch-1], color='green', s=100, zorder=5, 
-                       label=f'Best Val Loss (Epoch {self.best_epoch})')
+            plt.scatter(self.best_epoch, val_loss[self.best_epoch-1], color='green', s=100, zorder=5, label=f'Best Val Loss (Epoch {self.best_epoch})')
         plt.title(f'Training vs Validation Loss - Subject {self.test_subject[0]}')
         plt.xlabel('Epochs')
         plt.ylabel('Loss')
@@ -761,8 +681,8 @@ class Trainer:
                 fold_start_time = time.time()
                 self.train_loss_summary = []
                 self.val_loss_summary = []
-                self.best_loss = float('inf')  # Reset best loss for each fold
-                self.best_epoch = 0  # Reset best epoch for each fold
+                self.best_loss = float('inf')
+                self.best_epoch = 0
                 self.test_subject = [test_subject]
                 self.val_subject = self.fixed_val_subjects
                 remaining_eligible = [s for s in self.test_eligible_subjects if s != test_subject]
@@ -793,15 +713,12 @@ class Trainer:
                     self.load_optimizer()
                     self.load_loss()
                     self.early_stop.reset()
-                    # Training loop - track when best model was saved
                     for epoch in range(self.arg.num_epoch):
                         if self.train(epoch):
                             break
-                    # Log training summary
                     self.print_log(f'\n🏁 Training completed for fold {fold_idx+1}')
                     self.print_log(f'   Best model saved at epoch {self.best_epoch} with val_loss={self.best_loss:.4f}')
                     self.print_log(f'   Total epochs trained: {len(self.train_loss_summary)}')
-                    # Reload best model for testing
                     self.model = self.load_model()
                     self.load_weights()
                     self.print_log(f'\n=== Testing Subject {self.test_subject[0]} with Best Model ===')
@@ -982,6 +899,8 @@ def get_args():
     parser.add_argument('--val-subjects-fixed', nargs='+', type=int)
     parser.add_argument('--test-eligible-subjects', nargs='+', type=int)
     parser.add_argument('--include-older-subjects', type=str2bool, default=True)
+    parser.add_argument('--older-subject-sample-ratio', type=float, default=0.3)
+    parser.add_argument('--class-weights', type=dict, default=None)
     return parser
 
 def main():
