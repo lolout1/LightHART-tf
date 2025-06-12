@@ -40,6 +40,9 @@ dataset_args:
   fall_distance: 50
   non_fall_height: 1.2
   non_fall_distance: 100
+  # Hybrid interpolation for accelerometer data
+  sampling: 'hybrid'  # Options: 'none', 'hybrid'
+  target_fs: 30  # Target sampling frequency in Hz
 
 feeder: utils.dataset_tf.UTD_MM_TF
 batch_size: 16
@@ -52,3 +55,7 @@ weight_decay: 0.0004
 use_smv: false
 seed: 2
 print_log: true
+
+# Visualization settings for resampling
+viz_resampling: true  # Enable resampling visualization
+viz_resampling_dir: 'viz/resampling_comparison'  # Directory for resampling visualizations
